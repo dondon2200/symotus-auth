@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import Optional
@@ -120,3 +120,41 @@ def delete_job(
     db.delete(job)
     db.commit()
     return {"message": "已刪除"}
+
+
+# ── Internal endpoint（Spark callback server-to-server）──────────────────
+class JobInternalUpdate(BaseModel):
+    status: Optional[str] = None
+    percent_complete: Optional[int] = None
+    video_url: Optional[str] = None
+    error_message: Optional[str] = None
+    image_count: Optional[int] = None
+    processing_time_secs: Optional[str] = None
+
+@router.put("/internal/{job_id}")
+def internal_update_job(
+    job_id: str,
+    body: JobInternalUpdate,
+    request: "Request",
+    db: Session = Depends(get_db),
+):
+    """給 Spark callback 用的 server-to-server endpoint，不需要 user token"""
+    from fastapi import Request as FRequest
+    service_key = request.headers.get("x-service-key")
+    if service_key != "spark-callback":
+        from fastapi import HTTPException
+        raise HTTPException(403, "Invalid service key")
+
+    job = db.query(TimelapsJob).filter(TimelapsJob.job_id == job_id).first()
+    if not job:
+        return {"message": "Job not found, ignored"}
+
+    if body.status is not None: job.status = body.status
+    if body.percent_complete is not None: job.percent_complete = body.percent_complete
+    if body.video_url is not None: job.video_url = body.video_url
+    if body.error_message is not None: job.error_message = body.error_message
+    if body.image_count is not None: job.image_count = body.image_count
+    if body.processing_time_secs is not None: job.processing_time_secs = str(body.processing_time_secs)
+    job.updated_at = datetime.utcnow()
+    db.commit()
+    return {"message": "Updated"}

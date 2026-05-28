@@ -24,6 +24,10 @@ class User(Base):
     google_id = Column(String, nullable=True, unique=True)
     line_id = Column(String, nullable=True, unique=True)
 
+    video_url = Column(String, nullable=True)        # Spark 完成後的下載 URL
+    error_message = Column(String, nullable=True)   # 失敗原因
+    image_count = Column(Integer, nullable=True)
+    processing_time_secs = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -106,5 +110,11 @@ class TimelapsJob(Base):
     end_date = Column(String, nullable=True)
     fps = Column(Integer, nullable=True)
     resolution = Column(String, nullable=True)
+    video_url = Column(String, nullable=True)        # Spark 完成後的下載 URL
+    error_message = Column(String, nullable=True)   # 失敗原因
+    image_count = Column(Integer, nullable=True)
+    processing_time_secs = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+# 注意：下面的欄位需要 ALTER TABLE 或在新環境自動建立
+# TimelapsJob 額外欄位（已在 class 定義，這裡補充說明）
