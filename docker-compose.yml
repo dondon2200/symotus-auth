@@ -1,0 +1,36 @@
+version: "3.9"
+services:
+  auth-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: symotus_auth
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: your-db-password
+    volumes:
+      - auth_db_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"  # 用 5433 避免跟現有 DB 衝突
+
+  auth-service:
+    build: .
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql://postgres:your-db-password@auth-db:5432/symotus_auth
+      JWT_SECRET: your-super-secret-jwt-key
+      JWT_ALGORITHM: HS256
+      JWT_EXPIRE_MINUTES: 1440
+      CAMERA_BACKEND_URL: https://user.symotus.com/api
+      FRONTEND_URL: https://admin.symotus.com
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_REDIRECT_URI: https://admin.symotus.com/auth/callback/google
+      LINE_CLIENT_ID: ${LINE_CLIENT_ID}
+      LINE_CLIENT_SECRET: ${LINE_CLIENT_SECRET}
+      LINE_REDIRECT_URI: https://admin.symotus.com/auth/callback/line
+    depends_on:
+      - auth-db
+    restart: unless-stopped
+
+volumes:
+  auth_db_data:
