@@ -88,3 +88,23 @@ class RefreshToken(Base):
     expires_at = Column(DateTime, nullable=False)
     revoked = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class TimelapsJob(Base):
+    """縮時影片任務記錄，跨裝置同步"""
+    __tablename__ = "timelapse_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    job_id = Column(String, nullable=False, unique=True)  # Spark 的 job_id
+    camera_id = Column(Integer, nullable=True)
+    camera_name = Column(String, nullable=True)
+    serial_id = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="processing")  # processing | completed | failed
+    percent_complete = Column(Integer, default=0)
+    start_date = Column(String, nullable=True)
+    end_date = Column(String, nullable=True)
+    fps = Column(Integer, nullable=True)
+    resolution = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
