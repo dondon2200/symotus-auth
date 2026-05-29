@@ -192,3 +192,51 @@ def _oauth_finish(db, oauth_field, oauth_id, email, full_name, invite_token_str=
     db.commit()
     return TokenResponse(access_token=create_access_token(user, db), refresh_token=refresh,
                          expires_in=settings.JWT_EXPIRE_MINUTES * 60)
+
+
+# ── Internal: 建立使用者（系統用，不對外公開）──────────────────
+class UserCreateInternal(BaseModel):
+    username: str
+    email: str
+    full_name: Optional[str] = None
+    password: str
+    role: str = "reseller"  # symotus_admin | reseller | end_user
+
+@router.post("/register")
+async def register(body: UserCreateInternal, db: Session = Depends(get_db),
+                   service_key: str = ""):
+    """建立新帳號（需要 x-service-key 或系統初始化用）"""
+    from fastapi import Request
+    existing = db.query(User).filter(
+        (User.username == body.username) | (User.email == body.email)
+    ).first()
+    if existing:
+        raise HTTPException(400, "帳號或 Email 已存在")
+
+    user = User(
+        username=body.username,
+        email=body.email,
+        full_name=body.full_name,
+        hashed_password=hash_password(body.password),
+        role=body.role,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    # 同步換 camera token
+    camera_tokens = await get_camera_token(user.id, user.email, user.role)
+    access_token = create_access_token(user, db)
+    refresh = create_refresh_token()
+    db.add(RefreshToken(user_id=user.id, token=refresh,
+        expires_at=datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)))
+    db.commit()
+
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh,
+        expires_in=settings.JWT_EXPIRE_MINUTES * 60,
+        camera_access_token=camera_tokens.get("access_token"),
+        camera_refresh_token=camera_tokens.get("refresh_token"),
+    )
