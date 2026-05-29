@@ -281,9 +281,15 @@ async def line_callback(code: str, state: str = "", db: Session = Depends(get_db
 
         # 取得 user 的 role（可能是 reseller 或 end_user）
         user = db.query(User).filter(User.line_id == profile["userId"]).first()
-        camera_tokens = await get_camera_token(
-            user.id, user.email or td.get("email") or "", user.role
-        )
+
+        # camera token 是 optional，失敗不影響登入
+        camera_tokens = {}
+        try:
+            # LINE 不一定回傳 email，用 user_id 作為識別
+            cam_email = user.email or f"line_{profile['userId']}@symotus.com"
+            camera_tokens = await get_camera_token(user.id, cam_email, user.role)
+        except Exception as cam_err:
+            print(f"[LINE callback] camera token optional error: {cam_err}")
 
         # URL-encode token 防止特殊字元問題
         auth_token = quote(token_resp.access_token, safe="")
