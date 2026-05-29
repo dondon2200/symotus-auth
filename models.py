@@ -24,10 +24,6 @@ class User(Base):
     google_id = Column(String, nullable=True, unique=True)
     line_id = Column(String, nullable=True, unique=True)
 
-    video_url = Column(String, nullable=True)        # Spark 完成後的下載 URL
-    error_message = Column(String, nullable=True)   # 失敗原因
-    image_count = Column(Integer, nullable=True)
-    processing_time_secs = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
