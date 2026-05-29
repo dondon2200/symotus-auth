@@ -253,32 +253,50 @@ async def register(body: UserCreateInternal, db: Session = Depends(get_db),
 async def line_callback(code: str, state: str = "", db: Session = Depends(get_db)):
     """LINE OAuth GET callback - 處理 LINE redirect，最後 redirect 回前端"""
     from fastapi.responses import RedirectResponse
+    from urllib.parse import quote
     frontend = settings.FRONTEND_URL
     try:
         invite_token_str = None
         if state and ":" in state:
             _, invite_token_str = state.split(":", 1)
+
         async with httpx.AsyncClient() as client:
             r = await client.post("https://api.line.me/oauth2/v2.1/token", data={
                 "grant_type": "authorization_code", "code": code,
-                "redirect_uri": settings.LINE_REDIRECT_URI.replace("/token", "/callback"),
-                "client_id": settings.LINE_CLIENT_ID, "client_secret": settings.LINE_CLIENT_SECRET})
+                "redirect_uri": settings.LINE_REDIRECT_URI,
+                "client_id": settings.LINE_CLIENT_ID,
+                "client_secret": settings.LINE_CLIENT_SECRET,
+            })
             td = r.json()
             if "access_token" not in td:
+                print(f"[LINE callback] token error: {td}")
                 return RedirectResponse(f"{frontend}/login?error=line_failed")
             r2 = await client.get("https://api.line.me/v2/profile",
                                    headers={"Authorization": f"Bearer {td['access_token']}"})
             profile = r2.json()
-        token_resp = _oauth_finish(db, "line_id", profile["userId"], td.get("email"), profile.get("displayName"), invite_token_str)
+
+        # 建立 / 取得帳號
+        token_resp = _oauth_finish(db, "line_id", profile["userId"],
+                                   td.get("email"), profile.get("displayName"), invite_token_str)
+
+        # 取得 user 的 role（可能是 reseller 或 end_user）
+        user = db.query(User).filter(User.line_id == profile["userId"]).first()
         camera_tokens = await get_camera_token(
-            db.query(User).filter(User.line_id == profile["userId"]).first().id,
-            td.get("email") or "", "end_user"
+            user.id, user.email or td.get("email") or "", user.role
         )
-        # 把 token 帶回前端
-        auth_token = token_resp.access_token
-        camera_token = camera_tokens.get("access_token", "")
+
+        # URL-encode token 防止特殊字元問題
+        auth_token = quote(token_resp.access_token, safe="")
+        refresh_token = quote(token_resp.refresh_token, safe="")
+        camera_token = quote(camera_tokens.get("access_token", ""), safe="")
+        camera_refresh = quote(camera_tokens.get("refresh_token", ""), safe="")
+
         return RedirectResponse(
-            f"{frontend}/auth/callback?auth_token={auth_token}&camera_token={camera_token}&refresh_token={token_resp.refresh_token}"
+            f"{frontend}/auth/callback"
+            f"?auth_token={auth_token}"
+            f"&refresh_token={refresh_token}"
+            f"&camera_token={camera_token}"
+            f"&camera_refresh_token={camera_refresh}"
         )
     except Exception as e:
         return RedirectResponse(f"{frontend}/login?error=line_failed")
