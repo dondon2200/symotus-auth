@@ -14,9 +14,11 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: Optional[str] = None
     GOOGLE_REDIRECT_URI: Optional[str] = None
 
-    LINE_CLIENT_ID: Optional[str] = None
-    LINE_CLIENT_SECRET: Optional[str] = None
-    LINE_REDIRECT_URI: Optional[str] = None
+    LINE_CLIENT_ID: Optional[str] = Field(None, alias="LINE_CHANNEL_ID")
+    LINE_CHANNEL_ID: Optional[str] = None  # 備用讀取
+    LINE_CLIENT_SECRET: Optional[str] = Field(None, alias="LINE_CHANNEL_SECRET")
+    LINE_CHANNEL_SECRET: Optional[str] = None
+    LINE_REDIRECT_URI: str = "https://symotus-auth.onrender.com/auth/line/token"
 
     FRONTEND_URL: str = "https://admin.symotus.com"
     INVITE_EXPIRE_HOURS: int = 168
