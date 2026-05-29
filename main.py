@@ -32,6 +32,20 @@ async def startup():
         try:
             logger.info(f"Connecting to DB (attempt {i+1}/{max_retries})...")
             Base.metadata.create_all(bind=engine)
+            # 補上後來加的欄位（舊 DB 可能沒有）
+            from sqlalchemy import text
+            with engine.connect() as conn:
+                for col, typ in [
+                    ("video_url", "TEXT"),
+                    ("error_message", "TEXT"),
+                    ("image_count", "INTEGER"),
+                    ("processing_time_secs", "TEXT"),
+                ]:
+                    try:
+                        conn.execute(text(f"ALTER TABLE timelapse_jobs ADD COLUMN IF NOT EXISTS {col} {typ}"))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
             logger.info("DB connected and tables created!")
             break
         except Exception as e:
