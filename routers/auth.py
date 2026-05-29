@@ -16,15 +16,18 @@ from config import settings
 CAMERA_BACKEND_URL = "https://user.symotus.com"
 CAMERA_SERVICE_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
 
-async def get_camera_token(user_id: int, email: str, role: str) -> dict:
+async def get_camera_token(user_id: int, email: str, role: str, camera_email: Optional[str] = None) -> dict:
     """向 Camera Backend 換取 camera token"""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
+            # 若 user 有設定 camera_email，使用它；否則用 auth email
+            actual_email = camera_email or email
             resp = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
                 headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": user_id, "email": email, "role": role},
+                json={"user_id": user_id, "email": actual_email, "role": role},
             )
+            print(f"[Camera token] {actual_email} → {resp.status_code}: {resp.text[:100]}")
             if resp.status_code == 200:
                 return resp.json()
     except Exception as e:
@@ -48,8 +51,8 @@ async def login(body: LoginRequest, db: Session = Depends(get_db)):
         expires_at=datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)))
     db.commit()
 
-    # 向 Camera Backend 換取 camera token
-    camera_tokens = await get_camera_token(user.id, user.email, user.role)
+    # 向 Camera Backend 換取 camera token（使用 camera_email 若有設定）
+    camera_tokens = await get_camera_token(user.id, user.email, user.role, user.camera_email)
 
     return TokenResponse(
         access_token=access_token,
@@ -203,6 +206,7 @@ class UserCreateInternal(BaseModel):
     full_name: Optional[str] = None
     password: str
     role: str = "reseller"  # symotus_admin | reseller | end_user
+    camera_email: Optional[str] = None  # Camera Backend 對應帳號 email
 
 @router.post("/register")
 async def register(body: UserCreateInternal, db: Session = Depends(get_db),
@@ -222,6 +226,7 @@ async def register(body: UserCreateInternal, db: Session = Depends(get_db),
         hashed_password=hash_password(body.password),
         role=body.role,
         is_active=True,
+        camera_email=body.camera_email,
     )
     db.add(user)
     db.commit()

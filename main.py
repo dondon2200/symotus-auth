@@ -46,6 +46,14 @@ async def startup():
                         conn.commit()
                     except Exception:
                         conn.rollback()
+            # 在 users 表加 camera_email（若尚未存在）
+            from sqlalchemy import text
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS camera_email TEXT"))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
             logger.info("DB connected and tables created!")
             break
         except Exception as e:
