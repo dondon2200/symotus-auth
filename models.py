@@ -20,6 +20,9 @@ class User(Base):
     reseller_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # end_user -> reseller
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
+    # Camera Backend 帳號對應
+    camera_email = Column(String, nullable=True)  # Camera Backend 對應帳號 email
+
     # OAuth
     google_id = Column(String, nullable=True, unique=True)
     line_id = Column(String, nullable=True, unique=True)
