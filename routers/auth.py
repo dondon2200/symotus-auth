@@ -247,3 +247,39 @@ async def register(body: UserCreateInternal, db: Session = Depends(get_db),
         camera_access_token=camera_tokens.get("access_token"),
         camera_refresh_token=camera_tokens.get("refresh_token"),
     )
+
+
+@router.get("/line/callback")
+async def line_callback(code: str, state: str = "", db: Session = Depends(get_db)):
+    """LINE OAuth GET callback - 處理 LINE redirect，最後 redirect 回前端"""
+    from fastapi.responses import RedirectResponse
+    frontend = settings.FRONTEND_URL
+    try:
+        invite_token_str = None
+        if state and ":" in state:
+            _, invite_token_str = state.split(":", 1)
+        async with httpx.AsyncClient() as client:
+            r = await client.post("https://api.line.me/oauth2/v2.1/token", data={
+                "grant_type": "authorization_code", "code": code,
+                "redirect_uri": settings.LINE_REDIRECT_URI.replace("/token", "/callback"),
+                "client_id": settings.LINE_CLIENT_ID, "client_secret": settings.LINE_CLIENT_SECRET})
+            td = r.json()
+            if "access_token" not in td:
+                return RedirectResponse(f"{frontend}/login?error=line_failed")
+            r2 = await client.get("https://api.line.me/v2/profile",
+                                   headers={"Authorization": f"Bearer {td['access_token']}"})
+            profile = r2.json()
+        token_resp = _oauth_finish(db, "line_id", profile["userId"], td.get("email"), profile.get("displayName"), invite_token_str)
+        camera_tokens = await get_camera_token(
+            db.query(User).filter(User.line_id == profile["userId"]).first().id,
+            td.get("email") or "", "end_user"
+        )
+        # 把 token 帶回前端
+        auth_token = token_resp.access_token
+        camera_token = camera_tokens.get("access_token", "")
+        return RedirectResponse(
+            f"{frontend}/auth/callback?auth_token={auth_token}&camera_token={camera_token}&refresh_token={token_resp.refresh_token}"
+        )
+    except Exception as e:
+        return RedirectResponse(f"{frontend}/login?error=line_failed")
+
