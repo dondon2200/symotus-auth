@@ -13,6 +13,9 @@ class TokenResponse(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     expires_in: int  # seconds
+    # Camera Backend token（由 Auth Service 向 Camera Backend 換取）
+    camera_access_token: Optional[str] = None
+    camera_refresh_token: Optional[str] = None
 
 class RefreshRequest(BaseModel):
     refresh_token: str

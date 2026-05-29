@@ -10,10 +10,29 @@ from auth import (hash_password, verify_password, create_access_token,
                   create_refresh_token, decode_token, get_current_user)
 from config import settings
 
+
+CAMERA_BACKEND_URL = "https://user.symotus.com"
+CAMERA_SERVICE_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+
+async def get_camera_token(user_id: int, email: str, role: str) -> dict:
+    """向 Camera Backend 換取 camera token"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                headers={"x-service-key": CAMERA_SERVICE_KEY},
+                json={"user_id": user_id, "email": email, "role": role},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception as e:
+        print(f"[Camera token] Failed: {e}")
+    return {}
+
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/login", response_model=TokenResponse)
-def login(body: LoginRequest, db: Session = Depends(get_db)):
+async def login(body: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(
         (User.username == body.username) | (User.email == body.username)
     ).first()
@@ -26,11 +45,20 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     db.add(RefreshToken(user_id=user.id, token=refresh,
         expires_at=datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)))
     db.commit()
-    return TokenResponse(access_token=access_token, refresh_token=refresh,
-                         expires_in=settings.JWT_EXPIRE_MINUTES * 60)
+
+    # 向 Camera Backend 換取 camera token
+    camera_tokens = await get_camera_token(user.id, user.email, user.role)
+
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh,
+        expires_in=settings.JWT_EXPIRE_MINUTES * 60,
+        camera_access_token=camera_tokens.get("access_token"),
+        camera_refresh_token=camera_tokens.get("refresh_token"),
+    )
 
 @router.post("/refresh", response_model=TokenResponse)
-def refresh_token(body: RefreshRequest, db: Session = Depends(get_db)):
+async def refresh_token(body: RefreshRequest, db: Session = Depends(get_db)):
     db_token = db.query(RefreshToken).filter(
         RefreshToken.token == body.refresh_token,
         RefreshToken.revoked == False,
@@ -46,8 +74,16 @@ def refresh_token(body: RefreshRequest, db: Session = Depends(get_db)):
     db.add(RefreshToken(user_id=user.id, token=new_refresh,
         expires_at=datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)))
     db.commit()
-    return TokenResponse(access_token=create_access_token(user, db), refresh_token=new_refresh,
-                         expires_in=settings.JWT_EXPIRE_MINUTES * 60)
+    # 向 Camera Backend 換取新的 camera token
+    camera_tokens = await get_camera_token(user.id, user.email, user.role)
+
+    return TokenResponse(
+        access_token=create_access_token(user, db),
+        refresh_token=new_refresh,
+        expires_in=settings.JWT_EXPIRE_MINUTES * 60,
+        camera_access_token=camera_tokens.get("access_token"),
+        camera_refresh_token=camera_tokens.get("refresh_token"),
+    )
 
 @router.post("/logout")
 def logout(body: RefreshRequest, db: Session = Depends(get_db)):
