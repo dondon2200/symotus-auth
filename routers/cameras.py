@@ -20,12 +20,16 @@ CAMERA_SERVICE_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a8
 
 
 async def get_camera_backend_token(user: User) -> str:
-    """取得 Camera Backend token（用 service key，不依賴 user 的 camera_email）"""
+    """取得 Camera Backend token
+    - 用 camera_email 對應到 Camera Backend 的帳號
+    - user_id 傳 0，讓 Camera Backend 純用 email 查找對應帳號
+    """
+    cam_email = user.camera_email or f"line_{user.line_id or user.id}@symotus.com"
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
             f"{CAMERA_BACKEND_URL}/internal/auth/token",
             headers={"x-service-key": CAMERA_SERVICE_KEY},
-            json={"user_id": user.id, "email": user.camera_email or f"line_{user.id}@symotus.com", "role": user.role},
+            json={"user_id": 0, "email": cam_email, "role": user.role},
         )
         if resp.status_code == 200:
             return resp.json().get("access_token", "")
