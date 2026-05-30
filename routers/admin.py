@@ -101,10 +101,13 @@ def update_user_admin(
         raise HTTPEx(status_code=404, detail="User not found")
     if "camera_email" in body:
         user.camera_email = body["camera_email"]
+    if "camera_user_id" in body:
+        user.camera_user_id = body["camera_user_id"]
     if "role" in body:
         user.role = body["role"]
     if "is_active" in body:
         user.is_active = body["is_active"]
     db.commit()
     return {"id": user.id, "username": user.username, "email": user.email,
-            "role": user.role, "camera_email": user.camera_email, "is_active": user.is_active}
+            "role": user.role, "camera_email": user.camera_email,
+            "camera_user_id": user.camera_user_id, "is_active": user.is_active}

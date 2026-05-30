@@ -21,7 +21,8 @@ class User(Base):
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     # Camera Backend 帳號對應
-    camera_email = Column(String, nullable=True)  # Camera Backend 對應帳號 email
+    camera_email = Column(String, nullable=True)      # Camera Backend 對應帳號 email
+    camera_user_id = Column(Integer, nullable=True)   # Camera Backend 的真實 user_id
 
     # OAuth
     google_id = Column(String, nullable=True, unique=True)
