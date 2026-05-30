@@ -111,3 +111,23 @@ def update_user_admin(
     return {"id": user.id, "username": user.username, "email": user.email,
             "role": user.role, "camera_email": user.camera_email,
             "camera_user_id": user.camera_user_id, "is_active": user.is_active}
+
+@router.post("/migrate/add-camera-user-id")
+def migrate_add_camera_user_id(
+    x_service_key: str = Header(None),
+    db: Session = Depends(get_db),
+):
+    """一次性 migration：加 camera_user_id 欄位並設定 admin@timelapse.com"""
+    if x_service_key != CAMERA_SERVICE_KEY:
+        raise HTTPEx(status_code=403, detail="Invalid service key")
+    from sqlalchemy import text
+    try:
+        db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS camera_user_id INTEGER"))
+        db.execute(text("UPDATE users SET camera_user_id = 1 WHERE email = 'admin@timelapse.com'"))
+        db.commit()
+        # 查結果
+        result = db.execute(text("SELECT id, email, camera_user_id FROM users")).fetchall()
+        return {"ok": True, "users": [{"id": r[0], "email": r[1], "camera_user_id": r[2]} for r in result]}
+    except Exception as e:
+        db.rollback()
+        raise HTTPEx(status_code=500, detail=str(e))
