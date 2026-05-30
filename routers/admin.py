@@ -72,3 +72,33 @@ def get_camera_access(
                       "email": u.email if u else None,
                       "username": u.username if u else None})
     return {"camera_id": camera_id, "users": users}
+
+@router.get("/users")
+def list_all_users(
+    x_service_key: str = Header(None),
+    db: Session = Depends(get_db),
+):
+    """列出所有用戶（service key 保護）"""
+    if x_service_key != CAMERA_SERVICE_KEY:
+        raise HTTPEx(status_code=403, detail="Invalid service key")
+    users = db.query(User).all()
+    return [{"id": u.id, "username": u.username, "email": u.email,
+             "role": u.role, "line_id": u.line_id, "camera_email": u.camera_email,
+             "is_active": u.is_active} for u in users]
+
+@router.put("/users/{user_id}/camera-email")
+def set_camera_email(
+    user_id: int,
+    body: dict,
+    x_service_key: str = Header(None),
+    db: Session = Depends(get_db),
+):
+    """設定用戶的 camera_email（service key 保護）"""
+    if x_service_key != CAMERA_SERVICE_KEY:
+        raise HTTPEx(status_code=403, detail="Invalid service key")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPEx(status_code=404, detail="User not found")
+    user.camera_email = body.get("camera_email")
+    db.commit()
+    return {"id": user.id, "username": user.username, "camera_email": user.camera_email}
