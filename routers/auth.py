@@ -266,14 +266,18 @@ async def line_callback(code: str, state: str = "", db: Session = Depends(get_db
 
         user = db.query(User).filter(User.line_id == profile["userId"]).first()
 
+        # 換取 camera token：優先用 camera_email，否則用 line_{userId}@symotus.com 自動建帳號
         camera_tokens = {}
-        if user and user.camera_email:
+        if user:
+            cam_email = user.camera_email or f"line_{profile['userId']}@symotus.com"
             try:
-                camera_tokens = await get_camera_token(user.id, user.camera_email, user.role)
+                camera_tokens = await get_camera_token(user.id, cam_email, user.role)
+                # 如果成功且原本沒有 camera_email，存起來
+                if camera_tokens and not user.camera_email:
+                    user.camera_email = cam_email
+                    db.commit()
             except Exception as cam_err:
                 print(f"[LINE callback] camera token error: {cam_err}")
-        else:
-            print(f"[LINE callback] skipping camera token (no camera_email for user {user.id if user else 'unknown'})")
 
         auth_token = quote(token_resp.access_token, safe="")
         refresh_token = quote(token_resp.refresh_token, safe="")
