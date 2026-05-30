@@ -86,19 +86,25 @@ def list_all_users(
              "role": u.role, "line_id": u.line_id, "camera_email": u.camera_email,
              "is_active": u.is_active} for u in users]
 
-@router.put("/users/{user_id}/camera-email")
-def set_camera_email(
+@router.put("/users/{user_id}")
+def update_user_admin(
     user_id: int,
     body: dict,
     x_service_key: str = Header(None),
     db: Session = Depends(get_db),
 ):
-    """設定用戶的 camera_email（service key 保護）"""
+    """更新用戶屬性：camera_email、role、is_active（service key 保護）"""
     if x_service_key != CAMERA_SERVICE_KEY:
         raise HTTPEx(status_code=403, detail="Invalid service key")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPEx(status_code=404, detail="User not found")
-    user.camera_email = body.get("camera_email")
+    if "camera_email" in body:
+        user.camera_email = body["camera_email"]
+    if "role" in body:
+        user.role = body["role"]
+    if "is_active" in body:
+        user.is_active = body["is_active"]
     db.commit()
-    return {"id": user.id, "username": user.username, "camera_email": user.camera_email}
+    return {"id": user.id, "username": user.username, "email": user.email,
+            "role": user.role, "camera_email": user.camera_email, "is_active": user.is_active}
