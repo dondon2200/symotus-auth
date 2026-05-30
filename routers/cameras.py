@@ -28,12 +28,12 @@ async def get_camera_backend_token(user: User) -> str:
     """
     if not user.camera_email:
         return ""  # 沒有 camera_email = 沒有 Camera Backend 帳號，不給 token
-    cam_uid = user.camera_user_id or 0
+    # user_id=0 讓 Camera Backend 純用 email 查帳號，避免 user_id 不一致問題
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
             f"{CAMERA_BACKEND_URL}/internal/auth/token",
             headers={"x-service-key": CAMERA_SERVICE_KEY},
-            json={"user_id": cam_uid, "email": user.camera_email, "role": user.role},
+            json={"user_id": 0, "email": user.camera_email, "role": user.role},
         )
         if resp.status_code == 200:
             return resp.json().get("access_token", "")
