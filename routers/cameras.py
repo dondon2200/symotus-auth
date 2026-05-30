@@ -248,3 +248,46 @@ async def proxy_camera_api(
             params=dict(request.query_params),
         )
         return JSONResponse(status_code=resp.status_code, content=resp.json() if resp.content else {})
+
+# ── Projects proxy ─────────────────────────────────────────────────────────────
+
+@router.get("/projects")
+async def list_projects(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    cam_token = await get_camera_backend_token(current_user)
+    if not cam_token:
+        return {"projects": []}
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{CAMERA_BACKEND_URL}/api/projects",
+            headers={"Authorization": f"Bearer {cam_token}"},
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    return {"projects": []}
+
+
+@router.post("/projects")
+async def create_project(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.role not in ("reseller", "symotus_admin"):
+        raise HTTPException(403, "沒有建立專案的權限")
+    cam_token = await get_camera_backend_token(current_user)
+    if not cam_token:
+        raise HTTPException(502, "無法取得 Camera Backend token")
+    body = await request.body()
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{CAMERA_BACKEND_URL}/api/projects",
+            headers={"Authorization": f"Bearer {cam_token}", "Content-Type": "application/json"},
+            content=body,
+        )
+        try:
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            return JSONResponse(status_code=resp.status_code, content={"detail": resp.text})
