@@ -220,20 +220,24 @@ async def create_gdrive_job(
                 "key": GDRIVE_KEY,
             }
         )
-        if list_resp.status_code == 403:
-            raise HTTPException(400, "無法存取此 Google Drive 資料夾，請確認已設為「知道連結的人都可以查看」")
+        if list_resp.status_code == 403 or list_resp.status_code == 404:
+            raise HTTPException(400, "無法讀取此資料夾。請確認：1) 資料夾已設為「知道連結的人都可以查看」2) 連結正確且未過期")
         if list_resp.status_code != 200:
-            raise HTTPException(502, f"Google Drive API 錯誤: {list_resp.status_code}")
+            raise HTTPException(400, "連結讀取失敗，請確認 Google Drive 連結是否正確")
 
         files = list_resp.json().get("files", [])
         if not files:
-            raise HTTPException(400, "資料夾內沒有找到圖片，請確認資料夾內有 JPG/PNG 圖片")
+            raise HTTPException(400, "此資料夾裡找不到任何圖片，請確認資料夾內有 JPG 或 PNG 格式的照片")
 
         image_count = len(files)
+        MAX_IMAGES = 200  # 記憶體限制，超過需要後端工程師支援 NAS 方案
+
+        if image_count > MAX_IMAGES:
+            raise HTTPException(400, f"此資料夾有 {image_count} 張照片，目前單次最多支援 {MAX_IMAGES} 張。請縮小日期範圍或減少照片數量後再試")
 
         # 2. 下載所有圖片並準備 multipart
         images_data = []
-        for f in files[:500]:  # 最多 500 張避免 timeout
+        for f in files[:MAX_IMAGES]:  # 最多 MAX_IMAGES 張
             dl = await client.get(
                 f"{GDRIVE_API}/files/{f['id']}",
                 params={"alt": "media", "key": GDRIVE_KEY}
@@ -242,7 +246,7 @@ async def create_gdrive_job(
                 images_data.append((f["name"], dl.content, f.get("mimeType", "image/jpeg")))
 
         if not images_data:
-            raise HTTPException(400, "無法下載圖片，請確認資料夾權限設定正確")
+            raise HTTPException(400, "照片下載失敗。請確認資料夾的分享設定是「知道連結的人都可以查看」，並確認照片格式為 JPG 或 PNG")
 
         # 3. 送 Spark API
         callback_url = f"https://symotus-auth.onrender.com/jobs/internal/{{job_id}}"
@@ -269,7 +273,7 @@ async def create_gdrive_job(
         )
 
         if spark_resp.status_code not in [200, 201]:
-            raise HTTPException(502, f"Spark API 錯誤: {spark_resp.text[:200]}")
+            raise HTTPException(500, "影片生成服務暫時無法使用，請稍後再試")
 
         spark_data = spark_resp.json()
         spark_job_id = spark_data.get("job_id")
