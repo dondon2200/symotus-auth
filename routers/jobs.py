@@ -158,3 +158,143 @@ def internal_update_job(
     job.updated_at = datetime.utcnow()
     db.commit()
     return {"message": "Updated"}
+
+# ── Google Drive 縮時影片 ────────────────────────────────────────────────────────
+
+import re
+import httpx
+
+SPARK_API_URL = "https://user.symotus.com/spark"
+SPARK_API_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+GDRIVE_API = "https://www.googleapis.com/drive/v3"
+GDRIVE_KEY = ""  # 公開資料夾不需要 API key，用空字串即可
+
+
+class GDriveJobRequest(BaseModel):
+    gdrive_url: str
+    fps: int = 24
+    resolution: Optional[str] = "1080p"
+    rain_fog_detection: bool = True
+    darkness_detection: bool = True
+    image_recovery: bool = True
+    stabilization: bool = True
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
+
+def extract_folder_id(url: str) -> Optional[str]:
+    """從 Google Drive URL 解析出 folder ID"""
+    patterns = [
+        r"drive\.google\.com/drive/folders/([a-zA-Z0-9_-]+)",
+        r"drive\.google\.com/drive/u/\d+/folders/([a-zA-Z0-9_-]+)",
+        r"id=([a-zA-Z0-9_-]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+@router.post("/gdrive")
+async def create_gdrive_job(
+    body: GDriveJobRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """從 Google Drive 公開資料夾建立縮時影片 job"""
+    folder_id = extract_folder_id(body.gdrive_url)
+    if not folder_id:
+        raise HTTPException(400, "無法解析 Google Drive 連結，請確認連結格式正確")
+
+    # 1. 用 Google Drive API 列出資料夾內的圖片
+    async with httpx.AsyncClient(timeout=30) as client:
+        # 查資料夾內的圖片檔案
+        list_resp = await client.get(
+            f"{GDRIVE_API}/files",
+            params={
+                "q": f"'{folder_id}' in parents and mimeType contains 'image/' and trashed=false",
+                "fields": "files(id,name,mimeType,size),nextPageToken",
+                "orderBy": "name",
+                "pageSize": "1000",
+                "key": GDRIVE_KEY,
+            }
+        )
+        if list_resp.status_code == 403:
+            raise HTTPException(400, "無法存取此 Google Drive 資料夾，請確認已設為「知道連結的人都可以查看」")
+        if list_resp.status_code != 200:
+            raise HTTPException(502, f"Google Drive API 錯誤: {list_resp.status_code}")
+
+        files = list_resp.json().get("files", [])
+        if not files:
+            raise HTTPException(400, "資料夾內沒有找到圖片，請確認資料夾內有 JPG/PNG 圖片")
+
+        image_count = len(files)
+
+        # 2. 下載所有圖片並準備 multipart
+        images_data = []
+        for f in files[:500]:  # 最多 500 張避免 timeout
+            dl = await client.get(
+                f"{GDRIVE_API}/files/{f['id']}",
+                params={"alt": "media", "key": GDRIVE_KEY}
+            )
+            if dl.status_code == 200:
+                images_data.append((f["name"], dl.content, f.get("mimeType", "image/jpeg")))
+
+        if not images_data:
+            raise HTTPException(400, "無法下載圖片，請確認資料夾權限設定正確")
+
+        # 3. 送 Spark API
+        callback_url = f"https://symotus-auth.onrender.com/jobs/internal/{{job_id}}"
+
+        # 準備 multipart form data
+        import uuid
+        job_ref = f"gdrive_{folder_id}_{uuid.uuid4().hex[:8]}"
+
+        files_payload = [
+            ("images", (name, data, mime))
+            for name, data, mime in images_data
+        ]
+
+        spark_resp = await client.post(
+            f"{SPARK_API_URL}/jobs",
+            params={"api_key": SPARK_API_KEY},
+            data={
+                "callback_url": callback_url,
+                "fps": str(body.fps),
+                "reference": job_ref,
+            },
+            files=files_payload,
+            timeout=120,
+        )
+
+        if spark_resp.status_code not in [200, 201]:
+            raise HTTPException(502, f"Spark API 錯誤: {spark_resp.text[:200]}")
+
+        spark_data = spark_resp.json()
+        spark_job_id = spark_data.get("job_id")
+
+    # 4. 存到 Auth Service DB
+    import uuid as _uuid
+    job = TimelapsJob(
+        job_id=spark_job_id or _uuid.uuid4().hex,
+        user_id=current_user.id,
+        camera_id=None,
+        camera_name=f"Google Drive ({image_count} 張照片)",
+        serial_id=folder_id,
+        start_date=body.start_date,
+        end_date=body.end_date,
+        fps=body.fps,
+        resolution=body.resolution,
+        status="processing",
+        image_count=image_count,
+    )
+    db.add(job)
+    db.commit()
+
+    return {
+        "job_id": job.job_id,
+        "status": "processing",
+        "image_count": image_count,
+        "message": f"已開始處理 {image_count} 張照片"
+    }
