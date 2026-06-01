@@ -177,7 +177,7 @@ class GDriveJobRequest(BaseModel):
     image_recovery: bool = False
     stabilization: bool = False
     max_images: Optional[int] = None
-    camera_token: Optional[str] = None  # 前端傳來的 Camera Backend token，省去 server-to-server 換 token
+
 
 
 async def get_camera_token_for_user(user: User) -> str:
@@ -202,8 +202,7 @@ async def create_gdrive_job(
     db: Session = Depends(get_db),
 ):
     """從 Google Drive 公開資料夾建立縮時影片 job"""
-    # 優先用前端傳來的 camera_token（避免 server-to-server IP 白名單問題）
-    cam_token = body.camera_token or await get_camera_token_for_user(current_user)
+    cam_token = await get_camera_token_for_user(current_user)
     if not cam_token:
         raise HTTPException(503, "無法連接影片服務，請稍後再試")
 
