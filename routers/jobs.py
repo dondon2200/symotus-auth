@@ -235,7 +235,7 @@ async def create_gdrive_job(
 
     data = resp.json()
     return {
-        "job_id": data.get("id"),
+        "job_id": data.get("job_id") or data.get("id"),
         "status": data.get("status", "processing"),
         "image_count": data.get("image_count", 0),
         "message": "已開始下載照片並生成影片",
@@ -285,7 +285,7 @@ async def get_gdrive_job(
         percent = 5
 
     return {
-        "job_id": data.get("id"),
+        "job_id": data.get("job_id") or data.get("id"),
         "status": status,
         "percent_complete": percent,
         "image_count": image_count,
