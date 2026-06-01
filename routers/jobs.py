@@ -214,31 +214,16 @@ async def _list_drive_images(folder_id: str, max_images: Optional[int] = None) -
 
 
 async def _download_file_direct(session: httpx.AsyncClient, file_id: str) -> Optional[bytes]:
-    """不走 API，用公開 HTTP 下載（避免 API 配額消耗）"""
+    """用 Google Drive API 下載單張圖片"""
     try:
-        # 先嘗試直接下載
         resp = await session.get(
-            GDRIVE_DOWNLOAD_URL,
-            params={"export": "download", "id": file_id},
+            f"{GDRIVE_FILES_URL}/{file_id}",
+            params={"alt": "media", "key": GDRIVE_API_KEY},
             follow_redirects=True,
             timeout=30,
         )
         if resp.status_code == 200 and len(resp.content) > 1000:
             return resp.content
-        # 如果被擋（病毒掃描確認頁面），嘗試帶 confirm
-        if b"confirm=" in resp.content:
-            import re as _re
-            m = _re.search(rb'confirm=([0-9A-Za-z_-]+)', resp.content)
-            if m:
-                confirm = m.group(1).decode()
-                resp2 = await session.get(
-                    GDRIVE_DOWNLOAD_URL,
-                    params={"export": "download", "id": file_id, "confirm": confirm},
-                    follow_redirects=True,
-                    timeout=30,
-                )
-                if resp2.status_code == 200:
-                    return resp2.content
         return None
     except Exception:
         return None
@@ -341,7 +326,9 @@ async def create_gdrive_job(
 
     # 先列出檔案清單（快，只是 API 查詢）
     try:
-        files = await _list_drive_images(folder_id, body.max_images)
+        MAX_IMAGES = 500  # Render 免費版 512MB 記憶體限制
+    max_req = min(body.max_images or MAX_IMAGES, MAX_IMAGES)
+    files = await _list_drive_images(folder_id, max_req)
     except HTTPException:
         raise
     except Exception as e:
