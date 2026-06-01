@@ -355,11 +355,15 @@ async def create_gdrive_job(
     # 背景執行下載 + 送 Spark
     asyncio.create_task(_run_gdrive_background(job.id, files, body.fps, body.resolution))
 
+    total_in_folder = len(files)  # 實際列出的數量（已被 max_req 限制）
+    warning = f"資料夾內超過 {MAX_IMAGES} 張照片，將只處理前 {MAX_IMAGES} 張" if total_in_folder >= MAX_IMAGES else None
+
     return {
         "job_id": job.id,
         "status": "pending",
-        "image_count": len(files),
-        "message": f"找到 {len(files)} 張照片，開始背景下載",
+        "image_count": total_in_folder,
+        "message": warning or f"找到 {total_in_folder} 張照片，開始背景下載",
+        "warning": warning,
     }
 
 
