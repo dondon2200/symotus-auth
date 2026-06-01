@@ -330,12 +330,10 @@ class GDriveJobRequest(BaseModel):
 @router.post("/gdrive")
 async def create_gdrive_job(
     body: GDriveJobRequest,
-    background_tasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """從 Google Drive 公開資料夾建立縮時影片 job（背景下載，立即回傳）"""
-    from fastapi import BackgroundTasks
+    """從 Google Drive 公開資料夾建立縮時影片 job（背景下載，立即回傳）""
 
     folder_id = _extract_folder_id(body.folder_url)
     if not folder_id:
