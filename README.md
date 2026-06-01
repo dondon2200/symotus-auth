@@ -1,116 +1,87 @@
 # Symotus Auth Service
 
-權限管理微服務，負責登入、角色管理、邀請連結、相機存取授權。
+Symotus 平台的認證與權限中心，使用 FastAPI + PostgreSQL，部署在 Render。
 
-## 快速啟動
+## 技術棧
 
-### 1. 複製設定檔
-```bash
-cp .env.example .env
-# 編輯 .env 填入實際值
+- **Framework**: FastAPI (Python)
+- **Database**: PostgreSQL (Railway)
+- **Deploy**: Render（自動 deploy，push to main 即上線）
+- **Container**: Docker
+
+## 架構職責
+
+Auth Service 是**唯一的權限控制中心**：
+- 所有 Camera Backend API 都必須透過 Auth Service 的 proxy 存取
+- Camera Backend 本身不做權限控制
+- 相機存取權限由 `camera_access` 表管理
+
+## Router 說明
+
+| Router | 路徑 | 說明 |
+|--------|------|------|
+| auth | `/auth/*` | 登入、登出、OAuth（Google/LINE）|
+| cameras | `/cameras/*` | 相機 API proxy（權限控制）|
+| jobs | `/jobs/*` | 縮時任務、Google Drive 縮時 |
+| invites | `/invites/*` | 邀請連結管理 |
+| reseller | `/reseller/*` | Reseller 用戶管理 |
+| admin | `/admin/*` | 平台管理（service key 保護）|
+| support | `/support/*` | 技術支援授權 |
+
+## 重要設定
+
+### 環境變數（在 Render 設定）
+```
+DATABASE_URL          PostgreSQL 連線字串
+JWT_SECRET            JWT 簽名密鑰
+JWT_ALGORITHM         HS256
+LINE_CLIENT_ID        LINE Login Channel ID
+LINE_CLIENT_SECRET    LINE Login Channel Secret
+LINE_REDIRECT_URI     https://symotus-auth.onrender.com/auth/line/callback
+GOOGLE_CLIENT_ID      Google OAuth Client ID
+GOOGLE_CLIENT_SECRET  Google OAuth Client Secret
+GOOGLE_REDIRECT_URI   https://symotus-auth.onrender.com/auth/google/callback
+FRONTEND_URL          https://admin.symotus.com
 ```
 
-### 2. 啟動服務
-```bash
-docker-compose up -d
+### Camera Backend 連接
+```python
+CAMERA_BACKEND_URL = "https://user.symotus.com"
+CAMERA_SERVICE_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
 ```
 
-### 3. 建立第一個 Admin 帳號
-```bash
-docker-compose exec auth-service python init_admin.py
+## 用戶角色
+
+```
+symotus_admin  →  平台管理員（最高權限）
+reseller       →  二房東（有自己的相機，可管理 end_user）
+end_user       →  終端用戶（只能看被授權的相機）
 ```
 
-### 4. 確認服務正常
+## DB 重要欄位
+
+**users 表**
+- `camera_email`: 對應 Camera Backend 的帳號 email
+- `camera_user_id`: Camera Backend 的 user id（固定傳 0 讓後端用 email 查）
+- `line_id`: LINE OAuth ID
+- `google_id`: Google OAuth ID
+
+**camera_access 表**
+- `camera_id`: Camera Backend 的相機 ID
+- `user_id`: Auth Service 的用戶 ID
+- `granted_by`: 授權者的 user ID
+
+## 本地開發
+
 ```bash
-curl http://localhost:8001/health
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8001
 ```
 
 ## API 文件
-啟動後訪問：http://localhost:8001/docs
 
-## Endpoints 總覽
+https://symotus-auth.onrender.com/docs
 
-### 認證
-| Method | Path | 說明 |
-|--------|------|------|
-| POST | /auth/login | 帳密登入 |
-| POST | /auth/refresh | 刷新 token |
-| POST | /auth/logout | 登出 |
-| GET  | /auth/me | 取得當前用戶 |
-| GET  | /auth/google/url | 取得 Google OAuth URL |
-| POST | /auth/google/token | Google OAuth 換 token |
-| GET  | /auth/line/url | 取得 LINE OAuth URL |
-| POST | /auth/line/token | LINE OAuth 換 token |
+## 相關 Repo
 
-### 邀請管理（reseller）
-| Method | Path | 說明 |
-|--------|------|------|
-| POST | /invites | 建立邀請連結 |
-| GET  | /invites | 列出邀請記錄 |
-| DELETE | /invites/{token} | 撤銷邀請 |
-| GET  | /invites/preview/{token} | 查看邀請資訊（公開，不需登入）|
-
-### 使用者管理（reseller）
-| Method | Path | 說明 |
-|--------|------|------|
-| GET  | /reseller/users | 列出名下 end_user |
-| PUT  | /reseller/users/{id} | 更新用戶（停用/啟用）|
-| DELETE | /reseller/users/{id} | 移除 end_user |
-| GET  | /reseller/cameras/{id}/access | 列出相機存取權 |
-| POST | /reseller/cameras/{id}/access | 分配相機給用戶 |
-| DELETE | /reseller/cameras/{id}/access/{user_id} | 撤銷存取 |
-
-### 技術支援授權（reseller）
-| Method | Path | 說明 |
-|--------|------|------|
-| POST | /support/grants | 授權 Symotus 技術支援 48hr |
-| GET  | /support/grants | 查看有效授權 |
-| DELETE | /support/grants/{id} | 提前撤銷 |
-
-### 管理後台（symotus_admin）
-| Method | Path | 說明 |
-|--------|------|------|
-| GET | /admin/resellers | 列出所有 reseller |
-| GET | /admin/resellers/{id}/users | 查看 reseller 的 end_user |
-| GET | /admin/support/grants | 查看所有有效技術支援授權 |
-
-## Token 格式
-
-JWT payload 包含：
-```json
-{
-  "sub": 123,
-  "role": "end_user",
-  "reseller_id": 5,
-  "camera_ids": [1, 2, 3],
-  "exp": 1234567890
-}
-```
-
-前端存在 localStorage，每次 request 帶在 Header：
-```
-Authorization: Bearer <token>
-```
-
-## NUC 部署說明
-
-1. 確保 NUC 上已安裝 Docker 和 Docker Compose
-2. clone 這個 repo 到 NUC
-3. 設定 .env
-4. `docker-compose up -d`
-5. 在 nginx 設定反向代理：
-
-```nginx
-location /auth-api/ {
-    proxy_pass http://localhost:8001/;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-}
-```
-
-## 前端需要的改動
-
-1. 登入改打 Auth Service：`POST http://nuc-ip:8001/auth/login`
-2. 登入後收到 JWT，存 localStorage
-3. 打現有相機後端時帶同一個 JWT（現有後端只需驗 JWT 有效性）
-4. 邀請頁面 `/invite/{token}` 先打 `/invites/preview/{token}` 顯示邀請資訊
+- 前端: https://github.com/dondon2200/symotus-frontend
