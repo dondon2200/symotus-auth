@@ -163,6 +163,7 @@ def internal_update_job(
 
 import re
 import asyncio
+import os
 import httpx
 from models import GDriveJob
 
@@ -281,57 +282,74 @@ async def _run_gdrive_background_full(job_id: int, folder_id: str, body_fps: int
 
 
 async def _run_gdrive_background(job_id: int, files: list[dict], body_fps: int, body_resolution: Optional[str], _db=None):
-    """背景任務：分批下載照片 → 送 Spark"""
+    """背景任務：下載照片到磁碟 → 送 Spark（避免記憶體爆炸）"""
+    import tempfile, shutil
     from database import SessionLocal
     db = _db or SessionLocal()
     own_db = _db is None
+    tmp_dir = None
     try:
         job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
         if not job:
             return
 
-        # 下載階段
+        # 建暫存目錄
+        tmp_dir = tempfile.mkdtemp(prefix=f"gdrive_{job_id}_")
+
+        # 下載階段：寫磁碟，不存記憶體
         job.status = "downloading"
         db.commit()
 
-        downloaded_files = []
-        BATCH = 50  # 每批 50 張，避免記憶體爆炸
+        saved_files = []
         async with httpx.AsyncClient(timeout=60) as session:
             for i, f in enumerate(files):
                 img_bytes = await _download_file_direct(session, f["id"])
                 if img_bytes:
-                    downloaded_files.append((f["name"], img_bytes))
-                # 每下載一張更新進度
+                    fpath = os.path.join(tmp_dir, f["name"])
+                    with open(fpath, "wb") as fp:
+                        fp.write(img_bytes)
+                    saved_files.append((f["name"], fpath))
+                    del img_bytes  # 立刻釋放記憶體
                 job.downloaded_count = i + 1
                 if (i + 1) % 10 == 0:
                     db.commit()
-                # 小間隔避免觸發 Google 速率限制
-                if (i + 1) % BATCH == 0:
-                    await asyncio.sleep(1)
+                if (i + 1) % 50 == 0:
+                    await asyncio.sleep(0.5)
 
-        job.downloaded_count = len(downloaded_files)
+        job.downloaded_count = len(saved_files)
         db.commit()
 
-        if len(downloaded_files) < 100:
+        if len(saved_files) < 100:
             job.status = "failed"
-            job.error_message = f"成功下載 {len(downloaded_files)} 張，不足 100 張無法生成縮時影片"
+            job.error_message = f"成功下載 {len(saved_files)} 張，不足 100 張無法生成縮時影片"
             db.commit()
             return
 
-        # 上傳 Spark 階段
+        # 上傳 Spark 階段：從磁碟讀，分批送
         job.status = "uploading"
         db.commit()
 
         callback_url = f"https://symotus-auth.onrender.com/jobs/gdrive/callback/{job_id}"
-        form_files = [("images", (name, data, "image/jpeg")) for name, data in downloaded_files]
 
-        async with httpx.AsyncClient(timeout=300) as client:
-            spark_resp = await client.post(
-                f"{SPARK_API_URL}/jobs",
-                headers={"x-api-key": SPARK_API_KEY},
-                data={"callback_url": callback_url, "fps": str(body_fps)},
-                files=form_files,
-            )
+        # 用 open file handles 做 multipart，不把全部載入記憶體
+        file_handles = []
+        form_files = []
+        try:
+            for name, fpath in saved_files:
+                fh = open(fpath, "rb")
+                file_handles.append(fh)
+                form_files.append(("images", (name, fh, "image/jpeg")))
+
+            async with httpx.AsyncClient(timeout=600) as client:
+                spark_resp = await client.post(
+                    f"{SPARK_API_URL}/jobs",
+                    headers={"x-api-key": SPARK_API_KEY},
+                    data={"callback_url": callback_url, "fps": str(body_fps)},
+                    files=form_files,
+                )
+        finally:
+            for fh in file_handles:
+                fh.close()
 
         if spark_resp.status_code not in [200, 202]:
             job.status = "failed"
@@ -354,6 +372,8 @@ async def _run_gdrive_background(job_id: int, files: list[dict], body_fps: int, 
         except Exception:
             pass
     finally:
+        if tmp_dir and os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         if own_db:
             db.close()
 
@@ -365,7 +385,6 @@ class GDriveJobRequest(BaseModel):
     max_images: Optional[int] = None
 
 
-@router.post("/gdrive")
 @router.post("/gdrive")
 async def create_gdrive_job(
     body: GDriveJobRequest,
