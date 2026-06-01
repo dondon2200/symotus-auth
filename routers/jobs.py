@@ -159,13 +159,69 @@ def internal_update_job(
     db.commit()
     return {"message": "Updated"}
 
-# ── Google Drive 縮時影片 ────────────────────────────────────────────────────────
+# ── Google Drive 縮時影片（Auth Service 自己處理，不走 Camera Backend）──────────
 
 import re
 import httpx
 
-CAMERA_BACKEND_URL = "https://user.symotus.com"
-CAMERA_SERVICE_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+SPARK_API_URL = "https://user.symotus.com/spark"
+SPARK_API_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+GDRIVE_API_KEY = "AIzaSyAj-LJs2lbT7pjh0FFkOw-rRH-OMtMl3c4"
+GDRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+
+
+def _extract_folder_id(folder_url: str) -> Optional[str]:
+    """從 Google Drive 資料夾連結解析 folder id"""
+    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", folder_url)
+    return m.group(1) if m else None
+
+
+async def _list_drive_images(folder_id: str, max_images: Optional[int] = None) -> list[dict]:
+    """列出 Google Drive 資料夾內的圖片檔案"""
+    files = []
+    page_token = None
+    limit = max_images or 5000
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        while len(files) < limit:
+            params = {
+                "q": f"'{folder_id}' in parents and trashed=false",
+                "fields": "nextPageToken,files(id,name,mimeType)",
+                "pageSize": min(1000, limit - len(files)),
+                "key": GDRIVE_API_KEY,
+                "orderBy": "name",
+            }
+            if page_token:
+                params["pageToken"] = page_token
+
+            resp = await client.get(GDRIVE_FILES_URL, params=params)
+            if resp.status_code != 200:
+                raise HTTPException(400, f"無法列出 Google Drive 資料夾內容（{resp.status_code}）")
+
+            data = resp.json()
+            image_files = [
+                f for f in data.get("files", [])
+                if f.get("mimeType", "").startswith("image/")
+            ]
+            files.extend(image_files)
+
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+
+    return files[:limit]
+
+
+async def _download_drive_file(file_id: str) -> bytes:
+    """下載單張 Google Drive 圖片"""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"{GDRIVE_FILES_URL}/{file_id}",
+            params={"alt": "media", "key": GDRIVE_API_KEY},
+        )
+        if resp.status_code != 200:
+            raise Exception(f"下載失敗 {file_id}: {resp.status_code}")
+        return resp.content
 
 
 class GDriveJobRequest(BaseModel):
@@ -179,84 +235,88 @@ class GDriveJobRequest(BaseModel):
     max_images: Optional[int] = None
 
 
-
-async def get_camera_token_for_user(user: User) -> str:
-    """換取 Camera Backend token"""
-    if not user.camera_email:
-        return ""
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            f"{CAMERA_BACKEND_URL}/internal/auth/token",
-            headers={"x-service-key": CAMERA_SERVICE_KEY},
-            json={"user_id": 0, "email": user.camera_email, "role": user.role},
-        )
-        if resp.status_code == 200:
-            return resp.json().get("access_token", "")
-    return ""
-
-
 @router.post("/gdrive")
 async def create_gdrive_job(
     body: GDriveJobRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """從 Google Drive 公開資料夾建立縮時影片 job"""
-    cam_token = await get_camera_token_for_user(current_user)
-    if not cam_token:
-        raise HTTPException(503, "無法連接影片服務，請稍後再試")
+    """從 Google Drive 公開資料夾建立縮時影片 job（Auth Service 自己下載後送 Spark）"""
+    # 1. 解析 folder id
+    folder_id = _extract_folder_id(body.folder_url)
+    if not folder_id:
+        raise HTTPException(400, "無法解析 Google Drive 資料夾連結，請確認格式正確")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        payload = {
-            "folder_url": body.folder_url,
-            "fps": body.fps,
-            "resolution": body.resolution,
-            "rain_fog_detection": body.rain_fog_detection,
-            "darkness_detection": body.darkness_detection,
-            "image_recovery": body.image_recovery,
-            "stabilization": body.stabilization,
-        }
-        if body.max_images:
-            payload["max_images"] = body.max_images
+    # 2. 列出圖片
+    try:
+        files = await _list_drive_images(folder_id, body.max_images)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"無法讀取資料夾內容：{e}")
 
-        resp = await client.post(
-            f"{CAMERA_BACKEND_URL}/api/timelapse/gdrive-import",
-            headers={"Authorization": f"Bearer {cam_token}", "Content-Type": "application/json"},
-            json=payload,
+    if not files:
+        raise HTTPException(400, "資料夾內沒有找到圖片")
+    if len(files) < 100:
+        raise HTTPException(400, f"圖片數量不足（{len(files)} 張），縮時影片至少需要 100 張")
+
+    # 3. 下載所有圖片並組成 multipart
+    callback_url = "https://symotus-auth.onrender.com/jobs/gdrive/callback"
+    form_data = []
+    errors = 0
+    async with httpx.AsyncClient(timeout=60) as client:
+        for f in files:
+            try:
+                img_bytes = await _download_drive_file(f["id"])
+                form_data.append(("images", (f["name"], img_bytes, "image/jpeg")))
+            except Exception:
+                errors += 1
+                if errors > len(files) * 0.2:  # 超過 20% 失敗就放棄
+                    raise HTTPException(500, "下載圖片時發生太多錯誤，請稍後再試")
+
+        if not form_data:
+            raise HTTPException(500, "所有圖片下載失敗")
+
+        # 4. 送 Spark
+        spark_resp = await client.post(
+            f"{SPARK_API_URL}/jobs",
+            headers={"x-api-key": SPARK_API_KEY},
+            data={"callback_url": callback_url, "fps": str(body.fps)},
+            files=form_data,
+            timeout=120,
         )
 
-    if resp.status_code == 400:
-        detail = resp.json().get("detail", "")
-        if "資料夾" in detail or "id" in detail.lower():
-            raise HTTPException(400, "無法讀取此 Google Drive 資料夾，請確認連結正確且已設為公開")
-        raise HTTPException(400, detail)
-    if resp.status_code not in [200, 201]:
-        raise HTTPException(500, "影片生成服務暫時無法使用，請稍後再試")
+    if spark_resp.status_code not in [200, 202]:
+        raise HTTPException(500, f"影片生成服務錯誤：{spark_resp.status_code}")
 
-    data = resp.json()
+    spark_data = spark_resp.json()
     return {
-        "job_id": data.get("job_id") or data.get("id"),
-        "status": data.get("status", "processing"),
-        "image_count": data.get("image_count", 0),
-        "message": "已開始下載照片並生成影片",
+        "job_id": spark_data.get("job_id"),
+        "status": spark_data.get("status", "processing"),
+        "image_count": spark_data.get("image_count", len(form_data)),
+        "message": f"已上傳 {len(form_data)} 張照片，開始生成縮時影片",
     }
+
+
+@router.post("/gdrive/callback")
+async def gdrive_callback(request: Request, db: Session = Depends(get_db)):
+    """接收 Spark 完成通知（server-to-server）"""
+    # 暫時只記 log，之後可以推通知給用戶
+    body = await request.json()
+    return {"message": "received"}
 
 
 @router.get("/gdrive/{job_id}")
 async def get_gdrive_job(
-    job_id: int,
+    job_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """查詢 Google Drive 縮時 job 狀態"""
-    cam_token = await get_camera_token_for_user(current_user)
-    if not cam_token:
-        raise HTTPException(503, "無法連接影片服務")
-
+    """查詢 Google Drive 縮時 job 狀態（直接查 Spark）"""
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
-            f"{CAMERA_BACKEND_URL}/api/timelapse/jobs/{job_id}",
-            headers={"Authorization": f"Bearer {cam_token}"},
+            f"{SPARK_API_URL}/jobs/{job_id}",
+            headers={"x-api-key": SPARK_API_KEY},
         )
     if resp.status_code == 404:
         raise HTTPException(404, "找不到此任務")
@@ -264,34 +324,31 @@ async def get_gdrive_job(
         raise HTTPException(resp.status_code, "查詢失敗")
 
     data = resp.json()
-    # 計算進度
-    image_count = data.get("image_count", 0)
-    downloaded = data.get("downloaded_count", 0)
-    spark_status = data.get("spark_status") or ""
     status = data.get("status", "processing")
+    image_count = data.get("image_count", 0)
+    processed = data.get("processed_count", 0)
 
-    # 進度計算：下載佔 40%，spark 處理佔 60%
     if status == "completed":
         percent = 100
     elif status == "failed":
         percent = 0
-    elif spark_status in ("processing", "running"):
-        percent = 70
-    elif spark_status == "completed":
-        percent = 95
-    elif image_count > 0 and downloaded > 0:
-        percent = int((downloaded / image_count) * 40)
+    elif status in ("processing", "running"):
+        percent = int((processed / image_count * 80) + 10) if image_count > 0 else 30
     else:
         percent = 5
 
+    # 影片下載 URL
+    video_url = None
+    if status == "completed":
+        video_url = f"{SPARK_API_URL}/jobs/{job_id}/download?api_key={SPARK_API_KEY}"
+
     return {
-        "job_id": data.get("job_id") or data.get("id"),
+        "job_id": job_id,
         "status": status,
         "percent_complete": percent,
         "image_count": image_count,
-        "downloaded_count": downloaded,
-        "current_stage": _stage_label(status, spark_status, downloaded, image_count),
-        "video_download_url": data.get("video_download_url"),
+        "current_stage": "完成" if status == "completed" else ("失敗" if status == "failed" else "AI 生成影片中"),
+        "video_download_url": video_url,
         "error_message": data.get("error_message"),
     }
 
@@ -301,34 +358,21 @@ def _stage_label(status: str, spark_status: str, downloaded: int, total: int) ->
         return "完成"
     if status == "failed":
         return "失敗"
-    if status == "downloading":
-        return f"下載照片中（{downloaded}/{total}）"
-    if status == "processing" and not spark_status:
-        return "準備中"
-    if spark_status in ("processing", "running"):
-        return "AI 生成影片中"
-    if spark_status == "completed":
-        return "後處理中"
     return "處理中"
 
 
 @router.delete("/gdrive/{job_id}")
 async def delete_gdrive_job(
-    job_id: int,
+    job_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """刪除 Google Drive 縮時 job"""
-    cam_token = await get_camera_token_for_user(current_user)
-    if not cam_token:
-        raise HTTPException(503, "無法連接影片服務")
-
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.delete(
-            f"{CAMERA_BACKEND_URL}/api/timelapse/jobs/{job_id}",
-            headers={"Authorization": f"Bearer {cam_token}"},
+            f"{SPARK_API_URL}/jobs/{job_id}",
+            headers={"x-api-key": SPARK_API_KEY},
         )
-
-    if resp.status_code == 204 or resp.status_code == 200:
+    if resp.status_code in [200, 204]:
         return {"message": "已刪除"}
     raise HTTPException(resp.status_code, "刪除失敗")
