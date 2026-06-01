@@ -118,3 +118,22 @@ class TimelapsJob(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 # 注意：下面的欄位需要 ALTER TABLE 或在新環境自動建立
 # TimelapsJob 額外欄位（已在 class 定義，這裡補充說明）
+
+class GDriveJob(Base):
+    """Google Drive 縮時影片任務（Auth Service 自己管理下載進度）"""
+    __tablename__ = "gdrive_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    folder_url = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="pending")
+    # pending → downloading → uploading → processing → completed | failed
+    total_images = Column(Integer, default=0)       # Drive 資料夾內圖片總數
+    downloaded_count = Column(Integer, default=0)   # 已下載張數
+    spark_job_id = Column(String, nullable=True)    # Spark 回傳的 job_id
+    fps = Column(Integer, default=30)
+    resolution = Column(String, nullable=True)
+    video_url = Column(String, nullable=True)
+    error_message = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
