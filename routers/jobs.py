@@ -366,38 +366,23 @@ class GDriveJobRequest(BaseModel):
 
 
 @router.post("/gdrive")
+@router.post("/gdrive")
 async def create_gdrive_job(
     body: GDriveJobRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """從 Google Drive 公開資料夾建立縮時影片 job（背景下載，立即回傳）""
-
+    """從 Google Drive 公開資料夾建立縮時影片 job（立即回傳，背景跑全流程）"""
     folder_id = _extract_folder_id(body.folder_url)
     if not folder_id:
-        raise HTTPException(400, "無法解析 Google Drive 資料夾連結")
+        raise HTTPException(400, "無法解析 Google Drive 資料夾連結，請確認格式正確")
 
-    # 先列出檔案清單（快，只是 API 查詢）
-    try:
-        MAX_IMAGES = 500  # Render 免費版 512MB 記憶體限制
-    max_req = min(body.max_images or MAX_IMAGES, MAX_IMAGES)
-    files = await _list_drive_images(folder_id, max_req)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"無法讀取資料夾：{e}")
-
-    if not files:
-        raise HTTPException(400, "資料夾內沒有找到圖片")
-    if len(files) < 100:
-        raise HTTPException(400, f"圖片數量不足（{len(files)} 張），縮時影片至少需要 100 張")
-
-    # 建立 DB 記錄
+    # 立即建立 DB 記錄並回傳，不等待 Drive API
     job = GDriveJob(
         user_id=current_user.id,
         folder_url=body.folder_url,
         status="pending",
-        total_images=len(files),
+        total_images=0,
         fps=body.fps,
         resolution=body.resolution,
     )
@@ -405,40 +390,16 @@ async def create_gdrive_job(
     db.commit()
     db.refresh(job)
 
-    # 背景執行下載 + 送 Spark
-    asyncio.create_task(_run_gdrive_background(job.id, files, body.fps, body.resolution))
-
-    total_in_folder = len(files)  # 實際列出的數量（已被 max_req 限制）
-    warning = f"資料夾內超過 {MAX_IMAGES} 張照片，將只處理前 {MAX_IMAGES} 張" if total_in_folder >= MAX_IMAGES else None
+    # 背景執行：列清單 + 下載 + 送 Spark
+    asyncio.create_task(_run_gdrive_background_full(job.id, folder_id, body.fps, body.resolution, body.max_images))
 
     return {
         "job_id": job.id,
         "status": "pending",
-        "image_count": total_in_folder,
-        "message": warning or f"找到 {total_in_folder} 張照片，開始背景下載",
-        "warning": warning,
+        "image_count": 0,
+        "message": "已開始處理，正在讀取 Google Drive 資料夾",
+        "warning": None,
     }
-
-
-@router.post("/gdrive/callback/{job_id}")
-async def gdrive_spark_callback(job_id: int, request: Request, db: Session = Depends(get_db)):
-    """接收 Spark 完成 callback"""
-    data = await request.json()
-    job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
-    if not job:
-        return {"message": "not found"}
-
-    spark_status = data.get("status", "")
-    if spark_status == "completed":
-        job.status = "completed"
-        job.video_url = data.get("download_url") or f"{SPARK_API_URL}/jobs/{job.spark_job_id}/download?api_key={SPARK_API_KEY}"
-    elif spark_status == "failed":
-        job.status = "failed"
-        job.error_message = data.get("error_message", "Spark 處理失敗")
-
-    job.updated_at = datetime.utcnow()
-    db.commit()
-    return {"message": "ok"}
 
 
 @router.get("/gdrive/{job_id}")
