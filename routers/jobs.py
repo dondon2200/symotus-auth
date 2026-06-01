@@ -229,10 +229,62 @@ async def _download_file_direct(session: httpx.AsyncClient, file_id: str) -> Opt
         return None
 
 
-async def _run_gdrive_background(job_id: int, files: list[dict], body_fps: int, body_resolution: Optional[str]):
-    """背景任務：分批下載照片 → 送 Spark"""
+async def _run_gdrive_background_full(job_id: int, folder_id: str, body_fps: int, body_resolution: Optional[str], max_images: Optional[int] = None):
+    """背景任務：列清單 + 分批下載照片 → 送 Spark"""
     from database import SessionLocal
     db = SessionLocal()
+    try:
+        job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
+        if not job:
+            return
+
+        # 列出檔案清單
+        MAX_IMAGES = 500
+        max_req = min(max_images or MAX_IMAGES, MAX_IMAGES)
+        try:
+            files = await _list_drive_images(folder_id, max_req)
+        except Exception as e:
+            job.status = "failed"
+            job.error_message = f"無法讀取資料夾：{e}"
+            db.commit()
+            return
+
+        if not files:
+            job.status = "failed"
+            job.error_message = "資料夾內沒有找到圖片"
+            db.commit()
+            return
+
+        if len(files) < 100:
+            job.status = "failed"
+            job.error_message = f"圖片數量不足（{len(files)} 張），縮時影片至少需要 100 張"
+            db.commit()
+            return
+
+        job.total_images = len(files)
+        if len(files) >= MAX_IMAGES:
+            job.error_message = f"資料夾內超過 {MAX_IMAGES} 張照片，將只處理前 {MAX_IMAGES} 張"
+        db.commit()
+
+        await _run_gdrive_background(job_id, files, body_fps, body_resolution, _db=db)
+    except Exception as e:
+        try:
+            job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
+            if job:
+                job.status = "failed"
+                job.error_message = str(e)[:300]
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+async def _run_gdrive_background(job_id: int, files: list[dict], body_fps: int, body_resolution: Optional[str], _db=None):
+    """背景任務：分批下載照片 → 送 Spark"""
+    from database import SessionLocal
+    db = _db or SessionLocal()
+    own_db = _db is None
     try:
         job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
         if not job:
@@ -302,7 +354,8 @@ async def _run_gdrive_background(job_id: int, files: list[dict], body_fps: int, 
         except Exception:
             pass
     finally:
-        db.close()
+        if own_db:
+            db.close()
 
 
 class GDriveJobRequest(BaseModel):
