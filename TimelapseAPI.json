@@ -1,0 +1,1092 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Timelapse Pipeline Service",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "/spark"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Create Job",
+        "operationId": "create_job_jobs_post",
+        "parameters": [
+          {
+            "name": "api_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Api Key"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_create_job_jobs_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobCreateResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/nas": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Create timelapse from NAS images / 從 NAS 圖片建立縮時影片",
+        "description": "Create a timelapse video from images stored on the NAS.\n\n從 NAS 上儲存的圖片建立縮時影片。\n\n**Processing options / 處理選項:**\n- No toggles = Raw video (all images, no processing) / 不開啟選項 = 原始影片\n- rain_fog + darkness = Filtered (remove bad images) / 過濾（移除不良圖片）\n- + image_recovery = Enhanced (recover bad images via AI) / 增強（AI 修復不良圖片）\n- + stabilization = Stabilized (smooth 60fps) / 穩定（平滑 60fps）",
+        "operationId": "create_nas_job_jobs_nas_post",
+        "parameters": [
+          {
+            "name": "api_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Api Key"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NasJobCreateRequest"
+              },
+              "examples": {
+                "raw_video": {
+                  "summary": "1. Raw video / 原始影片",
+                  "description": "No processing, all images to video. Fastest. 不做任何處理，所有圖片直接生成影片。最快。",
+                  "value": {
+                    "nas_path": "台電運維_完整",
+                    "callback_url": "https://your-server.com/callback",
+                    "fps": 30
+                  }
+                },
+                "filtered": {
+                  "summary": "2. Filtered / 過濾影片",
+                  "description": "Remove rain/fog/dark images. ~26 min for 15K images. 移除雨天/霧氣/過暗圖片。15K 張約 26 分鐘。",
+                  "value": {
+                    "nas_path": "台電運維_完整",
+                    "callback_url": "https://your-server.com/callback",
+                    "fps": 30,
+                    "rain_fog_detection": true,
+                    "darkness_detection": true
+                  }
+                },
+                "enhanced": {
+                  "summary": "3. Enhanced / 增強影片",
+                  "description": "Detect + recover bad images via AI fusion. ~33 min for 15K images. 偵測 + AI 融合修復不良圖片。15K 張約 33 分鐘。",
+                  "value": {
+                    "nas_path": "台電運維_完整",
+                    "callback_url": "https://your-server.com/callback",
+                    "fps": 30,
+                    "rain_fog_detection": true,
+                    "darkness_detection": true,
+                    "image_recovery": true
+                  }
+                },
+                "stabilized": {
+                  "summary": "4. Stabilized / 穩定影片",
+                  "description": "All processing + smooth 60fps motion interpolation. ~65 min for 15K images. 完整處理 + 平滑 60fps 動態補間。15K 張約 65 分鐘。",
+                  "value": {
+                    "nas_path": "台電運維_完整",
+                    "callback_url": "https://your-server.com/callback",
+                    "fps": 30,
+                    "rain_fog_detection": true,
+                    "darkness_detection": true,
+                    "image_recovery": true,
+                    "stabilization": true
+                  }
+                },
+                "quick_test": {
+                  "summary": "5. Quick test / 快速測試",
+                  "description": "Test with 100 images only. 僅使用 100 張圖片測試。",
+                  "value": {
+                    "nas_path": "台電運維_完整",
+                    "callback_url": "https://your-server.com/callback",
+                    "fps": 30,
+                    "max_images": 100,
+                    "rain_fog_detection": true,
+                    "darkness_detection": true
+                  }
+                },
+                "rain_only": {
+                  "summary": "6. Rain/fog only / 僅偵測雨霧",
+                  "description": "Only detect rain/fog, no darkness check. 僅偵測雨滴/霧氣，不檢查亮度。",
+                  "value": {
+                    "nas_path": "時代海德_完整",
+                    "callback_url": "https://your-server.com/callback",
+                    "fps": 30,
+                    "rain_fog_detection": true
+                  }
+                },
+                "darkness_only": {
+                  "summary": "7. Darkness only / 僅偵測亮度",
+                  "description": "Only remove too dark/bright images. 僅移除過暗/過亮圖片。",
+                  "value": {
+                    "nas_path": "時代海德_完整",
+                    "callback_url": "https://your-server.com/callback",
+                    "fps": 30,
+                    "darkness_detection": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobCreateResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/synology": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Create Synology Job",
+        "description": "Create a job from images on Synology NAS via FileStation API.",
+        "operationId": "create_synology_job_jobs_synology_post",
+        "parameters": [
+          {
+            "name": "api_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Api Key"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SynologyJobCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobCreateResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Get Job Status",
+        "operationId": "get_job_status_jobs__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "api_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Api Key"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Delete Job",
+        "operationId": "delete_job_jobs__job_id__delete",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "api_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Api Key"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/download": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Download Video",
+        "description": "Stream the rendered MP4 directly from the NAS mount.\n\nThe worker writes a copy to {synology_path}/video/{site}_{job_short}.mp4\nafter each NAS/Synology job. Serving from disk via FileResponse uses\nsendfile() and bypasses the urllib3+MinIO chunked-stream path that\ncapped throughput at ~3 MB/s on multi-GB videos.",
+        "operationId": "download_video_jobs__job_id__download_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "api_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Api Key"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Body_create_job_jobs_post": {
+        "properties": {
+          "images": {
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "type": "array",
+            "title": "Images"
+          },
+          "callback_url": {
+            "type": "string",
+            "title": "Callback Url"
+          },
+          "fps": {
+            "type": "integer",
+            "title": "Fps",
+            "default": 30
+          },
+          "reference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference"
+          }
+        },
+        "type": "object",
+        "required": [
+          "images",
+          "callback_url"
+        ],
+        "title": "Body_create_job_jobs_post"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "default": "ok"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version",
+            "default": "1.0.0"
+          }
+        },
+        "type": "object",
+        "title": "HealthResponse"
+      },
+      "JobCreateResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Job Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "image_count": {
+            "type": "integer",
+            "title": "Image Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "status",
+          "image_count"
+        ],
+        "title": "JobCreateResponse"
+      },
+      "JobStatusResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Job Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "image_count": {
+            "type": "integer",
+            "title": "Image Count"
+          },
+          "fps": {
+            "type": "integer",
+            "title": "Fps"
+          },
+          "resolution": {
+            "type": "string",
+            "title": "Resolution"
+          },
+          "percent_complete": {
+            "type": "integer",
+            "title": "Percent Complete",
+            "default": 0
+          },
+          "estimated_time_remaining": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Time Remaining"
+          },
+          "current_stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Stage"
+          },
+          "stage_detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage Detail"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "video_duration_secs": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Video Duration Secs"
+          },
+          "quality_report": {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quality Report"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "status",
+          "image_count",
+          "fps",
+          "resolution",
+          "created_at"
+        ],
+        "title": "JobStatusResponse"
+      },
+      "NasJobCreateRequest": {
+        "properties": {
+          "nas_path": {
+            "type": "string",
+            "title": "Nas Path",
+            "description": "Folder path on NAS containing the images. NAS 上包含圖片的資料夾路徑。",
+            "examples": [
+              "台電運維_完整",
+              "時代海德_完整"
+            ]
+          },
+          "callback_url": {
+            "type": "string",
+            "title": "Callback Url",
+            "description": "URL to receive job completion notification. 任務完成時接收通知的網址。"
+          },
+          "fps": {
+            "type": "integer",
+            "maximum": 60,
+            "minimum": 1,
+            "title": "Fps",
+            "description": "Video frame rate (frames per second). 影片幀率（每秒幀數）。",
+            "default": 30
+          },
+          "resolution": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution",
+            "description": "Video resolution. Default: 3840x2160 (4K). 影片解析度。預設：3840x2160（4K）。",
+            "examples": [
+              "3840x2160",
+              "1920x1080"
+            ]
+          },
+          "reference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference",
+            "description": "Reference image filename for color correction. Auto-selected if not set. 色彩校正的參考圖片檔名。未設定則自動選擇。"
+          },
+          "start_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Date",
+            "description": "Only include images after this date (requires date in filename). 僅包含此日期之後的圖片（需要檔名中包含日期）。"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Date",
+            "description": "Only include images before this date (requires date in filename). 僅包含此日期之前的圖片（需要檔名中包含日期）。"
+          },
+          "max_images": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Images",
+            "description": "Limit to first N images. Useful for quick tests. 限制前 N 張圖片。適用於快速測試。",
+            "examples": [100, 500, 1000]
+          },
+          "rain_fog_detection": {
+            "type": "boolean",
+            "title": "Rain Fog Detection",
+            "description": "Enable AI rain/fog/water-drop detection (CLIP model). Removes images with rain drops, fog, haze, or dirty lens. Uses medium sensitivity — only removes clearly damaged images. Thresholds configurable in .env. ~26 min for 15K images. \n\n啟用 AI 雨滴/霧氣/水滴偵測（CLIP 模型）。移除有雨滴、霧氣、朦朧或鏡頭髒污的圖片。使用中等靈敏度 — 僅移除明顯受損的圖片。閾值可在 .env 中設定。15K 張圖片約 26 分鐘。",
+            "default": false
+          },
+          "darkness_detection": {
+            "type": "boolean",
+            "title": "Darkness Detection",
+            "description": "Auto-delete images that are too dark or too bright. Catches night shots, overexposed frames, and washed-out images. Thresholds (configurable in .env): brightness\u003C40=dark, \u003E220=bright, overexposed\u003E30%, underexposed\u003E30%. \n\n自動刪除過暗或過亮的圖片。捕捉夜間拍攝、過度曝光和褪色的圖片。閾值（可在 .env 設定）：亮度\u003C40=過暗，\u003E220=過亮，過度曝光\u003E30%，曝光不足\u003E30%。",
+            "default": false
+          },
+          "image_recovery": {
+            "type": "boolean",
+            "title": "Image Recovery",
+            "description": "Recover damaged images using AI temporal fusion instead of deleting them. Blends clean neighboring frames to reconstruct damaged areas. Requires rain_fog_detection or darkness_detection to be enabled. Adds ~5-15 min depending on damage rate. \n\n使用 AI 時序融合修復受損圖片，而非直接刪除。混合相鄰的乾淨幀來重建受損區域。需要啟用 rain_fog_detection 或 darkness_detection。根據損壞率增加約 5-15 分鐘。",
+            "default": false
+          },
+          "stabilization": {
+            "type": "boolean",
+            "title": "Stabilization",
+            "description": "Enable smooth video output via motion-compensated frame interpolation. Doubles frame rate (30→60fps) by synthesizing intermediate frames. Reduces the jittery/flickery look common in timelapses. Adds ~30-40 min for 4K video. \n\n透過動態補償影格插值啟用平滑影片輸出。將幀率加倍（30→60fps），合成中間影格。減少縮時影片常見的抖動/閃爍感。4K 影片額外增加約 30-40 分鐘。",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "nas_path",
+          "callback_url"
+        ],
+        "title": "NasJobCreateRequest",
+        "description": "Create a timelapse video from images on the NAS.\n\n從 NAS 上的圖片建立縮時影片。\n\nProcessing options can be combined independently.\n處理選項可以獨立組合使用。\n\n---\n\n**Scenarios / 使用情境:**\n\n1. **Raw video / 原始影片** — No toggles, fastest (~10 min for 15K images).\n   不開啟任何選項，最快速（15K 張圖片約 10 分鐘）。\n\n2. **Filtered / 過濾影片** — Remove rain, fog, and dark images.\n   移除雨天、霧氣和過暗/過亮的圖片。\n\n3. **Enhanced / 增強影片** — Detect bad images + recover them via AI fusion.\n   偵測有問題的圖片，並透過 AI 融合技術修復。\n\n4. **Stabilized / 穩定影片** — All processing + smooth 60fps motion interpolation.\n   所有處理 + 平滑 60fps 動態補間。",
+        "examples": [
+          {
+            "description": "No processing, all images to video. Fastest option. 不做任何處理，所有圖片直接生成影片。最快的選項。",
+            "summary": "Scenario 1: Raw video / 情境一：原始影片",
+            "value": {
+              "callback_url": "https://your-server.com/callback",
+              "fps": 30,
+              "nas_path": "台電運維_完整",
+              "resolution": "3840x2160"
+            }
+          },
+          {
+            "description": "Remove rain/fog/dark images, delete bad frames. 移除雨天/霧氣/過暗圖片，刪除有問題的幀。",
+            "summary": "Scenario 2: Filtered / 情境二：過濾影片",
+            "value": {
+              "callback_url": "https://your-server.com/callback",
+              "darkness_detection": true,
+              "fps": 30,
+              "nas_path": "台電運維_完整",
+              "rain_fog_detection": true
+            }
+          },
+          {
+            "description": "Detect bad images + AI recovery via temporal fusion. 偵測有問題的圖片 + AI 時序融合修復。",
+            "summary": "Scenario 3: Enhanced / 情境三：增強影片",
+            "value": {
+              "callback_url": "https://your-server.com/callback",
+              "darkness_detection": true,
+              "fps": 30,
+              "image_recovery": true,
+              "nas_path": "台電運維_完整",
+              "rain_fog_detection": true
+            }
+          },
+          {
+            "description": "Full processing + smooth 60fps motion interpolation. 完整處理 + 平滑 60fps 動態補間。",
+            "summary": "Scenario 4: Stabilized / 情境四：穩定影片",
+            "value": {
+              "callback_url": "https://your-server.com/callback",
+              "darkness_detection": true,
+              "fps": 30,
+              "image_recovery": true,
+              "nas_path": "台電運維_完整",
+              "rain_fog_detection": true,
+              "stabilization": true
+            }
+          },
+          {
+            "description": "Test with 100 images only. 僅使用 100 張圖片進行測試。",
+            "summary": "Quick test / 快速測試",
+            "value": {
+              "callback_url": "https://your-server.com/callback",
+              "darkness_detection": true,
+              "fps": 30,
+              "max_images": 100,
+              "nas_path": "台電運維_完整",
+              "rain_fog_detection": true
+            }
+          },
+          {
+            "description": "Only detect and remove rain/fog images, no darkness check. 僅偵測並移除雨滴/霧氣圖片，不檢查亮度。",
+            "summary": "Rain only / 僅偵測雨滴",
+            "value": {
+              "callback_url": "https://your-server.com/callback",
+              "fps": 30,
+              "nas_path": "時代海德_完整",
+              "rain_fog_detection": true
+            }
+          },
+          {
+            "description": "Only remove too dark/bright images, no rain/fog check. 僅移除過暗/過亮圖片，不檢查雨滴/霧氣。",
+            "summary": "Darkness only / 僅偵測亮度",
+            "value": {
+              "callback_url": "https://your-server.com/callback",
+              "darkness_detection": true,
+              "fps": 30,
+              "nas_path": "時代海德_完整"
+            }
+          }
+        ]
+      },
+      "SynologyJobCreateRequest": {
+        "properties": {
+          "synology_path": {
+            "type": "string",
+            "title": "Synology Path",
+            "description": "Synology FileStation path (e.g. /home/www/B)"
+          },
+          "callback_url": {
+            "type": "string",
+            "title": "Callback Url"
+          },
+          "fps": {
+            "type": "integer",
+            "maximum": 60,
+            "minimum": 1,
+            "title": "Fps",
+            "default": 30
+          },
+          "reference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference"
+          },
+          "batch_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Batch Size",
+            "description": "Images per batch (default: from .env)"
+          },
+          "start_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Date",
+            "description": "Start date filter (YYYY-MM-DD)"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Date",
+            "description": "End date filter (YYYY-MM-DD)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "synology_path",
+          "callback_url"
+        ],
+        "title": "SynologyJobCreateRequest"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

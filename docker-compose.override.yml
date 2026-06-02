@@ -1,0 +1,6 @@
+# 本地啟動用 override（自動與 docker-compose.yml 合併）
+# 修正：main.py 預設監聽 PORT=8000，但 compose 對外映射 8001 → 必須注入 PORT=8001
+services:
+  auth-service:
+    environment:
+      PORT: 8001
