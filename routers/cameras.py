@@ -228,20 +228,39 @@ async def nas_images(
     db: Session = Depends(get_db),
 ):
     """NAS 照片列表 proxy
-    Camera Backend 根據 camera_id 自動找正確的 NAS 路徑
-    不需要前端傳 folder_path，直接傳 camera_id 即可
+    先從 Camera Backend 取得 device_serial_id，組成 /home/firmness/{serial} 路徑
     """
     cam_token = await get_camera_backend_token(current_user)
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token")
 
-    # 轉發所有 query params（camera_id, limit, offset, start_time, end_time 等）
     params = dict(request.query_params)
-
-    # 如果前端傳了 folder_path，移除它讓 Camera Backend 用 camera_id 自動決定
-    params.pop("folder_path", None)
+    camera_id = params.get("camera_id")
 
     async with httpx.AsyncClient(timeout=30) as client:
+        # 取得 device_serial_id
+        folder_path = None
+        if camera_id:
+            cam_resp = await client.get(
+                f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
+                headers={"Authorization": f"Bearer {cam_token}"},
+            )
+            if cam_resp.status_code == 200:
+                cam_data = cam_resp.json()
+                serial = (
+                    cam_data.get("device_serial_id") or
+                    cam_data.get("serial_id") or
+                    cam_data.get("serial")
+                )
+                if serial:
+                    folder_path = f"/home/firmness/{serial}"
+
+        # 帶 folder_path 打 nas/images
+        if folder_path:
+            params["folder_path"] = folder_path
+        else:
+            params.pop("folder_path", None)
+
         resp = await client.get(
             f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
             headers={"Authorization": f"Bearer {cam_token}"},
