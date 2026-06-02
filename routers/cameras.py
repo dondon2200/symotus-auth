@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from typing import Optional
+import asyncio
 import httpx
 
 from database import get_db
@@ -228,18 +229,25 @@ async def nas_images(
     db: Session = Depends(get_db),
 ):
     """NAS 照片列表 proxy
-    先從 Camera Backend 取得 device_serial_id，組成 /home/firmness/{serial} 路徑
+    照片按日期存在子資料夾 /homes/firmness/{serial}/YYYY-MM-DD/
+    用 asyncio.gather 並行查詢所有日期資料夾，速度快
     """
+    from datetime import datetime, timedelta, date as date_type
+
     cam_token = await get_camera_backend_token(current_user)
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token")
 
     params = dict(request.query_params)
     camera_id = params.get("camera_id")
+    limit = int(params.get("limit", 30))
+    offset = int(params.get("offset", 0))
+    start_time = params.get("start_time")
+    end_time = params.get("end_time")
 
     async with httpx.AsyncClient(timeout=30) as client:
-        # 取得 device_serial_id
-        folder_path = None
+        # 1. 取得 device_serial_id
+        serial = None
         if camera_id:
             cam_resp = await client.get(
                 f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
@@ -247,31 +255,118 @@ async def nas_images(
             )
             if cam_resp.status_code == 200:
                 cam_data = cam_resp.json()
-                # Camera Backend 回傳格式：{ basic_info: { device_serial_id: ... } } 或直接頂層
                 basic = cam_data.get("basic_info", cam_data)
                 serial = (
                     basic.get("device_serial_id") or
                     basic.get("serial_id") or
                     basic.get("serial")
                 )
-                if serial:
-                    folder_path = f"/home/firmness/{serial}"
 
-        # 帶 folder_path 打 nas/images
-        if folder_path:
-            params["folder_path"] = folder_path
+        if not serial:
+            resp = await client.get(
+                f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
+                headers={"Authorization": f"Bearer {cam_token}"},
+                params=params,
+            )
+            try:
+                return JSONResponse(status_code=resp.status_code, content=resp.json())
+            except Exception:
+                return JSONResponse(status_code=resp.status_code, content={"detail": resp.text})
+
+        base_path = f"/homes/firmness/{serial}"
+
+        # 2. 產生日期列表（最新在前）
+        now = datetime.utcnow()
+        if end_time:
+            try:
+                end_dt = datetime.fromisoformat(end_time.replace("T", " ").split(".")[0]).date()
+            except Exception:
+                end_dt = now.date()
         else:
-            params.pop("folder_path", None)
+            end_dt = now.date()
 
-        resp = await client.get(
-            f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
-            headers={"Authorization": f"Bearer {cam_token}"},
-            params=params,
-        )
-        try:
-            return JSONResponse(status_code=resp.status_code, content=resp.json())
-        except Exception:
-            return JSONResponse(status_code=resp.status_code, content={"detail": resp.text})
+        if start_time:
+            try:
+                start_dt = datetime.fromisoformat(start_time.replace("T", " ").split(".")[0]).date()
+            except Exception:
+                start_dt = end_dt - timedelta(days=30)
+        else:
+            start_dt = end_dt - timedelta(days=365)  # 預設查一年
+
+        date_list = []
+        cur = end_dt
+        while cur >= start_dt and len(date_list) < 400:
+            date_list.append(cur.strftime("%Y-%m-%d"))
+            cur -= timedelta(days=1)
+
+        # 3. 並行查所有日期資料夾的 total
+        async def get_folder_total(date_str: str):
+            try:
+                r = await client.get(
+                    f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
+                    headers={"Authorization": f"Bearer {cam_token}"},
+                    params={
+                        "camera_id": camera_id,
+                        "folder_path": f"{base_path}/{date_str}",
+                        "limit": 1,
+                        "offset": 0,
+                    },
+                )
+                if r.status_code == 200:
+                    total = r.json().get("data", {}).get("total", 0)
+                    return (date_str, total)
+            except Exception:
+                pass
+            return (date_str, 0)
+
+        results = await asyncio.gather(*[get_folder_total(d) for d in date_list])
+        folder_totals = {d: t for d, t in results if t > 0}
+        active_dates = [d for d in date_list if folder_totals.get(d, 0) > 0]
+        total_count = sum(folder_totals.values())
+
+        # 4. 根據 offset/limit 取照片
+        collected = []
+        skipped = 0
+        for date_str in active_dates:
+            folder_total = folder_totals[date_str]
+            if skipped + folder_total <= offset:
+                skipped += folder_total
+                continue
+            folder_offset = offset - skipped if skipped < offset else 0
+            need = limit - len(collected)
+            r = await client.get(
+                f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
+                headers={"Authorization": f"Bearer {cam_token}"},
+                params={
+                    "camera_id": camera_id,
+                    "folder_path": f"{base_path}/{date_str}",
+                    "limit": need,
+                    "offset": folder_offset,
+                },
+            )
+            if r.status_code == 200:
+                files = r.json().get("data", {}).get("files", [])
+                for f in files:
+                    f["date"] = date_str
+                collected.extend(files)
+            skipped += folder_total
+            if len(collected) >= limit:
+                break
+
+        return JSONResponse(status_code=200, content={
+            "success": True,
+            "data": {
+                "files": collected[:limit],
+                "total": total_count,
+                "returned": len(collected[:limit]),
+                "offset": offset,
+                "limit": limit,
+            },
+            "debug": {
+                "folder_path": base_path,
+                "date_folders_found": active_dates,
+            }
+        })
 
 
 @router.get("/nas/image")
