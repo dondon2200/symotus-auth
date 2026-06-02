@@ -228,11 +228,10 @@ async def nas_images(
     db: Session = Depends(get_db),
 ):
     """NAS 照片列表 proxy
-    照片按日期存在子資料夾（/homes/firmness/{serial}/YYYY-MM-DD/）
-    Auth Service 負責列出所有日期資料夾並合併查詢
+    照片按日期存在子資料夾 /homes/firmness/{serial}/YYYY-MM-DD/
+    Auth Service 根據日期範圍推算資料夾名稱，逐一查詢並合併
     """
     from datetime import datetime, timedelta
-    import re as _re
 
     cam_token = await get_camera_backend_token(current_user)
     if not cam_token:
@@ -263,7 +262,7 @@ async def nas_images(
                 )
 
         if not serial:
-            # 沒有 serial 就用原本邏輯
+            # 沒有 serial，走原本邏輯
             resp = await client.get(
                 f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
                 headers={"Authorization": f"Bearer {cam_token}"},
@@ -276,89 +275,77 @@ async def nas_images(
 
         base_path = f"/homes/firmness/{serial}"
 
-        # 2. 列出根目錄取得所有日期資料夾
-        list_resp = await client.get(
-            f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
-            headers={"Authorization": f"Bearer {cam_token}"},
-            params={"camera_id": camera_id, "folder_path": base_path, "limit": 1000, "offset": 0},
-        )
-        list_data = list_resp.json() if list_resp.status_code == 200 else {}
-
-        # 從回傳的 files 裡找出日期資料夾（格式 YYYY-MM-DD）
-        all_files = list_data.get("data", {}).get("files", [])
-        date_folders = sorted([
-            f["name"] for f in all_files
-            if _re.match(r'^\d{4}-\d{2}-\d{2}$', f.get("name", ""))
-        ], reverse=True)  # 最新日期在前
-
-        # 如果有日期時間篩選，過濾資料夾
+        # 2. 根據日期範圍推算要查的日期資料夾
+        now = datetime.utcnow()
         if start_time:
-            start_date = start_time[:10]  # YYYY-MM-DD
-            date_folders = [d for d in date_folders if d >= start_date]
-        if end_time:
-            end_date = end_time[:10]
-            date_folders = [d for d in date_folders if d <= end_date]
-
-        if not date_folders:
-            # 沒有日期資料夾，直接讀根目錄
-            resp = await client.get(
-                f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
-                headers={"Authorization": f"Bearer {cam_token}"},
-                params={**params, "folder_path": base_path},
-            )
             try:
-                return JSONResponse(status_code=resp.status_code, content=resp.json())
+                start_dt = datetime.fromisoformat(start_time.replace("T", " ").split(".")[0])
             except Exception:
-                return JSONResponse(status_code=resp.status_code, content={"detail": resp.text})
+                start_dt = now - timedelta(days=30)
+        else:
+            start_dt = now - timedelta(days=30)
 
-        # 3. 計算 total（所有日期資料夾的照片總數）
-        # 先用第一個資料夾拿 total 估算，之後再精確
-        total_count = 0
+        if end_time:
+            try:
+                end_dt = datetime.fromisoformat(end_time.replace("T", " ").split(".")[0])
+            except Exception:
+                end_dt = now
+        else:
+            end_dt = now
+
+        # 產生日期列表（最新在前）
+        date_list = []
+        cur = end_dt.date()
+        start_date = start_dt.date()
+        while cur >= start_date:
+            date_list.append(cur.strftime("%Y-%m-%d"))
+            cur -= timedelta(days=1)
+            if len(date_list) > 365:
+                break
+
+        # 3. 查每個日期資料夾的 total
         folder_totals = {}
-        for date_folder in date_folders:
-            folder_resp = await client.get(
+        for date_str in date_list:
+            folder_path = f"{base_path}/{date_str}"
+            r = await client.get(
                 f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
                 headers={"Authorization": f"Bearer {cam_token}"},
-                params={"camera_id": camera_id, "folder_path": f"{base_path}/{date_folder}", "limit": 1, "offset": 0},
+                params={"camera_id": camera_id, "folder_path": folder_path, "limit": 1, "offset": 0},
             )
-            if folder_resp.status_code == 200:
-                folder_total = folder_resp.json().get("data", {}).get("total", 0)
-                folder_totals[date_folder] = folder_total
-                total_count += folder_total
+            if r.status_code == 200:
+                total = r.json().get("data", {}).get("total", 0)
+                if total > 0:
+                    folder_totals[date_str] = total
 
-        # 4. 根據 offset/limit 決定從哪個資料夾開始取
+        total_count = sum(folder_totals.values())
+
+        # 4. 根據 offset/limit 從對應資料夾取照片
         collected = []
         skipped = 0
-        for date_folder in date_folders:
-            folder_total = folder_totals.get(date_folder, 0)
+        for date_str in date_list:
+            folder_total = folder_totals.get(date_str, 0)
+            if folder_total == 0:
+                continue
             if skipped + folder_total <= offset:
                 skipped += folder_total
                 continue
             folder_offset = offset - skipped if skipped < offset else 0
             need = limit - len(collected)
-            folder_resp = await client.get(
+            folder_path = f"{base_path}/{date_str}"
+            r = await client.get(
                 f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
                 headers={"Authorization": f"Bearer {cam_token}"},
                 params={
                     "camera_id": camera_id,
-                    "folder_path": f"{base_path}/{date_folder}",
+                    "folder_path": folder_path,
                     "limit": need,
                     "offset": folder_offset,
-                    **({"start_time": start_time} if start_time else {}),
-                    **({"end_time": end_time} if end_time else {}),
                 },
             )
-            if folder_resp.status_code == 200:
-                files = folder_resp.json().get("data", {}).get("files", [])
-                # 在每張照片的 path 加上日期資料夾，讓前端能正確載入
+            if r.status_code == 200:
+                files = r.json().get("data", {}).get("files", [])
                 for f in files:
-                    if not f.get("path", "").startswith(base_path):
-                        f["path"] = f"{base_path}/{date_folder}/{f['name']}"
-                    if f.get("image_url") and not f["image_url"].startswith("http"):
-                        f["image_url"] = f["image_url"].replace(
-                            base_path, f"{base_path}/{date_folder}"
-                        ) if base_path in f["image_url"] else f["image_url"]
-                    f["date"] = date_folder  # 加上日期欄位給前端用
+                    f["date"] = date_str  # 加日期欄位給前端用
                 collected.extend(files)
             skipped += folder_total
             if len(collected) >= limit:
@@ -375,7 +362,7 @@ async def nas_images(
             },
             "debug": {
                 "folder_path": base_path,
-                "date_folders": date_folders,
+                "date_folders_found": list(folder_totals.keys()),
             }
         })
 
