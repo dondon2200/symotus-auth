@@ -247,10 +247,12 @@ async def nas_images(
             )
             if cam_resp.status_code == 200:
                 cam_data = cam_resp.json()
+                # Camera Backend 回傳格式：{ basic_info: { device_serial_id: ... } } 或直接頂層
+                basic = cam_data.get("basic_info", cam_data)
                 serial = (
-                    cam_data.get("device_serial_id") or
-                    cam_data.get("serial_id") or
-                    cam_data.get("serial")
+                    basic.get("device_serial_id") or
+                    basic.get("serial_id") or
+                    basic.get("serial")
                 )
                 if serial:
                     folder_path = f"/home/firmness/{serial}"
