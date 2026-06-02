@@ -319,7 +319,11 @@ async def nas_images(
                 pass
             return (date_str, 0)
 
-        results = await asyncio.gather(*[get_folder_total(d) for d in date_list])
+        sem = asyncio.Semaphore(10)  # 最多同時 10 個請求，避免 OOM
+        async def get_folder_total_safe(date_str: str):
+            async with sem:
+                return await get_folder_total(date_str)
+        results = await asyncio.gather(*[get_folder_total_safe(d) for d in date_list])
         folder_totals = {d: t for d, t in results if t > 0}
         active_dates = [d for d in date_list if folder_totals.get(d, 0) > 0]
         total_count = sum(folder_totals.values())

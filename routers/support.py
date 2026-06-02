@@ -55,3 +55,16 @@ def revoke_grant(
         raise HTTPException(404, "授權不存在")
     grant.revoked_at = datetime.utcnow(); db.commit()
     return {"message": "授權已撤銷"}
+
+
+@router.delete("/admin/grants/{grant_id}")
+def admin_revoke_grant(
+    grant_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("symotus_admin"))
+):
+    grant = db.query(TechSupportGrant).filter(TechSupportGrant.id == grant_id).first()
+    if not grant:
+        raise HTTPException(404, "授權不存在")
+    grant.revoked_at = datetime.utcnow(); db.commit()
+    return {"message": "授權已撤銷"}
