@@ -325,6 +325,8 @@ async def nas_images(
         total_count = sum(folder_totals.values())
 
         # 4. 根據 offset/limit 取照片
+        # Camera Backend 每次最多回傳 30 筆，超過會回 0，需分批取
+        CAM_MAX = 30
         collected = []
         skipped = 0
         for date_str in active_dates:
@@ -334,21 +336,31 @@ async def nas_images(
                 continue
             folder_offset = offset - skipped if skipped < offset else 0
             need = limit - len(collected)
-            r = await client.get(
-                f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
-                headers={"Authorization": f"Bearer {cam_token}"},
-                params={
-                    "camera_id": camera_id,
-                    "folder_path": f"{base_path}/{date_str}",
-                    "limit": need,
-                    "offset": folder_offset,
-                },
-            )
-            if r.status_code == 200:
+            # 分批取，每批最多 CAM_MAX 筆
+            while need > 0:
+                chunk = min(need, CAM_MAX)
+                r = await client.get(
+                    f"{CAMERA_BACKEND_URL}/api/camera/nas/images",
+                    headers={"Authorization": f"Bearer {cam_token}"},
+                    params={
+                        "camera_id": camera_id,
+                        "folder_path": f"{base_path}/{date_str}",
+                        "limit": chunk,
+                        "offset": folder_offset,
+                    },
+                )
+                if r.status_code != 200:
+                    break
                 files = r.json().get("data", {}).get("files", [])
+                if not files:
+                    break
                 for f in files:
                     f["date"] = date_str
                 collected.extend(files)
+                folder_offset += len(files)
+                need -= len(files)
+                if len(files) < chunk:
+                    break  # 該日資料夾已取完
             skipped += folder_total
             if len(collected) >= limit:
                 break
