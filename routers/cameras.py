@@ -255,7 +255,7 @@ async def nas_images(
                     basic.get("serial")
                 )
                 if serial:
-                    folder_path = f"/home/firmness/{serial}"
+                    folder_path = f"/homes/{serial}/ipcam"
 
         # 帶 folder_path 打 nas/images
         if folder_path:
