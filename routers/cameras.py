@@ -102,7 +102,9 @@ async def list_cameras(
                 r = await client.get(f"{CAMERA_BACKEND_URL}/api/cameras/{cam_id}",
                                      headers={"Authorization": f"Bearer {owner_token}"})
                 if r.status_code == 200:
-                    cameras.append(r.json())
+                    cam_data = r.json()
+                    cam_data["permission_level"] = a.permission_level if hasattr(a, 'permission_level') else "photos_stream"
+                    cameras.append(cam_data)
 
     return {"cameras": cameras, "total": len(cameras)}
 

@@ -45,6 +45,7 @@ class CameraAccess(Base):
     camera_id = Column(Integer, nullable=False, index=True)  # 現有後端的 camera ID
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     granted_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    permission_level = Column(String, default="photos_stream", nullable=False)  # full / photos_stream / stream_only
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", foreign_keys=[user_id], back_populates="camera_accesses")
@@ -151,6 +152,7 @@ class CameraInvitation(Base):
     camera_name = Column(String, nullable=True)                            # 方便顯示
     status = Column(String, default="pending")                             # pending / accepted / declined
     note = Column(String, nullable=True)
+    permission_level = Column(String, default="photos_stream", nullable=False)  # full / photos_stream / stream_only
     expires_at = Column(DateTime, nullable=True)                           # None = 不過期
     created_at = Column(DateTime, default=datetime.utcnow)
     responded_at = Column(DateTime, nullable=True)

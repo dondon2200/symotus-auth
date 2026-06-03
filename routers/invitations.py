@@ -19,10 +19,17 @@ router = APIRouter(prefix="/invitations", tags=["invitations"])
 FRONTEND_URL = getattr(settings, "FRONTEND_URL", "https://admin.symotus.com")
 
 
+PERMISSION_LABELS = {
+    "full": "完整存取（設定＋照片＋串流）",
+    "photos_stream": "照片＋串流（不可改設定）",
+    "stream_only": "只看串流",
+}
+
 class CreateInvitationBody(BaseModel):
     camera_id: int
     camera_name: Optional[str] = None
     note: Optional[str] = None
+    permission_level: str = "photos_stream"  # full / photos_stream / stream_only
     expires_hours: Optional[int] = None  # None = 不過期
 
 
@@ -44,6 +51,7 @@ def create_invitation(
         camera_id=body.camera_id,
         camera_name=body.camera_name or f"相機 #{body.camera_id}",
         note=body.note,
+        permission_level=body.permission_level if body.permission_level in ("full","photos_stream","stream_only") else "photos_stream",
         expires_at=expires_at,
     )
     db.add(inv); db.commit(); db.refresh(inv)
@@ -76,6 +84,8 @@ def preview_invitation(token: str, db: Session = Depends(get_db)):
         "camera_name": inv.camera_name,
         "inviter_name": inviter.full_name or inviter.username or inviter.email if inviter else "管理員",
         "note": inv.note,
+        "permission_level": inv.permission_level,
+        "permission_label": PERMISSION_LABELS.get(inv.permission_level, ""),
         "expires_at": inv.expires_at.isoformat() if inv.expires_at else None,
     }
 
@@ -101,7 +111,7 @@ def accept_invitation(
         CameraAccess.camera_id == inv.camera_id,
     ).first()
     if not existing:
-        db.add(CameraAccess(camera_id=inv.camera_id, user_id=current_user.id, granted_by=inv.inviter_id))
+        db.add(CameraAccess(camera_id=inv.camera_id, user_id=current_user.id, granted_by=inv.inviter_id, permission_level=inv.permission_level))
 
     inv.status = "accepted"
     inv.invitee_id = current_user.id
@@ -147,6 +157,8 @@ def list_sent_invitations(
         "status": inv.status,
         "invite_url": f"{FRONTEND_URL}/camera-invite/{inv.token}",
         "created_at": inv.created_at.isoformat() if inv.created_at else None,
+        "permission_level": inv.permission_level,
+        "permission_label": PERMISSION_LABELS.get(inv.permission_level, ""),
         "expires_at": inv.expires_at.isoformat() if inv.expires_at else None,
     } for inv in invs]
 
