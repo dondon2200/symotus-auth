@@ -391,17 +391,31 @@ async def create_gdrive_job(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """從 Google Drive 公開資料夾建立縮時影片 job（立即回傳，背景跑全流程）"""
-    folder_id = _extract_folder_id(body.folder_url)
-    if not folder_id:
-        raise HTTPException(400, "無法解析 Google Drive 資料夾連結，請確認格式正確")
+    """從 Google Drive 公開資料夾建立縮時影片 job（委派給 Camera Backend 處理）"""
+    # 呼叫 Camera Backend 新 API
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{SPARK_API_URL.replace('/spark', '')}/api/timelapse/gdrive-import",
+            headers={"x-service-key": SPARK_API_KEY},
+            json={
+                "folder_url": body.folder_url,
+                "fps": body.fps,
+                "resolution": body.resolution,
+                "max_images": body.max_images,
+            },
+        )
+    if resp.status_code not in (200, 201):
+        raise HTTPException(502, f"Camera Backend 錯誤：{resp.text[:200]}")
 
-    # 立即建立 DB 記錄並回傳，不等待 Drive API
+    cam_data = resp.json()
+    cam_job_id = cam_data.get("job_id")
+
+    # 在 Auth Service DB 記錄（spark_job_id 存 Camera Backend job_id）
     job = GDriveJob(
         user_id=current_user.id,
         folder_url=body.folder_url,
         status="pending",
-        total_images=0,
+        spark_job_id=str(cam_job_id),
         fps=body.fps,
         resolution=body.resolution,
     )
@@ -409,14 +423,11 @@ async def create_gdrive_job(
     db.commit()
     db.refresh(job)
 
-    # 背景執行：列清單 + 下載 + 送 Spark
-    asyncio.create_task(_run_gdrive_background_full(job.id, folder_id, body.fps, body.resolution, body.max_images))
-
     return {
         "job_id": job.id,
         "status": "pending",
         "image_count": 0,
-        "message": "已開始處理，正在讀取 Google Drive 資料夾",
+        "message": "已委派 Camera Backend 開始處理",
         "warning": None,
     }
 
@@ -427,7 +438,7 @@ async def get_gdrive_job(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """查詢 Google Drive 縮時 job 進度"""
+    """查詢 Google Drive 縮時 job 進度（proxy Camera Backend）"""
     job = db.query(GDriveJob).filter(
         GDriveJob.id == job_id,
         GDriveJob.user_id == current_user.id,
@@ -435,59 +446,59 @@ async def get_gdrive_job(
     if not job:
         raise HTTPException(404, "找不到此任務")
 
-    # 如果 Spark 已有 job_id，直接 poll Spark 取最新狀態
-    if job.spark_job_id and job.status == "processing":
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                spark_resp = await client.get(
-                    f"{SPARK_API_URL}/jobs/{job.spark_job_id}",
-                    headers={"x-api-key": SPARK_API_KEY},
-                )
-            if spark_resp.status_code == 200:
-                spark_data = spark_resp.json()
-                if spark_data.get("status") == "completed":
-                    job.status = "completed"
-                    job.video_url = f"{SPARK_API_URL}/jobs/{job.spark_job_id}/download?api_key={SPARK_API_KEY}"
-                    db.commit()
-                elif spark_data.get("status") == "failed":
-                    job.status = "failed"
-                    job.error_message = spark_data.get("error_message", "")
-                    db.commit()
-        except Exception:
-            pass
+    if not job.spark_job_id:
+        return {"job_id": job.id, "status": "pending", "percent_complete": 0, "current_stage": "準備中"}
 
-    # 計算進度
-    if job.status == "completed":
-        percent = 100
-    elif job.status == "failed":
-        percent = 0
-    elif job.status == "downloading":
-        percent = int((job.downloaded_count / job.total_images * 60)) if job.total_images > 0 else 5
-    elif job.status == "uploading":
-        percent = 65
-    elif job.status == "processing":
-        percent = 75
-    else:
-        percent = 2
+    # Proxy Camera Backend 取即時狀態
+    cam_status = {}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            cam_resp = await client.get(
+                f"{SPARK_API_URL.replace('/spark', '')}/api/timelapse/jobs/{job.spark_job_id}",
+                headers={"x-service-key": SPARK_API_KEY},
+            )
+        if cam_resp.status_code == 200:
+            cam_status = cam_resp.json()
+    except Exception:
+        pass
+
+    status = cam_status.get("status", job.status)
+    image_count = cam_status.get("image_count", 0)
+    downloaded = cam_status.get("downloaded_count", 0)
+    error = cam_status.get("error_message") or cam_status.get("spark_error")
+    video_url = cam_status.get("video_url")
+
+    # Camera Backend status → percent
+    percent_map = {"pending": 2, "listing": 5, "downloading": 0, "submitted": 70, "completed": 100, "failed": 0}
+    percent = percent_map.get(status, 2)
+    if status == "downloading" and image_count > 0:
+        percent = max(5, int(downloaded / image_count * 60))
 
     stage_map = {
         "pending": "準備中",
-        "downloading": f"下載照片中（{job.downloaded_count}/{job.total_images}）",
-        "uploading": "上傳至處理伺服器中",
-        "processing": "AI 生成影片中",
+        "listing": "讀取 Google Drive 資料夾中",
+        "downloading": f"下載照片中（{downloaded}/{image_count}）",
+        "submitted": "送出 Spark 生成中",
         "completed": "完成",
         "failed": "失敗",
     }
 
+    # 同步 DB
+    if status in ("completed", "failed") and job.status != status:
+        job.status = status
+        if video_url: job.video_url = video_url
+        if error: job.error_message = error
+        db.commit()
+
     return {
         "job_id": job.id,
-        "status": job.status,
+        "status": status,
         "percent_complete": percent,
-        "image_count": job.total_images,
-        "downloaded_count": job.downloaded_count,
-        "current_stage": stage_map.get(job.status, "處理中"),
-        "video_download_url": job.video_url,
-        "error_message": job.error_message,
+        "image_count": image_count,
+        "downloaded_count": downloaded,
+        "current_stage": stage_map.get(status, "處理中"),
+        "video_download_url": video_url or job.video_url,
+        "error_message": error or job.error_message,
     }
 
 
