@@ -140,15 +140,17 @@ class GDriveJob(Base):
 
 
 class CameraInvitation(Base):
-    """相機存取邀請（等待接受/拒絕）"""
+    """相機存取邀請（連結式，點連結接受）"""
     __tablename__ = "camera_invitations"
 
     id = Column(Integer, primary_key=True, index=True)
+    token = Column(String, unique=True, nullable=False, index=True)        # 分享連結 token
     inviter_id = Column(Integer, ForeignKey("users.id"), nullable=False)   # 邀請者
-    invitee_id = Column(Integer, ForeignKey("users.id"), nullable=False)   # 被邀請者
+    invitee_id = Column(Integer, ForeignKey("users.id"), nullable=True)    # 接受者（接受後填入）
     camera_id = Column(Integer, nullable=False)
     camera_name = Column(String, nullable=True)                            # 方便顯示
     status = Column(String, default="pending")                             # pending / accepted / declined
     note = Column(String, nullable=True)
+    expires_at = Column(DateTime, nullable=True)                           # None = 不過期
     created_at = Column(DateTime, default=datetime.utcnow)
     responded_at = Column(DateTime, nullable=True)
