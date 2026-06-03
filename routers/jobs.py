@@ -445,6 +445,32 @@ async def create_gdrive_job(
     }
 
 
+
+@router.get("/gdrive")
+async def list_gdrive_jobs(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """列出目前用戶的所有 Google Drive 縮時 jobs"""
+    jobs = db.query(GDriveJob).filter(
+        GDriveJob.user_id == current_user.id
+    ).order_by(GDriveJob.created_at.desc()).all()
+    return [
+        {
+            "job_id": job.id,
+            "status": job.status,
+            "folder_url": job.folder_url,
+            "fps": job.fps,
+            "resolution": job.resolution,
+            "total_images": job.total_images,
+            "downloaded_count": job.downloaded_count,
+            "video_download_url": job.video_url,
+            "error_message": job.error_message,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+        }
+        for job in jobs
+    ]
+
 @router.get("/gdrive/{job_id}")
 async def get_gdrive_job(
     job_id: int,
