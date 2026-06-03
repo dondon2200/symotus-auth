@@ -392,11 +392,24 @@ async def create_gdrive_job(
     db: Session = Depends(get_db),
 ):
     """從 Google Drive 公開資料夾建立縮時影片 job（委派給 Camera Backend 處理）"""
+    # 先取得 Camera Backend user token（用 admin 帳號）
+    CAMERA_BACKEND = "https://user.symotus.com"
+    CAM_SVCKEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+    async with httpx.AsyncClient(timeout=15) as client:
+        tok_resp = await client.post(
+            f"{CAMERA_BACKEND}/internal/auth/token",
+            headers={"x-service-key": CAM_SVCKEY},
+            json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+        )
+    if tok_resp.status_code != 200:
+        raise HTTPException(502, f"無法取得 Camera Backend token：{tok_resp.text[:100]}")
+    cam_token = tok_resp.json().get("access_token", "")
+
     # 呼叫 Camera Backend 新 API
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
-            f"{SPARK_API_URL.replace('/spark', '')}/api/timelapse/gdrive-import",
-            headers={"x-service-key": SPARK_API_KEY},
+            f"{CAMERA_BACKEND}/api/timelapse/gdrive-import",
+            headers={"Authorization": f"Bearer {cam_token}"},
             json={
                 "folder_url": body.folder_url,
                 "fps": body.fps,
@@ -450,12 +463,21 @@ async def get_gdrive_job(
         return {"job_id": job.id, "status": "pending", "percent_complete": 0, "current_stage": "準備中"}
 
     # Proxy Camera Backend 取即時狀態
+    CAMERA_BACKEND = "https://user.symotus.com"
+    CAM_SVCKEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
     cam_status = {}
     try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            tok_resp = await client.post(
+                f"{CAMERA_BACKEND}/internal/auth/token",
+                headers={"x-service-key": CAM_SVCKEY},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+            )
+        cam_token = tok_resp.json().get("access_token", "") if tok_resp.status_code == 200 else ""
         async with httpx.AsyncClient(timeout=15) as client:
             cam_resp = await client.get(
-                f"{SPARK_API_URL.replace('/spark', '')}/api/timelapse/jobs/{job.spark_job_id}",
-                headers={"x-service-key": SPARK_API_KEY},
+                f"{CAMERA_BACKEND}/api/timelapse/jobs/{job.spark_job_id}",
+                headers={"Authorization": f"Bearer {cam_token}"},
             )
         if cam_resp.status_code == 200:
             cam_status = cam_resp.json()
