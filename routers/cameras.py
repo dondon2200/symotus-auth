@@ -180,9 +180,22 @@ async def get_camera(
             f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
             headers={"Authorization": f"Bearer {cam_token}"},
         )
-        if resp.status_code == 200:
-            return resp.json()
-        raise HTTPException(resp.status_code, resp.text)
+        if resp.status_code != 200:
+            raise HTTPException(resp.status_code, resp.text)
+        data = resp.json()
+
+    # 附上當前用戶的權限等級
+    if current_user.role in ("reseller", "symotus_admin"):
+        data["my_permission"] = "full"
+    else:
+        from models import CameraAccess
+        access = db.query(CameraAccess).filter(
+            CameraAccess.camera_id == camera_id,
+            CameraAccess.user_id == current_user.id,
+        ).first()
+        data["my_permission"] = access.permission_level if access else "stream_only"
+
+    return data
 
 
 @router.post("/{camera_id}/unbind")
