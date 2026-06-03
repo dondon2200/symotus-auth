@@ -137,3 +137,18 @@ class GDriveJob(Base):
     error_message = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class CameraInvitation(Base):
+    """相機存取邀請（等待接受/拒絕）"""
+    __tablename__ = "camera_invitations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    inviter_id = Column(Integer, ForeignKey("users.id"), nullable=False)   # 邀請者
+    invitee_id = Column(Integer, ForeignKey("users.id"), nullable=False)   # 被邀請者
+    camera_id = Column(Integer, nullable=False)
+    camera_name = Column(String, nullable=True)                            # 方便顯示
+    status = Column(String, default="pending")                             # pending / accepted / declined
+    note = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    responded_at = Column(DateTime, nullable=True)
