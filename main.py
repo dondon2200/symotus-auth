@@ -64,7 +64,7 @@ async def startup():
                 logger.error("Failed to connect to DB after all retries")
                 raise
 
-from routers import auth, invites, users, support, admin, jobs, cameras
+from routers import auth, invites, users, support, admin, jobs, cameras, line_webhook
 app.include_router(auth.router)
 app.include_router(invites.router)
 app.include_router(users.router)
@@ -72,6 +72,7 @@ app.include_router(support.router)
 app.include_router(admin.router)
 app.include_router(jobs.router)
 app.include_router(cameras.router)
+app.include_router(line_webhook.router)
 
 @app.get("/health")
 def health():
