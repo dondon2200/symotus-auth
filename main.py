@@ -15,8 +15,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL, "http://localhost:3000"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -54,6 +54,29 @@ async def startup():
                     conn.commit()
                 except Exception:
                     conn.rollback()
+            # 確保 camera_invitations table 存在（新功能）
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS camera_invitations (
+                            id SERIAL PRIMARY KEY,
+                            token VARCHAR UNIQUE NOT NULL,
+                            inviter_id INTEGER REFERENCES users(id),
+                            camera_id INTEGER NOT NULL,
+                            camera_name VARCHAR,
+                            note TEXT,
+                            permission_level VARCHAR DEFAULT 'photos_stream',
+                            status VARCHAR DEFAULT 'pending',
+                            invitee_id INTEGER REFERENCES users(id),
+                            expires_at TIMESTAMP,
+                            responded_at TIMESTAMP,
+                            created_at TIMESTAMP DEFAULT NOW()
+                        )
+                    """))
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    logger.warning(f"camera_invitations migration: {e}")
             logger.info("DB connected and tables created!")
             break
         except Exception as e:
