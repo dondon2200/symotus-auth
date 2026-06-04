@@ -84,6 +84,8 @@ async def startup():
                     ("token", "VARCHAR", None),
                     ("permission_level", "VARCHAR", "'photos_stream'"),
                     ("invitee_id", "INTEGER", None),
+                    ("expires_at", "TIMESTAMP", None),
+                    ("responded_at", "TIMESTAMP", None),
                 ]:
                     try:
                         if default:
