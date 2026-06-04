@@ -133,6 +133,25 @@ async def list_cameras(
     return {"cameras": cameras, "total": len(cameras)}
 
 
+@router.get("/timer-status")
+async def get_timer_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """取得所有相機定時開關機倒數狀態"""
+    cam_token = await get_camera_backend_token(current_user)
+    if not cam_token:
+        return {"timers": []}
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{CAMERA_BACKEND_URL}/api/cameras/timer-status",
+            headers={"Authorization": f"Bearer {cam_token}"},
+        )
+    if resp.status_code == 200:
+        return resp.json()
+    return {"timers": []}
+
+
 @router.get("/thumbnails/latest")
 async def get_thumbnails(
     ids: str = "",
