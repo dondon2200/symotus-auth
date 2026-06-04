@@ -13,7 +13,7 @@ CAMERA_BACKEND_URL = "https://user.symotus.com"
 CAMERA_SERVICE_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
 LINE_ACCESS_TOKEN  = "ShTSgT5SabcpwdKVqTQUR5toy4/UdRWr+oxQpQYYKeswYmwD1mJ3NuD0velI+mXPDNSX5VJiTfWjF60Ji7scmd1Mawyn2jCGPg6LmOuRSbs7UQKr/tN8QaMnb028Zuazo/WMSmuDzZGkX/agdTKymAdB04t89/1O/w1cDnyilFU="
 FRONTEND_URL       = "https://admin.symotus.com"
-CHECK_INTERVAL     = 300  # 5 分鐘
+CHECK_INTERVAL     = 60   # 1 分鐘
 
 _prev_status: dict[int, bool] = {}
 
