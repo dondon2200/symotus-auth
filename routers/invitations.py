@@ -151,16 +151,20 @@ def list_sent_invitations(
         CameraInvitation.inviter_id == current_user.id,
     ).order_by(CameraInvitation.created_at.desc()).limit(50).all()
 
-    return [{
-        "id": inv.id, "token": inv.token,
-        "camera_name": inv.camera_name,
-        "status": inv.status,
-        "invite_url": f"{FRONTEND_URL}/camera-invite/{inv.token}",
-        "created_at": inv.created_at.isoformat() if inv.created_at else None,
-        "permission_level": inv.permission_level,
-        "permission_label": PERMISSION_LABELS.get(inv.permission_level, ""),
-        "expires_at": inv.expires_at.isoformat() if inv.expires_at else None,
-    } for inv in invs]
+    result = []
+    for inv in invs:
+        invitee = db.query(User).filter(User.id == inv.invitee_id).first() if inv.invitee_id else None
+        result.append({
+            "id": inv.id, "token": inv.token, "camera_id": inv.camera_id,
+            "camera_name": inv.camera_name, "status": inv.status,
+            "invite_url": f"{FRONTEND_URL}/camera-invite/{inv.token}",
+            "created_at": inv.created_at.isoformat() if inv.created_at else None,
+            "permission_level": inv.permission_level,
+            "permission_label": PERMISSION_LABELS.get(inv.permission_level, ""),
+            "invitee_name": (invitee.full_name or invitee.username or invitee.email) if invitee else None,
+            "expires_at": inv.expires_at.isoformat() if inv.expires_at else None,
+        })
+    return result
 
 
 # ── 取消邀請──────────────────────────────────────────────────────────────────
@@ -173,9 +177,15 @@ def cancel_invitation(
     inv = db.query(CameraInvitation).filter(
         CameraInvitation.id == inv_id,
         CameraInvitation.inviter_id == current_user.id,
-        CameraInvitation.status == "pending",
+        CameraInvitation.status.in_(["pending", "accepted"]),
     ).first()
     if not inv:
-        raise HTTPException(404, "邀請不存在")
-    inv.status = "cancelled"; db.commit()
-    return {"message": "邀請已取消"}
+        raise HTTPException(404, "邀請不存在或無法撤銷")
+    if inv.status == "accepted" and inv.invitee_id:
+        db.query(CameraAccess).filter(
+            CameraAccess.camera_id == inv.camera_id,
+            CameraAccess.user_id == inv.invitee_id,
+            CameraAccess.granted_by == current_user.id,
+        ).delete()
+    inv.status = "revoked"; db.commit()
+    return {"message": "已停止分享"}
