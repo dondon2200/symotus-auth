@@ -105,6 +105,9 @@ async def startup():
                     conn.rollback()
 
             logger.info("DB connected and tables created!")
+            # 啟動相機開機 LINE 推播背景工作
+            from services.camera_notifier import start_camera_notifier
+            asyncio.create_task(start_camera_notifier())
             break
         except Exception as e:
             logger.warning(f"DB not ready: {e}")
