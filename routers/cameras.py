@@ -106,6 +106,30 @@ async def list_cameras(
                     cam_data["permission_level"] = a.permission_level if hasattr(a, 'permission_level') else "photos_stream"
                     cameras.append(cam_data)
 
+    # 額外：把 camera_access 裡的授權相機也加進來（reseller 接受邀請後）
+    shared_ids = set(c.get("id") for c in cameras)
+    shared_accesses = db.query(CameraAccess).filter(
+        CameraAccess.user_id == current_user.id
+    ).all()
+    for access in shared_accesses:
+        if access.camera_id in shared_ids:
+            continue  # 已經有了
+        owner = db.query(User).filter(User.id == access.granted_by).first()
+        if not owner:
+            continue
+        owner_token = await get_camera_backend_token(owner)
+        if not owner_token:
+            continue
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{CAMERA_BACKEND_URL}/api/cameras/{access.camera_id}",
+                                 headers={"Authorization": f"Bearer {owner_token}"})
+            if r.status_code == 200:
+                cam_data = r.json()
+                perm = access.permission_level if hasattr(access, "permission_level") and access.permission_level else "photos_stream"
+                cam_data["permission_level"] = perm
+                cameras.append(cam_data)
+                shared_ids.add(access.camera_id)
+
     return {"cameras": cameras, "total": len(cameras)}
 
 
