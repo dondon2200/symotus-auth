@@ -131,3 +131,29 @@ def migrate_add_camera_user_id(
     except Exception as e:
         db.rollback()
         raise HTTPEx(status_code=500, detail=str(e))
+
+
+@router.post("/migrate/fix-camera-invitations")
+def fix_camera_invitations(db: Session = Depends(get_db), service_key: str = Header(None, alias="x-service-key")):
+    """一次性：補上 camera_invitations 和 camera_access 缺少的欄位"""
+    if service_key != "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2":
+        raise HTTPException(403, "Forbidden")
+    from sqlalchemy import text
+    results = []
+    sqls = [
+        "ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS token VARCHAR",
+        "ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS permission_level VARCHAR DEFAULT 'photos_stream'",
+        "ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS invitee_id INTEGER",
+        "ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP",
+        "ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS responded_at TIMESTAMP",
+        "ALTER TABLE camera_access ADD COLUMN IF NOT EXISTS permission_level VARCHAR DEFAULT 'photos_stream'",
+    ]
+    for sql in sqls:
+        try:
+            db.execute(text(sql))
+            db.commit()
+            results.append({"sql": sql, "ok": True})
+        except Exception as e:
+            db.rollback()
+            results.append({"sql": sql, "ok": False, "err": str(e)[:100]})
+    return {"results": results}
