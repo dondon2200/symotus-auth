@@ -147,6 +147,8 @@ def fix_camera_invitations(db: Session = Depends(get_db), service_key: str = Hea
         "ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP",
         "ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS responded_at TIMESTAMP",
         "ALTER TABLE camera_access ADD COLUMN IF NOT EXISTS permission_level VARCHAR DEFAULT 'photos_stream'",
+        "ALTER TABLE camera_invitations ALTER COLUMN invitee_id DROP NOT NULL",
+        "ALTER TABLE camera_invitations ALTER COLUMN inviter_id DROP NOT NULL",
     ]
     for sql in sqls:
         try:
