@@ -77,6 +77,31 @@ async def startup():
                 except Exception as e:
                     conn.rollback()
                     logger.warning(f"camera_invitations migration: {e}")
+
+            # 補上 camera_invitations 後加的欄位
+            with engine.connect() as conn:
+                for col, typ, default in [
+                    ("token", "VARCHAR", None),
+                    ("permission_level", "VARCHAR", "'photos_stream'"),
+                    ("invitee_id", "INTEGER", None),
+                ]:
+                    try:
+                        if default:
+                            conn.execute(text(f"ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS {col} {typ} DEFAULT {default}"))
+                        else:
+                            conn.execute(text(f"ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS {col} {typ}"))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+
+            # 補上 camera_access.permission_level
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text("ALTER TABLE camera_access ADD COLUMN IF NOT EXISTS permission_level VARCHAR DEFAULT 'photos_stream' NOT NULL"))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+
             logger.info("DB connected and tables created!")
             break
         except Exception as e:
