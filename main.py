@@ -123,6 +123,23 @@ app.include_router(cameras.router)
 app.include_router(line_webhook.router)
 app.include_router(invitations.router)
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    import traceback
+    logger.error(f"Unhandled exception: {exc}\n{traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "*",
+        }
+    )
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "symotus-auth"}
