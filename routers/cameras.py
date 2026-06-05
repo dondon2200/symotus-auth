@@ -146,7 +146,8 @@ async def list_cameras(
                 cam_data = raw.get("basic_info", raw)  # 攤平 detail 格式
                 perm = access.permission_level if hasattr(access, "permission_level") and access.permission_level else "photos_stream"
                 cam_data["permission_level"] = perm
-                cam_data["is_shared"] = True
+                # 自己配對的相機（granted_by == self）顯示為「我的相機」，不是「分享給我」
+                cam_data["is_shared"] = (access.granted_by != current_user.id)
                 cameras.append(cam_data)
                 shared_ids.add(access.camera_id)
 
