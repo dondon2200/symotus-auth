@@ -328,11 +328,23 @@ async def nas_images(
     from datetime import datetime, timedelta, date as date_type
 
     cam_token = await get_camera_backend_token(current_user)
-    if not cam_token:
-        raise HTTPException(502, "無法取得 Camera Backend token")
 
     params = dict(request.query_params)
     camera_id = params.get("camera_id")
+
+    # 沒有自己的 token（分享用戶）→ 用 granter 的 token
+    if not cam_token and camera_id:
+        access = db.query(CameraAccess).filter(
+            CameraAccess.user_id == current_user.id,
+            CameraAccess.camera_id == int(camera_id),
+        ).first()
+        if access and access.granted_by:
+            owner = db.query(User).filter(User.id == access.granted_by).first()
+            if owner:
+                cam_token = await get_camera_backend_token(owner)
+
+    if not cam_token:
+        raise HTTPException(502, "無法取得 Camera Backend token")
     limit = int(params.get("limit", 30))
     offset = int(params.get("offset", 0))
     start_time = params.get("start_time")
@@ -486,6 +498,16 @@ async def nas_image(
 ):
     """NAS 單張照片 proxy"""
     cam_token = await get_camera_backend_token(current_user)
+    # 分享用戶沒有自己的 token → 嘗試用 granter token
+    if not cam_token:
+        path_param = request.query_params.get("path", "")
+        # 路徑格式：/homes/firmness/{serial}/... 無法直接得知 camera_id
+        # 改為查該用戶所有 camera_access，取第一個 granter token
+        access = db.query(CameraAccess).filter(CameraAccess.user_id == current_user.id).first()
+        if access and access.granted_by:
+            owner = db.query(User).filter(User.id == access.granted_by).first()
+            if owner:
+                cam_token = await get_camera_backend_token(owner)
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token")
     from fastapi.responses import StreamingResponse
