@@ -1,19 +1,34 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, TechSupportGrant
+from models import User, CameraAccess, TechSupportGrant
 from schemas import UserResponse
 from auth import require_role
 from datetime import datetime
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-@router.get("/resellers", response_model=list[UserResponse])
+@router.get("/resellers")
 def list_resellers(
     db: Session = Depends(get_db),
     _=Depends(require_role("symotus_admin"))
 ):
-    return db.query(User).filter(User.role == "reseller").all()
+    resellers = db.query(User).filter(User.role == "reseller").all()
+    result = []
+    for u in resellers:
+        # 相機數 = camera_access（自己配對或被授權）
+        cam_count = db.query(CameraAccess).filter(CameraAccess.user_id == u.id).count()
+        result.append({
+            "id": u.id,
+            "username": u.username,
+            "email": u.email,
+            "role": u.role,
+            "line_id": u.line_id,
+            "camera_email": u.camera_email,
+            "is_active": u.is_active,
+            "camera_count": cam_count,
+        })
+    return result
 
 @router.get("/resellers/{reseller_id}/users", response_model=list[UserResponse])
 def reseller_users(
@@ -34,7 +49,6 @@ def all_grants(
     ).all()
 
 from fastapi import Header, HTTPException as HTTPEx
-from models import CameraAccess
 
 import os
 CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
