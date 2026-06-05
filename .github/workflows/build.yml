@@ -43,3 +43,26 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=auth
           cache-to: type=gha,scope=auth,mode=max
+
+  # 推出新 auth 映像後，觸發 symotus-frontend 的全 stack 部署，
+  # 讓伺服器 pull 新的 auth 映像並重啟（前後端共用一份 compose）。
+  trigger-deploy:
+    name: Trigger full-stack deploy
+    needs: build-docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check dispatch token
+        id: chk
+        env:
+          TOK: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
+        run: echo "has=${TOK:+yes}" >> "$GITHUB_OUTPUT"
+      - name: Dispatch deploy to symotus-frontend
+        if: steps.chk.outputs.has == 'yes'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
+          repository: ${{ github.repository_owner }}/symotus-frontend
+          event-type: deploy
+      - name: Warn if token missing
+        if: steps.chk.outputs.has != 'yes'
+        run: echo "::warning::未設定 DEPLOY_DISPATCH_TOKEN（需 repo scope PAT），已略過自動部署。請手動在 symotus-frontend 觸發 deploy。"
