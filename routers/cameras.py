@@ -245,15 +245,17 @@ async def get_camera(
         data = resp.json()
 
     # 附上當前用戶的權限等級
-    if current_user.role in ("reseller", "symotus_admin"):
-        data["my_permission"] = "full"
+    # 先查 camera_access（分享邀請授權）；若有，以授權等級為準
+    access = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == camera_id,
+        CameraAccess.user_id == current_user.id,
+    ).first()
+    if access:
+        data["my_permission"] = access.permission_level or "photos_stream"
+    elif current_user.role in ("reseller", "symotus_admin"):
+        data["my_permission"] = "full"  # 自己擁有的相機
     else:
-        from models import CameraAccess
-        access = db.query(CameraAccess).filter(
-            CameraAccess.camera_id == camera_id,
-            CameraAccess.user_id == current_user.id,
-        ).first()
-        data["my_permission"] = access.permission_level if access else "stream_only"
+        data["my_permission"] = "stream_only"
 
     return data
 
