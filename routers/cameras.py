@@ -584,6 +584,25 @@ async def proxy_camera_api(
         raise HTTPException(403, "無此相機的存取權限")
 
     cam_token = await get_camera_backend_token(current_user)
+    # 若沒有自己的 token，嘗試用 camera_access granter 的 token
+    if not cam_token:
+        access = db.query(CameraAccess).filter(
+            CameraAccess.user_id == current_user.id,
+            CameraAccess.camera_id == camera_id,
+        ).first()
+        if access and access.granted_by:
+            owner = db.query(User).filter(User.id == access.granted_by).first()
+            if owner:
+                cam_token = await get_camera_backend_token(owner)
+    # 最後 fallback 到 admin token
+    if not cam_token:
+        async with httpx.AsyncClient(timeout=10) as client:
+            tok_r = await client.post(
+                f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                headers={"x-service-key": CAMERA_SERVICE_KEY},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+            )
+        cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
     body = await request.body()
     headers = {"Authorization": f"Bearer {cam_token}", "Content-Type": "application/json"}
 
