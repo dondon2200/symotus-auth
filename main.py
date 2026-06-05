@@ -125,9 +125,9 @@ app.include_router(users.router)
 app.include_router(support.router)
 app.include_router(admin.router)
 app.include_router(jobs.router)
+app.include_router(public_camera.router)  # 必須在 cameras 前（避免 /{camera_id}/{path} catch-all 攔截）
 app.include_router(cameras.router)
 app.include_router(line_webhook.router)
-app.include_router(public_camera.router)
 app.include_router(invitations.router)
 
 from fastapi import Request
