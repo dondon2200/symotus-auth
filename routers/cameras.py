@@ -222,6 +222,7 @@ async def create_camera(
         cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token，請確認 camera_email 設定")
+    used_admin_fallback = not current_user.camera_email or current_user.camera_email.startswith("line_")
     body = await request.body()
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
@@ -230,9 +231,28 @@ async def create_camera(
             content=body,
         )
         try:
-            return JSONResponse(status_code=resp.status_code, content=resp.json())
+            resp_data = resp.json()
         except Exception:
             return JSONResponse(status_code=resp.status_code, content={"detail": resp.text})
+
+    # 若用 admin fallback 配對，自動幫 reseller 建立 camera_access（full 權限）
+    if resp.status_code in (200, 201) and used_admin_fallback and current_user.role == "reseller":
+        camera_id = resp_data.get("id") or resp_data.get("basic_info", {}).get("id")
+        if camera_id:
+            existing = db.query(CameraAccess).filter(
+                CameraAccess.camera_id == camera_id,
+                CameraAccess.user_id == current_user.id,
+            ).first()
+            if not existing:
+                db.add(CameraAccess(
+                    camera_id=camera_id,
+                    user_id=current_user.id,
+                    granted_by=current_user.id,
+                    permission_level="full",
+                ))
+                db.commit()
+
+    return JSONResponse(status_code=resp.status_code, content=resp_data)
 
 
 @router.get("/{camera_id}")
