@@ -211,8 +211,17 @@ async def create_camera(
     if current_user.role not in ("reseller", "symotus_admin"):
         raise HTTPException(403, "只有 reseller 或 admin 可以新增相機")
     cam_token = await get_camera_backend_token(current_user)
+    # 若沒有自己的 token（reseller 尚未設 camera_email），用 admin fallback
     if not cam_token:
-        raise HTTPException(502, "無法取得 Camera Backend token")
+        async with httpx.AsyncClient(timeout=10) as client:
+            tok_r = await client.post(
+                f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                headers={"x-service-key": CAMERA_SERVICE_KEY},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+            )
+        cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+    if not cam_token:
+        raise HTTPException(502, "無法取得 Camera Backend token，請確認 camera_email 設定")
     body = await request.body()
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
@@ -583,8 +592,17 @@ async def create_project(
     if current_user.role not in ("reseller", "symotus_admin"):
         raise HTTPException(403, "沒有建立專案的權限")
     cam_token = await get_camera_backend_token(current_user)
+    # 若沒有自己的 token（reseller 尚未設 camera_email），用 admin fallback
     if not cam_token:
-        raise HTTPException(502, "無法取得 Camera Backend token")
+        async with httpx.AsyncClient(timeout=10) as client:
+            tok_r = await client.post(
+                f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                headers={"x-service-key": CAMERA_SERVICE_KEY},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+            )
+        cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+    if not cam_token:
+        raise HTTPException(502, "無法取得 Camera Backend token，請確認 camera_email 設定")
     body = await request.body()
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
