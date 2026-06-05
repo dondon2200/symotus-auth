@@ -25,13 +25,11 @@ async def get_camera_backend_token(user: User) -> str:
     """取得 Camera Backend token
     安全原則：
     - 必須有 camera_email 才能換 token（代表該帳號有在 Camera Backend 配對過相機）
-    - LINE 自動合成的 camera_email（line_xxx@symotus.com）不算真實帳號，不給 token
+    - LINE 自動合成的 camera_email（line_xxx@symotus.com）Camera Backend 會自動建立帳號，正常換 token
     - 沒有 camera_email 的用戶無法直接存取 Camera Backend，只能透過 camera_access 看授權相機
     """
     if not user.camera_email:
         return ""  # 沒有 camera_email = 沒有 Camera Backend 帳號，不給 token
-    if user.camera_email.startswith("line_") and user.camera_email.endswith("@symotus.com"):
-        return ""  # LINE 自動合成 email，尚未真實綁定 Camera Backend 帳號
     # user_id=0 讓 Camera Backend 純用 email 查帳號，避免 user_id 不一致問題
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
@@ -223,7 +221,7 @@ async def create_camera(
         cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token，請確認 camera_email 設定")
-    used_admin_fallback = not current_user.camera_email or current_user.camera_email.startswith("line_")
+    used_admin_fallback = not current_user.camera_email
     body = await request.body()
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
