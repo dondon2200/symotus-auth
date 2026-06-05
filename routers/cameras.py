@@ -103,7 +103,8 @@ async def list_cameras(
                 r = await client.get(f"{CAMERA_BACKEND_URL}/api/cameras/{cam_id}",
                                      headers={"Authorization": f"Bearer {owner_token}"})
                 if r.status_code == 200:
-                    cam_data = r.json()
+                    raw = r.json()
+                    cam_data = raw.get("basic_info", raw)  # 攤平 detail 格式
                     cam_data["permission_level"] = a.permission_level if hasattr(a, 'permission_level') else "photos_stream"
                     cam_data["is_shared"] = True
                     cameras.append(cam_data)
@@ -140,7 +141,8 @@ async def list_cameras(
             r = await client.get(f"{CAMERA_BACKEND_URL}/api/cameras/{access.camera_id}",
                                  headers={"Authorization": f"Bearer {owner_token}"})
             if r.status_code == 200:
-                cam_data = r.json()
+                raw = r.json()
+                cam_data = raw.get("basic_info", raw)  # 攤平 detail 格式
                 perm = access.permission_level if hasattr(access, "permission_level") and access.permission_level else "photos_stream"
                 cam_data["permission_level"] = perm
                 cam_data["is_shared"] = True
