@@ -10,9 +10,9 @@ from models import User, CameraAccess
 logger = logging.getLogger(__name__)
 
 CAMERA_BACKEND_URL = "https://user.symotus.com"
-CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
-LINE_ACCESS_TOKEN = os.environ.get("LINE_ACCESS_TOKEN", "")
-FRONTEND_URL       = "https://admin.symotus.com"
+CAMERA_SERVICE_KEY = os.getenv("CAMERA_SERVICE_KEY", "")
+LINE_ACCESS_TOKEN  = os.getenv("LINE_ACCESS_TOKEN", "")
+FRONTEND_URL       = os.getenv("FRONTEND_URL", "https://reseller.symotus.com:9443")
 CHECK_INTERVAL     = 60   # 1 分鐘
 
 _prev_status: dict[int, bool] = {}

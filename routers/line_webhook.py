@@ -17,16 +17,16 @@ from config import settings
 router = APIRouter(prefix="/webhook", tags=["line-webhook"])
 
 # ── 常數 ──────────────────────────────────────────────────────────────────────
-LINE_CHANNEL_SECRET = "7ad292c5b66fc9057945b43d8e563f45"
-LINE_ACCESS_TOKEN = os.environ.get("LINE_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+LINE_ACCESS_TOKEN   = os.environ.get("LINE_ACCESS_TOKEN", "")
 LINE_REPLY_URL      = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL       = "https://api.line.me/v2/bot/message/push"
 LINE_LOADING_URL    = "https://api.line.me/v2/bot/chat/loading/start"
 OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
-AUTH_SERVICE_URL    = "https://symotus-auth.onrender.com"
+AUTH_SERVICE_URL    = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8001")
 CAMERA_BACKEND_URL  = "https://user.symotus.com"
-CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
-SPARK_API_KEY       = "5c036bfc702e1a7998a488e1cbed2f606d67b570586e3def24dba9bbf6a18016"
+CAMERA_SERVICE_KEY  = os.environ.get("CAMERA_SERVICE_KEY", "")
+SPARK_API_KEY       = os.environ.get("SPARK_API_KEY", "")
 
 LINE_HEADERS = {
     "Authorization": f"Bearer {LINE_ACCESS_TOKEN}",
@@ -146,7 +146,7 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
         async with httpx.AsyncClient(timeout=30) as c:
             sr = await c.post("https://user.symotus.com/spark/jobs/nas",
                 headers={"Content-Type":"application/json","x-api-key": SPARK_API_KEY},
-                json={"nas_path": serial, "callback_url": "https://admin.symotus.com/api/spark-callback",
+                json={"nas_path": serial, "callback_url": f"{os.getenv('FRONTEND_URL', 'https://reseller.symotus.com:9443')}/api/spark-callback",
                       "fps": 30, "resolution": "1920x1080",
                       "rain_fog_detection": True, "darkness_detection": True,
                       "image_recovery": False, "stabilization": False,
@@ -185,7 +185,7 @@ async def call_ai_line(text: str, auth_token: str, line_user_id: str) -> dict:
             resp = await c.post("https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
                          "Content-Type": "application/json",
-                         "HTTP-Referer": "https://admin.symotus.com", "X-Title": "Symotus LINE Bot"},
+                         "HTTP-Referer": os.getenv("FRONTEND_URL", "https://reseller.symotus.com:9443"), "X-Title": "Symotus LINE Bot"},
                 json={"model": "openai/gpt-4o-mini", "messages": messages,
                       "tools": LINE_TOOLS, "tool_choice": "auto",
                       "max_tokens": 600, "temperature": 0.3})
@@ -268,7 +268,7 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
         user = db.query(User).filter(User.line_id == line_user_id).first()
         if not user:
             await line_reply(reply_token, [{"type": "text",
-                "text": "您好！請先到 https://admin.symotus.com 用 LINE 登入，才能使用 AI 助理功能 🙂"}])
+                "text": f"您好！請先到 {os.getenv('FRONTEND_URL', 'https://reseller.symotus.com:9443')} 用 LINE 登入，才能使用 AI 助理功能"}])
             continue
 
         # 顯示載入動畫
