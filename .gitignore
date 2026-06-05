@@ -1,0 +1,31 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ── 虛擬環境 ──
+.venv/
+venv/
+env/
+ENV/
+
+# ── 環境變數 / 機密（config.py 以 env_file=".env" 讀取，切勿入庫）──
+.env
+.env.*
+!.env.example
+
+# ── 工具快取 ──
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# ── 本機資料庫備份 ──
+*.sql
+backup_*.sql
+
+# ── 編輯器 / OS ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
