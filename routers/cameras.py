@@ -111,13 +111,27 @@ async def list_cameras(
     shared_accesses = db.query(CameraAccess).filter(
         CameraAccess.user_id == current_user.id
     ).all()
+    # 取得 admin 備用 token（inviter 沒有 camera_email 時 fallback 用）
+    admin_fallback_token = None
     for access in shared_accesses:
         if access.camera_id in shared_ids:
             continue  # 已經有了
         owner = db.query(User).filter(User.id == access.granted_by).first()
-        if not owner:
-            continue
-        owner_token = await get_camera_backend_token(owner)
+        owner_token = (await get_camera_backend_token(owner)) if owner else ""
+        if not owner_token:
+            # 嘗試用 admin 帳號 token 取相機資料
+            if admin_fallback_token is None:
+                try:
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        tok_r = await client.post(
+                            f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                            headers={"x-service-key": CAMERA_SERVICE_KEY},
+                            json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                        )
+                        admin_fallback_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+                except Exception:
+                    admin_fallback_token = ""
+            owner_token = admin_fallback_token
         if not owner_token:
             continue
         async with httpx.AsyncClient(timeout=10) as client:
