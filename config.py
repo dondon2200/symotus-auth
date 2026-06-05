@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     JWT_SECRET: str
     JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRE_MINUTES: int = 1440  # 24hr
+    JWT_EXPIRE_MINUTES: int = 60   # 1hr
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
     CAMERA_BACKEND_URL: str = "https://user.symotus.com/api"
