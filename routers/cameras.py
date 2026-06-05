@@ -83,14 +83,10 @@ async def list_cameras(
         if allowed_ids is not None:
             cameras = [c for c in cameras if c["id"] in allowed_ids]
     else:
-        # 沒有 camera token（end_user 或未配對用戶，或 reseller 沒有 camera_email）：
-        # 用 camera_access 授權的相機，需要用 owner 的 token 去拿資料
-        # allowed_ids=None (reseller) → 不 early return，走到下面 camera_access 合併
-        if allowed_ids is not None and len(allowed_ids) == 0:
-            cameras = []
-        elif allowed_ids is not None:
-            cameras = []
-        # 找各台相機的 owner，用 owner token 拿資料
+        # 沒有 camera token（end_user、reseller 沒有 camera_email）：
+        # 走 camera_access 路徑。allowed_ids=None(reseller) 表示無自有相機，但仍可有分享相機
+        cameras = []
+        # 處理 end_user 的 allowed_ids 清單（從 camera_access 表得來）
         for cam_id in (allowed_ids or []):
             # 找誰 granted 這個 camera_access（granted_by = reseller/owner）
             access = db.query(CameraAccess).filter(CameraAccess.camera_id == cam_id,
