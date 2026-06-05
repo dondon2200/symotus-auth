@@ -76,6 +76,9 @@ async def list_cameras(
                 raise HTTPException(resp.status_code, "Camera Backend 錯誤")
             data = resp.json()
         cameras = data.get("cameras", [])
+        # 標記為自己擁有的相機
+        for c in cameras:
+            c["is_shared"] = False
         # reseller 看自己的相機；如果有 allowed_ids 限制再過濾
         if allowed_ids is not None:
             cameras = [c for c in cameras if c["id"] in allowed_ids]
@@ -104,6 +107,7 @@ async def list_cameras(
                 if r.status_code == 200:
                     cam_data = r.json()
                     cam_data["permission_level"] = a.permission_level if hasattr(a, 'permission_level') else "photos_stream"
+                    cam_data["is_shared"] = True
                     cameras.append(cam_data)
 
     # 額外：把 camera_access 裡的授權相機也加進來（reseller 接受邀請後）
@@ -141,6 +145,7 @@ async def list_cameras(
                 cam_data = r.json()
                 perm = access.permission_level if hasattr(access, "permission_level") and access.permission_level else "photos_stream"
                 cam_data["permission_level"] = perm
+                cam_data["is_shared"] = True
                 cameras.append(cam_data)
                 shared_ids.add(access.camera_id)
 
