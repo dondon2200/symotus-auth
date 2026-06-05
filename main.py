@@ -86,6 +86,7 @@ async def startup():
                     ("invitee_id", "INTEGER", None),
                     ("expires_at", "TIMESTAMP", None),
                     ("responded_at", "TIMESTAMP", None),
+                    ("is_public", "BOOLEAN", "FALSE"),
                 ]:
                     try:
                         if default:
