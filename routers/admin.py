@@ -21,6 +21,7 @@ def list_resellers(
         result.append({
             "id": u.id,
             "username": u.username,
+            "full_name": u.full_name,
             "email": u.email,
             "role": u.role,
             "line_id": u.line_id,
