@@ -67,6 +67,31 @@ def create_invitation(
 
 
 # ── 查看邀請資訊（公開，不需登入）──────────────────────────────────────────────
+@router.get("")
+def list_my_invitations(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出我收到的待處理邀請（作為被邀請者）"""
+    invs = db.query(CameraInvitation).filter(
+        CameraInvitation.invitee_id == current_user.id,
+        CameraInvitation.status == "pending",
+    ).order_by(CameraInvitation.created_at.desc()).all()
+    result = []
+    for inv in invs:
+        inviter = db.query(User).filter(User.id == inv.inviter_id).first()
+        result.append({
+            "id": inv.id,
+            "camera_id": inv.camera_id,
+            "camera_name": inv.camera_name or f"相機 #{inv.camera_id}",
+            "inviter_name": (inviter.full_name or inviter.username or inviter.email) if inviter else "未知",
+            "permission_level": inv.permission_level,
+            "note": inv.note,
+            "created_at": inv.created_at.isoformat() if inv.created_at else None,
+        })
+    return result
+
+
 @router.get("/preview/{token}")
 def preview_invitation(token: str, db: Session = Depends(get_db)):
     inv = db.query(CameraInvitation).filter(CameraInvitation.token == token).first()
