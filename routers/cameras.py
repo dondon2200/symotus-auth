@@ -81,6 +81,21 @@ async def list_cameras(
         # reseller 看自己的相機；如果有 allowed_ids 限制再過濾
         if allowed_ids is not None:
             cameras = [c for c in cameras if c["id"] in allowed_ids]
+        # ⚠️ 安全過濾：LINE 合成 email 的帳號在 Camera Backend 可能混用
+        # 必須以 Symotus camera_access 表為唯一授權依據，
+        # 防止 Camera Backend 帳號共用導致看到他人相機
+        is_line_email = (
+            current_user.camera_email and
+            current_user.camera_email.startswith("line_") and
+            current_user.camera_email.endswith("@symotus.com")
+        )
+        if is_line_email:
+            auth_cam_ids = set(
+                a.camera_id for a in db.query(CameraAccess).filter(
+                    CameraAccess.user_id == current_user.id
+                ).all()
+            )
+            cameras = [c for c in cameras if c.get("id") in auth_cam_ids]
     else:
         # 沒有 camera token（end_user、reseller 沒有 camera_email）：
         # 走 camera_access 路徑。allowed_ids=None(reseller) 表示無自有相機，但仍可有分享相機

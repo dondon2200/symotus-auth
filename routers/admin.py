@@ -39,6 +39,19 @@ def reseller_users(
 ):
     return db.query(User).filter(User.reseller_id == reseller_id).all()
 
+@router.get("/camera-access-by-user/{user_id}")
+def camera_access_by_user(
+    user_id: int,
+    x_service_key: str = Header(None),
+    db: Session = Depends(get_db),
+):
+    """列出某用戶所有 camera_access 的相機（含 basic_info，同步從 camera_access 取）"""
+    if x_service_key != CAMERA_SERVICE_KEY:
+        raise HTTPException(403, "Forbidden")
+    accesses = db.query(CameraAccess).filter(CameraAccess.user_id == user_id).all()
+    return [{"id": a.camera_id, "name": None, "ip_address": None, "online_status": False} for a in accesses]
+
+
 @router.get("/support/grants")
 def all_grants(
     db: Session = Depends(get_db),
