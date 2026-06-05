@@ -150,6 +150,12 @@ def health():
     return {"status": "ok", "service": "symotus-auth"}
 
 
+@app.get("/version")
+def version():
+    """回傳後端版本碼（CI build 時蓋的 YYYYMMDDHHMM，未設為 'dev'），供前端啟動時比對是否更新"""
+    return {"version": settings.BUILD_VERSION, "service": "symotus-auth"}
+
+
 if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))

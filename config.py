@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     JWT_EXPIRE_MINUTES: int = 60   # 1hr
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
+    # CI build 蓋上的版本碼（YYYYMMDDHHMM）；未設時為 "dev"。供 /version 回傳給前端比對是否更新
+    BUILD_VERSION: str = "dev"
+
     CAMERA_BACKEND_URL: str = "https://user.symotus.com/api"
 
     # Spark Timelapse Pipeline Service（縮時影片處理）
