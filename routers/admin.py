@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
 from models import User, CameraAccess, TechSupportGrant
@@ -62,7 +62,6 @@ def all_grants(
         TechSupportGrant.revoked_at == None
     ).all()
 
-from fastapi import Header, HTTPException as HTTPEx
 
 import os
 CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
@@ -76,7 +75,7 @@ def remove_camera_access(
 ):
     """用 service key 刪除特定用戶對特定相機的存取權"""
     if x_service_key != CAMERA_SERVICE_KEY:
-        raise HTTPEx(status_code=403, detail="Invalid service key")
+        raise HTTPException(status_code=403, detail="Invalid service key")
     deleted = db.query(CameraAccess).filter(
         CameraAccess.camera_id == camera_id,
         CameraAccess.user_id == user_id,
@@ -92,7 +91,7 @@ def get_camera_access(
 ):
     """列出特定相機的所有存取用戶"""
     if x_service_key != CAMERA_SERVICE_KEY:
-        raise HTTPEx(status_code=403, detail="Invalid service key")
+        raise HTTPException(status_code=403, detail="Invalid service key")
     rows = db.query(CameraAccess).filter(CameraAccess.camera_id == camera_id).all()
     users = []
     for r in rows:
@@ -109,7 +108,7 @@ def list_all_users(
 ):
     """列出所有用戶（service key 保護）"""
     if x_service_key != CAMERA_SERVICE_KEY:
-        raise HTTPEx(status_code=403, detail="Invalid service key")
+        raise HTTPException(status_code=403, detail="Invalid service key")
     users = db.query(User).all()
     return [{"id": u.id, "username": u.username, "email": u.email,
              "role": u.role, "line_id": u.line_id, "camera_email": u.camera_email,
@@ -124,10 +123,10 @@ def update_user_admin(
 ):
     """更新用戶屬性：camera_email、role、is_active（service key 保護）"""
     if x_service_key != CAMERA_SERVICE_KEY:
-        raise HTTPEx(status_code=403, detail="Invalid service key")
+        raise HTTPException(status_code=403, detail="Invalid service key")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPEx(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="User not found")
     if "camera_email" in body:
         user.camera_email = body["camera_email"]
     if "camera_user_id" in body:
@@ -148,7 +147,7 @@ def migrate_add_camera_user_id(
 ):
     """一次性 migration：加 camera_user_id 欄位並設定 admin@timelapse.com"""
     if x_service_key != CAMERA_SERVICE_KEY:
-        raise HTTPEx(status_code=403, detail="Invalid service key")
+        raise HTTPException(status_code=403, detail="Invalid service key")
     from sqlalchemy import text
     try:
         db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS camera_user_id INTEGER"))
@@ -159,7 +158,7 @@ def migrate_add_camera_user_id(
         return {"ok": True, "users": [{"id": r[0], "email": r[1], "camera_user_id": r[2]} for r in result]}
     except Exception as e:
         db.rollback()
-        raise HTTPEx(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/migrate/fix-camera-invitations")
