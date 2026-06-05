@@ -156,3 +156,4 @@ class CameraInvitation(Base):
     expires_at = Column(DateTime, nullable=True)                           # None = 不過期
     created_at = Column(DateTime, default=datetime.utcnow)
     responded_at = Column(DateTime, nullable=True)
+    is_public = Column(Boolean, default=False, nullable=False, server_default="false")  # 公開連結，不需登入

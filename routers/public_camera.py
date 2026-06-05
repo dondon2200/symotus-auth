@@ -1,0 +1,101 @@
+"""
+公開相機存取（無需登入）
+用於「有連結即可看串流＋縮時預覽」的分享功能
+"""
+import httpx
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+
+from database import get_db
+from models import User, CameraInvitation
+from routers.cameras import get_camera_backend_token, CAMERA_BACKEND_URL
+
+router = APIRouter(prefix="/cameras/public", tags=["public-camera"])
+
+
+async def _get_public_cam(token: str, db: Session):
+    """共用：驗證公開 token，回傳 (invitation, granter_token)"""
+    inv = db.query(CameraInvitation).filter(
+        CameraInvitation.token == token,
+        CameraInvitation.is_public == True,
+    ).first()
+    if not inv:
+        raise HTTPException(404, "連結無效")
+    if inv.expires_at and inv.expires_at < datetime.utcnow():
+        raise HTTPException(410, "連結已過期")
+
+    granter = db.query(User).filter(User.id == inv.inviter_id).first()
+    if not granter:
+        raise HTTPException(500, "找不到分享者")
+
+    cam_token = await get_camera_backend_token(granter)
+    if not cam_token:
+        raise HTTPException(502, "無法取得相機存取權")
+
+    return inv, cam_token
+
+
+@router.get("/{token}")
+async def get_public_camera_info(token: str, db: Session = Depends(get_db)):
+    """取得公開分享相機資訊（串流 stream_name + camera_name）"""
+    inv, cam_token = await _get_public_cam(token, db)
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{CAMERA_BACKEND_URL}/api/cameras/{inv.camera_id}",
+            headers={"Authorization": f"Bearer {cam_token}"},
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(502, "無法取得相機資訊")
+
+    cam = resp.json()
+    basic = cam.get("basic_info", cam)
+    ip = basic.get("ip_address", "")
+    stream_name = f"cam{ip.split('.')[2]}" if ip and len(ip.split('.')) >= 3 else ""
+
+    return {
+        "camera_id": inv.camera_id,
+        "camera_name": inv.camera_name or basic.get("name", f"相機 #{inv.camera_id}"),
+        "ip_address": ip,
+        "stream_name": stream_name,
+        "online": basic.get("online_status", False),
+        "permission": "stream_preview",
+    }
+
+
+@router.get("/{token}/timesnap")
+async def get_public_timesnap(token: str, db: Session = Depends(get_db)):
+    """取得縮時排程資訊（供預覽用）"""
+    inv, cam_token = await _get_public_cam(token, db)
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{CAMERA_BACKEND_URL}/api/cameras/{inv.camera_id}/timesnap",
+            headers={"Authorization": f"Bearer {cam_token}"},
+        )
+    if resp.status_code != 200:
+        return {"enable": False}
+    return resp.json()
+
+
+@router.get("/{token}/image")
+async def get_public_nas_image(token: str, request: Request, db: Session = Depends(get_db)):
+    """代理 NAS 圖片（供公開縮時預覽用）"""
+    inv, cam_token = await _get_public_cam(token, db)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"{CAMERA_BACKEND_URL}/api/camera/nas/image",
+            headers={"Authorization": f"Bearer {cam_token}"},
+            params=dict(request.query_params),
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, "圖片無法取得")
+
+    return StreamingResponse(
+        iter([resp.content]),
+        media_type=resp.headers.get("content-type", "image/jpeg"),
+    )

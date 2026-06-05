@@ -126,6 +126,7 @@ app.include_router(admin.router)
 app.include_router(jobs.router)
 app.include_router(cameras.router)
 app.include_router(line_webhook.router)
+app.include_router(public_camera.router)
 app.include_router(invitations.router)
 
 from fastapi import Request

@@ -31,6 +31,7 @@ class CreateInvitationBody(BaseModel):
     note: Optional[str] = None
     permission_level: str = "photos_stream"  # full / photos_stream / stream_only
     expires_hours: Optional[int] = None  # None = 不過期
+    is_public: bool = False  # 公開連結，不需登入
 
 
 # ── 建立邀請（產生連結）────────────────────────────────────────────────────────
@@ -51,7 +52,8 @@ def create_invitation(
         camera_id=body.camera_id,
         camera_name=body.camera_name or f"相機 #{body.camera_id}",
         note=body.note,
-        permission_level=body.permission_level if body.permission_level in ("full","photos_stream","stream_only") else "photos_stream",
+        permission_level=body.permission_level if body.permission_level in ("full","photos_stream","stream_only") else "stream_only",
+        is_public=body.is_public,
         expires_at=expires_at,
     )
     db.add(inv); db.commit(); db.refresh(inv)
