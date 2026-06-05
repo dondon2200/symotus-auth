@@ -17,7 +17,8 @@ from auth import get_current_user
 router = APIRouter(prefix="/cameras", tags=["cameras"])
 
 CAMERA_BACKEND_URL = "https://user.symotus.com"
-CAMERA_SERVICE_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+import os
+CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
 
 
 async def get_camera_backend_token(user: User) -> str:

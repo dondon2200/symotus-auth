@@ -18,14 +18,14 @@ router = APIRouter(prefix="/webhook", tags=["line-webhook"])
 
 # ── 常數 ──────────────────────────────────────────────────────────────────────
 LINE_CHANNEL_SECRET = "7ad292c5b66fc9057945b43d8e563f45"
-LINE_ACCESS_TOKEN   = "ShTSgT5SabcpwdKVqTQUR5toy4/UdRWr+oxQpQYYKeswYmwD1mJ3NuD0velI+mXPDNSX5VJiTfWjF60Ji7scmd1Mawyn2jCGPg6LmOuRSbs7UQKr/tN8QaMnb028Zuazo/WMSmuDzZGkX/agdTKymAdB04t89/1O/w1cDnyilFU="
+LINE_ACCESS_TOKEN = os.environ.get("LINE_ACCESS_TOKEN", "")
 LINE_REPLY_URL      = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL       = "https://api.line.me/v2/bot/message/push"
 LINE_LOADING_URL    = "https://api.line.me/v2/bot/chat/loading/start"
 OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
 AUTH_SERVICE_URL    = "https://symotus-auth.onrender.com"
 CAMERA_BACKEND_URL  = "https://user.symotus.com"
-CAMERA_SERVICE_KEY  = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
 SPARK_API_KEY       = "5c036bfc702e1a7998a488e1cbed2f606d67b570586e3def24dba9bbf6a18016"
 
 LINE_HEADERS = {

@@ -36,7 +36,8 @@ def all_grants(
 from fastapi import Header, HTTPException as HTTPEx
 from models import CameraAccess
 
-CAMERA_SERVICE_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+import os
+CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
 
 @router.delete("/camera-access")
 def remove_camera_access(
@@ -136,7 +137,7 @@ def migrate_add_camera_user_id(
 @router.post("/migrate/fix-camera-invitations")
 def fix_camera_invitations(db: Session = Depends(get_db), service_key: str = Header(None, alias="x-service-key")):
     """一次性：補上 camera_invitations 和 camera_access 缺少的欄位"""
-    if service_key != "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2":
+    if service_key != CAMERA_SERVICE_KEY:
         raise HTTPException(403, "Forbidden")
     from sqlalchemy import text
     results = []

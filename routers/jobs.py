@@ -395,7 +395,7 @@ async def create_gdrive_job(
     """從 Google Drive 公開資料夾建立縮時影片 job（委派給 Camera Backend 處理）"""
     # 先取得 Camera Backend user token（用 admin 帳號）
     CAMERA_BACKEND = "https://user.symotus.com"
-    CAM_SVCKEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+    CAM_SVCKEY = os.environ.get("CAMERA_SERVICE_KEY", "")
     async with httpx.AsyncClient(timeout=15) as client:
         tok_resp = await client.post(
             f"{CAMERA_BACKEND}/internal/auth/token",
@@ -491,7 +491,7 @@ async def get_gdrive_job(
 
     # Proxy Camera Backend 取即時狀態
     CAMERA_BACKEND = "https://user.symotus.com"
-    CAM_SVCKEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+    CAM_SVCKEY = os.environ.get("CAMERA_SERVICE_KEY", "")
     cam_status = {}
     try:
         async with httpx.AsyncClient(timeout=10) as client:

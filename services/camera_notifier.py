@@ -1,7 +1,7 @@
 """
 背景工作：每 5 分鐘檢查相機狀態，開機時推 LINE 通知
 """
-import asyncio, logging, httpx
+import asyncio, logging, httpx, os
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database import SessionLocal
@@ -10,8 +10,8 @@ from models import User, CameraAccess
 logger = logging.getLogger(__name__)
 
 CAMERA_BACKEND_URL = "https://user.symotus.com"
-CAMERA_SERVICE_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
-LINE_ACCESS_TOKEN  = "ShTSgT5SabcpwdKVqTQUR5toy4/UdRWr+oxQpQYYKeswYmwD1mJ3NuD0velI+mXPDNSX5VJiTfWjF60Ji7scmd1Mawyn2jCGPg6LmOuRSbs7UQKr/tN8QaMnb028Zuazo/WMSmuDzZGkX/agdTKymAdB04t89/1O/w1cDnyilFU="
+CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
+LINE_ACCESS_TOKEN = os.environ.get("LINE_ACCESS_TOKEN", "")
 FRONTEND_URL       = "https://admin.symotus.com"
 CHECK_INTERVAL     = 60   # 1 分鐘
 

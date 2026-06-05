@@ -14,7 +14,8 @@ from config import settings
 
 
 CAMERA_BACKEND_URL = "https://user.symotus.com"
-CAMERA_SERVICE_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+import os
+CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
 
 async def get_camera_token(user_id: int, email: str, role: str, camera_email: Optional[str] = None) -> dict:
     """向 Camera Backend 換取 camera token"""
