@@ -166,9 +166,10 @@ import asyncio
 import os
 import httpx
 from models import GDriveJob
+from config import settings
 
-SPARK_API_URL = "https://user.symotus.com/spark"
-SPARK_API_KEY = "9ad3343a32508c209152a450f601b990176fa4d41c94c27330e448b1a86826c2"
+SPARK_API_URL = settings.SPARK_API_URL
+SPARK_API_KEY = settings.SPARK_API_KEY
 GDRIVE_API_KEY = "AIzaSyAj-LJs2lbT7pjh0FFkOw-rRH-OMtMl3c4"
 GDRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 GDRIVE_DOWNLOAD_URL = "https://drive.google.com/uc"  # 不走 API，直接 HTTP 下載
@@ -329,7 +330,7 @@ async def _run_gdrive_background(job_id: int, files: list[dict], body_fps: int, 
         job.status = "uploading"
         db.commit()
 
-        callback_url = f"https://symotus-auth.onrender.com/jobs/gdrive/callback/{job_id}"
+        callback_url = f"{settings.PUBLIC_BASE_URL}/jobs/gdrive/callback/{job_id}"
 
         # 用 open file handles 做 multipart，不把全部載入記憶體
         file_handles = []
@@ -548,6 +549,47 @@ async def get_gdrive_job(
         "video_download_url": video_url or job.video_url,
         "error_message": error or job.error_message,
     }
+
+
+class SparkCallback(BaseModel):
+    status: Optional[str] = None
+    error: Optional[str] = None
+    error_message: Optional[str] = None
+    video_url: Optional[str] = None
+    percent_complete: Optional[int] = None
+
+
+@router.post("/gdrive/callback/{job_id}")
+async def gdrive_spark_callback(
+    job_id: int,
+    body: SparkCallback,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Spark 完成後的 server-to-server 回呼（不需 user token）。
+    狀態主要仍由 get_gdrive_job 輪詢取得，此回呼為即時補強。
+    若有帶 x-api-key 則須與 SPARK_API_KEY 相符（沒帶則放行，因 Spark 端帶法未定）。
+    """
+    key = request.headers.get("x-api-key")
+    if key and key != SPARK_API_KEY:
+        raise HTTPException(403, "Invalid api key")
+
+    job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
+    if not job:
+        return {"message": "job not found, ignored"}
+
+    if body.status:
+        job.status = body.status
+    err = body.error or body.error_message
+    if err:
+        job.error_message = err
+    if body.status == "completed":
+        if job.spark_job_id:
+            job.video_url = f"{SPARK_API_URL}/jobs/{job.spark_job_id}/download?api_key={SPARK_API_KEY}"
+        elif body.video_url:
+            job.video_url = body.video_url
+    db.commit()
+    return {"message": "ok"}
 
 
 @router.delete("/gdrive/{job_id}")

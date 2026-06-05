@@ -10,6 +10,12 @@ class Settings(BaseSettings):
 
     CAMERA_BACKEND_URL: str = "https://user.symotus.com/api"
 
+    # Spark Timelapse Pipeline Service（縮時影片處理）
+    SPARK_API_URL: str = "https://user.symotus.com/spark"
+    SPARK_API_KEY: str = "5c036bfc702e1a7998a488e1cbed2f606d67b570586e3def24dba9bbf6a18016"
+    # 本服務對外網址（給 Spark 完成後 server-to-server callback 用）
+    PUBLIC_BASE_URL: str = "https://auth.symotus.com"
+
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
     GOOGLE_REDIRECT_URI: Optional[str] = None
