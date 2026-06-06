@@ -213,37 +213,55 @@ async def call_ai_line(text: str, auth_token: str, line_user_id: str) -> dict:
 
 # ── 截圖處理 ─────────────────────────────────────────────────────────────────
 async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: str):
-    """取最新照片並 push 到 LINE"""
+    """取最新照片 → 存入臨時快取 → 推送 LINE 圖片訊息"""
+    from routers.public_camera import _store_temp_image, _temp_image_cache
+
     h = {"Authorization": f"Bearer {auth_token}"}
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(f"{AUTH_SERVICE_URL}/cameras/nas/images?camera_id={camera_id}&limit=1&offset=0", headers=h)
-    if not r.is_success: return
+    # 1. 查 NAS 最新照片
+    async with httpx.AsyncClient(timeout=30) as cl:
+        r = await cl.get(f"{AUTH_SERVICE_URL}/cameras/nas/images?camera_id={camera_id}&limit=1&offset=0", headers=h)
+    if not r.is_success:
+        await line_push(line_user_id, [{"type":"text","text":"找不到照片，請確認相機是否有拍照紀錄。"}])
+        return
     files = r.json().get("data", {}).get("files", [])
-    if not files: return
+    if not files:
+        await line_push(line_user_id, [{"type":"text","text":"目前沒有照片紀錄。"}])
+        return
 
+    # 2. 取完整圖片 URL（不帶 thumbnail）
     image_url = files[0].get("image_url", "")
-    # 取不含 thumbnail 的完整 URL
-    full_url = f"{CAMERA_BACKEND_URL}{image_url}".replace("&thumbnail=true", "").replace("thumbnail=true&", "")
+    taken_at = files[0].get("date", "")
+    full_path = image_url.replace("&thumbnail=true", "").replace("thumbnail=true&", "").replace("?thumbnail=true", "")
+    full_url = f"{CAMERA_BACKEND_URL}{full_path}"
 
-    # 取得相機 camera token 以便讀取圖片
-    async with httpx.AsyncClient(timeout=10) as c:
-        tok_r = await c.post(f"{CAMERA_BACKEND_URL}/internal/auth/token",
+    # 3. 取 Camera Backend token 下載圖片
+    async with httpx.AsyncClient(timeout=10) as cl:
+        tok_r = await cl.post(f"{CAMERA_BACKEND_URL}/internal/auth/token",
             headers={"x-service-key": CAMERA_SERVICE_KEY},
             json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"})
-    if not tok_r.is_success: return
+    if not tok_r.is_success:
+        await line_push(line_user_id, [{"type":"text","text":"無法取得相機授權。"}])
+        return
     cam_token = tok_r.json().get("access_token", "")
 
-    # Fetch image bytes → upload 到 LINE 的圖片 API 不行，只能給 public URL
-    # 改用簽名 URL 方式：直接打 /line/snapshot 端點
-    # 這個端點無需 auth，但有 HMAC 保護
-    import time
-    ts = int(time.time())
-    sig_data = f"{camera_id}:{ts}:{LINE_CHANNEL_SECRET}"
-    sig = hashlib.md5(sig_data.encode()).hexdigest()[:12]
-    public_url = f"{AUTH_SERVICE_URL}/line/snapshot/{camera_id}?t={ts}&sig={sig}"
+    # 4. 下載圖片 bytes
+    async with httpx.AsyncClient(timeout=30) as cl:
+        img_r = await cl.get(full_url, headers={"Authorization": f"Bearer {cam_token}"})
+    if not img_r.is_success:
+        await line_push(line_user_id, [{"type":"text","text":"無法下載圖片。"}])
+        return
+    img_bytes = img_r.content
+    content_type = img_r.headers.get("content-type", "image/jpeg")
 
+    # 5. 存入臨時快取取得公開 token
+    token = await _store_temp_image(img_bytes, content_type)
+    FRONTEND_URL = os.getenv("FRONTEND_URL", "https://reseller.symotus.com:9443")
+    public_url = f"{FRONTEND_URL}/auth-api/cameras/temp-image/{token}"
+
+    # 6. 推送 LINE 圖片訊息
     await line_push(line_user_id, [
-        {"type": "image", "originalContentUrl": public_url, "previewImageUrl": public_url}
+        {"type": "image", "originalContentUrl": public_url, "previewImageUrl": public_url},
+        {"type": "text", "text": f"📷 最新照片 · {taken_at}"}
     ])
 
 # ── Webhook endpoint ──────────────────────────────────────────────────────────

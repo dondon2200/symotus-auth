@@ -99,3 +99,37 @@ async def get_public_nas_image(token: str, request: Request, db: Session = Depen
         iter([resp.content]),
         media_type=resp.headers.get("content-type", "image/jpeg"),
     )
+
+import secrets as _secrets
+import asyncio as _asyncio
+from datetime import datetime as _dt
+
+# In-memory 臨時圖片快取（60 秒有效）
+_temp_image_cache: dict[str, tuple[bytes, str, float]] = {}  # token → (data, content_type, expires_at)
+
+async def _store_temp_image(data: bytes, content_type: str) -> str:
+    """存入快取，回傳 60 秒有效 token"""
+    token = _secrets.token_urlsafe(16)
+    expires = _asyncio.get_event_loop().time() + 60
+    _temp_image_cache[token] = (data, content_type, expires)
+    # 清理過期
+    now = _asyncio.get_event_loop().time()
+    expired = [k for k, (_, _, exp) in _temp_image_cache.items() if exp < now]
+    for k in expired:
+        del _temp_image_cache[k]
+    return token
+
+
+@router.get("/temp-image/{token}")
+async def serve_temp_image(token: str):
+    """公開端點：給 LINE 存取臨時圖片（60 秒有效）"""
+    from fastapi.responses import Response
+    entry = _temp_image_cache.get(token)
+    if not entry:
+        raise HTTPException(404, "圖片已過期或不存在")
+    data, content_type, expires = entry
+    import asyncio
+    if asyncio.get_event_loop().time() > expires:
+        del _temp_image_cache[token]
+        raise HTTPException(410, "圖片已過期")
+    return Response(content=data, media_type=content_type)
