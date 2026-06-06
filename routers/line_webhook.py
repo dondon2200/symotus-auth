@@ -234,8 +234,24 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
         r = await (await httpx.AsyncClient(timeout=10).__aenter__()).get(f"{AUTH_SERVICE_URL}/cameras/{args['camera_id']}/timesnap", headers=h)
         if not r.is_success: return {"result": "無法取得排程設定"}
         d = r.json()
-        if not d.get("enable"): return {"result": "此相機未設定拍照排程"}
-        return {"result": f"拍照排程：開始 {d.get('start_time','?')}，結束 {d.get('end_time','?')}，間隔 {d.get('interval','?')} 分鐘，每天拍照 {d.get('shots_per_day','?')} 張"}
+        enabled = str(d.get("enable","0")) in ("1","True","true")
+        if not enabled: return {"result": "此相機目前未啟用拍照排程"}
+        # interval 單位是秒
+        interval_secs = int(d.get("interval", 900))
+        interval_mins = interval_secs // 60
+        # 解析 DAY7.T0.timeSeg（全天設定）: "enable/HH:MM-HH:MM"
+        time_seg = d.get("DAY7.T0.timeSeg", "0/0:0-23:59")
+        seg_enabled = time_seg.startswith("1/")
+        if seg_enabled:
+            time_range = time_seg[2:]  # 去掉 "1/"
+            start_raw, end_raw = time_range.split("-") if "-" in time_range else ("0:0","23:59")
+            def fmt(t): parts=t.split(":"); return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+            start_str = fmt(start_raw); end_str = fmt(end_raw)
+        else:
+            start_str = "全天"; end_str = "全天"
+        mins_per_day = (int(end_raw.split(":")[0])*60+int(end_raw.split(":")[1])) - (int(start_raw.split(":")[0])*60+int(start_raw.split(":")[1])) if seg_enabled else 1440
+        shots = mins_per_day // interval_mins if interval_mins > 0 else "?"
+        return {"result": "拍照排程已啟用\n• 時間：" + start_str + " ～ " + end_str + "\n• 間隔：每 " + str(interval_mins) + " 分鐘\n• 每天約 " + str(shots) + " 張"}
 
     if name == "set_camera_schedule":
         if not args.get("confirmed"):
@@ -246,14 +262,19 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
             shots = mins // int(interval) if mins > 0 and int(interval) > 0 else "?"
             return {"result": f"確認設定：每天 {start}～{end}，每 {interval} 分鐘拍一張，每天約 {shots} 張。回覆「確認」執行。"}
         # 組 timesnap payload（Camera Backend 格式）
+        # Camera Backend timesnap：interval 單位是秒，時間用 DAY7.T0.timeSeg
+        start = args["start_time"].replace(":", "").zfill(4)  # "08:00" → "0800"
+        end = args["end_time"].replace(":", "").zfill(4)
+        start_fmt = f"{int(start[:2])}:{int(start[2:])}"  # "8:0"
+        end_fmt = f"{int(end[:2])}:{int(end[2:])}"
         payload = {
             "enable": True,
-            "start_time": args["start_time"],
-            "end_time": args["end_time"],
-            "interval": int(args["interval_minutes"]),
+            "interval": int(args["interval_minutes"]) * 60,  # 轉為秒
+            "ftp": 1,
+            "DAY7.T0.timeSeg": f"1/{start_fmt}-{end_fmt}",  # 全週時間設定
         }
         async with httpx.AsyncClient(timeout=15) as cl:
-            r = await cl.put(f"{auth_token and AUTH_SERVICE_URL or AUTH_SERVICE_URL}/cameras/{args['camera_id']}/timesnap",
+            r = await cl.put(f"{AUTH_SERVICE_URL}/cameras/{args['camera_id']}/timesnap",
                 headers={**h, "Content-Type": "application/json"},
                 json=payload)
         if r.is_success:
