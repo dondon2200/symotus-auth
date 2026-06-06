@@ -720,7 +720,25 @@ async def proxy_camera_api(
             content=body,
             params=dict(request.query_params),
         )
-        return JSONResponse(status_code=resp.status_code, content=resp.json() if resp.content else {})
+    # 若 user token 被拒（相機屬於不同 CB 帳號），自動換 admin token 重試
+    if resp.status_code in (403, 404):
+        async with httpx.AsyncClient(timeout=10) as client:
+            tok_r = await client.post(
+                f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                headers={"x-service-key": CAMERA_SERVICE_KEY},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+            )
+        admin_tok = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+        if admin_tok:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.request(
+                    method=request.method,
+                    url=f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}/{path}",
+                    headers={"Authorization": f"Bearer {admin_tok}", "Content-Type": "application/json"},
+                    content=body,
+                    params=dict(request.query_params),
+                )
+    return JSONResponse(status_code=resp.status_code, content=resp.json() if resp.content else {})
 
 # ── Projects proxy ─────────────────────────────────────────────────────────────
 
