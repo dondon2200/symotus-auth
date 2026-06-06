@@ -35,7 +35,8 @@ class Settings(BaseSettings):
 
     @property
     def LINE_CLIENT_SECRET(self) -> Optional[str]:
-        return self.LINE_CHANNEL_SECRET
+        # 優先用 LINE Login 專用 secret，沒設才 fallback 舊 channel secret
+        return self.LINE_LOGIN_CHANNEL_SECRET or self.LINE_CHANNEL_SECRET
 
     FRONTEND_URL: str = "https://reseller.symotus.com:9443"
     INVITE_EXPIRE_HOURS: int = 168
