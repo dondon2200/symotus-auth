@@ -281,7 +281,17 @@ async def get_camera(
         raise HTTPException(403, "無此相機的存取權限")
 
     cam_token = await get_camera_backend_token(current_user)
-    # 若沒有 cam_token（reseller 無 camera_email），用 admin fallback
+
+    # 若沒有 cam_token，試 camera_access granter 的 token（分享相機的擁有者）
+    access = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == camera_id,
+        CameraAccess.user_id == current_user.id,
+    ).first()
+    if not cam_token and access and access.granted_by:
+        owner = db.query(User).filter(User.id == access.granted_by).first()
+        if owner:
+            cam_token = await get_camera_backend_token(owner)
+    # 最後 fallback admin
     if not cam_token:
         async with httpx.AsyncClient(timeout=10) as client:
             tok_r = await client.post(
@@ -303,10 +313,7 @@ async def get_camera(
 
     # 附上當前用戶的權限等級
     # 先查 camera_access（分享邀請授權）；若有，以授權等級為準
-    access = db.query(CameraAccess).filter(
-        CameraAccess.camera_id == camera_id,
-        CameraAccess.user_id == current_user.id,
-    ).first()
+    # access 已在上方查過
     if access:
         data["my_permission"] = access.permission_level or "photos_stream"
     elif current_user.role in ("reseller", "symotus_admin"):

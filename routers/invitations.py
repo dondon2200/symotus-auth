@@ -41,6 +41,22 @@ def create_invitation(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("reseller", "symotus_admin")),
 ):
+    # 防重複：若已有 pending 邀請，直接回傳現有連結
+    existing_inv = db.query(CameraInvitation).filter(
+        CameraInvitation.inviter_id == current_user.id,
+        CameraInvitation.camera_id == body.camera_id,
+        CameraInvitation.status == "pending",
+        CameraInvitation.is_public == body.is_public,
+    ).first()
+    if existing_inv:
+        invite_url = f"{FRONTEND_URL}/camera-invite/{existing_inv.token}"
+        return {
+            "id": existing_inv.id, "token": existing_inv.token,
+            "invite_url": invite_url, "camera_name": existing_inv.camera_name,
+            "expires_at": existing_inv.expires_at.isoformat() if existing_inv.expires_at else None,
+            "reused": True,
+        }
+
     token = secrets.token_urlsafe(24)
     expires_at = None
     if body.expires_hours:
@@ -132,13 +148,19 @@ def accept_invitation(
     if inv.expires_at and inv.expires_at < datetime.utcnow():
         raise HTTPException(400, "邀請連結已過期")
 
-    # 確認未重複授權
+    # 若已有此相機的 camera_access，提示已有存取權，不重複建立
     existing = db.query(CameraAccess).filter(
         CameraAccess.user_id == current_user.id,
         CameraAccess.camera_id == inv.camera_id,
     ).first()
-    if not existing:
-        db.add(CameraAccess(camera_id=inv.camera_id, user_id=current_user.id, granted_by=inv.inviter_id, permission_level=inv.permission_level))
+    if existing:
+        # 更新 permission_level 若更高
+        inv.status = "accepted"
+        inv.invitee_id = current_user.id
+        inv.responded_at = datetime.utcnow()
+        db.commit()
+        return {"message": f"你已有「{inv.camera_name}」的存取權，儀表板已顯示此相機", "camera_id": inv.camera_id, "already_exists": True}
+    db.add(CameraAccess(camera_id=inv.camera_id, user_id=current_user.id, granted_by=inv.inviter_id, permission_level=inv.permission_level))
 
     inv.status = "accepted"
     inv.invitee_id = current_user.id
