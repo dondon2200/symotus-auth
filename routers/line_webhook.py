@@ -348,9 +348,41 @@ async def call_ai_line(text: str, auth_token: str, line_user_id: str) -> dict:
     return {"text": ai_reply, "snapshot": snapshot_action}
 
 # ── 截圖處理 ─────────────────────────────────────────────────────────────────
+GO2RTC_BASE = "https://user.symotus.com/go2rtc"
+
 async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: str):
-    """取最新照片 → 存入臨時快取 → 推送 LINE 圖片訊息"""
+    """取相機即時截圖（go2rtc）或最新 NAS 照片 → 推送 LINE 圖片訊息"""
     from routers.public_camera import _store_temp_image, _temp_image_cache
+
+    # 先查 camera 的 ip 以取得 stream_name
+    h = {"Authorization": f"Bearer {auth_token}"}
+    stream_name = None
+    try:
+        async with httpx.AsyncClient(timeout=8) as cl:
+            cr = await cl.get(f"{AUTH_SERVICE_URL}/cameras/{camera_id}", headers=h)
+        if cr.is_success:
+            info = cr.json(); basic = info.get("basic_info", info)
+            ip = basic.get("ip_address","")
+            if ip and len(ip.split(".")) >= 3:
+                stream_name = f"cam{ip.split('.')[2]}"
+    except Exception:
+        pass
+
+    # 嘗試 go2rtc 即時截圖（真正的「現在」）
+    if stream_name:
+        try:
+            async with httpx.AsyncClient(timeout=10) as cl:
+                gr = await cl.get(f"{GO2RTC_BASE}/api/frame.jpeg?src={stream_name}")
+            if gr.status_code == 200 and gr.content:
+                token = await _store_temp_image(gr.content, "image/jpeg")
+                FRONTEND_URL = os.getenv("FRONTEND_URL", "https://reseller.symotus.com:9443")
+                public_url = f"{FRONTEND_URL}/auth-api/cameras/public/temp-image/{token}"
+                await line_push(line_user_id, [
+                    {"type": "image", "originalContentUrl": public_url, "previewImageUrl": public_url}
+                ])
+                return
+        except Exception:
+            pass  # fallback to NAS
 
     h = {"Authorization": f"Bearer {auth_token}"}
     # 1. 查 NAS 最新照片
