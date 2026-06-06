@@ -167,9 +167,18 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
         return {"result": f"✅ 縮時任務已送出！相機：{cam_name}，{args['start_date']} 至 {args['end_date']}。可到網頁 /jobs 查看進度。"}
 
     if name == "get_shared_cameras":
-        r = await (await httpx.AsyncClient(timeout=15).__aenter__()).get(f"{AUTH_SERVICE_URL}/cameras", headers=h)
+        async with httpx.AsyncClient(timeout=15) as cl:
+            r = await cl.get(f"{AUTH_SERVICE_URL}/cameras", headers=h)
         if not r.is_success: return {"result": "無法取得相機列表"}
         cams = r.json().get("cameras", [])
+        # 查 granter 名稱：用 camera_access 的 granted_by user
+        async with httpx.AsyncClient(timeout=10) as cl:
+            ra = await cl.get(f"{AUTH_SERVICE_URL}/admin/users",
+                headers={"x-service-key": CAMERA_SERVICE_KEY})
+        user_map = {}
+        if ra.is_success:
+            for u in ra.json():
+                user_map[u["id"]] = u.get("full_name") or u.get("username") or u.get("email","?")
         shared = [cam for cam in cams if cam.get("is_shared")]
         owned = [cam for cam in cams if not cam.get("is_shared")]
         parts = []
@@ -177,9 +186,13 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
             names = ", ".join(cam.get("name","?") for cam in owned)
             parts.append("你擁有：" + names)
         if shared:
-            names = ", ".join(cam.get("name","?") for cam in shared)
-            parts.append("分享給你：" + names)
-        return {"result": "、".join(parts) if parts else "目前沒有任何相機"}
+            items = []
+            for cam in shared:
+                granter_id = cam.get("granted_by") or cam.get("granter_id")
+                granter = user_map.get(granter_id, "管理員") if granter_id else "管理員"
+                items.append(f"{cam.get('name','?')}（由 {granter} 分享）")
+            parts.append("分享給你：" + "、".join(items))
+        return {"result": "；".join(parts) if parts else "目前沒有任何相機"}
 
     if name == "get_camera_schedule":
         r = await (await httpx.AsyncClient(timeout=10).__aenter__()).get(f"{AUTH_SERVICE_URL}/cameras/{args['camera_id']}/timesnap", headers=h)
