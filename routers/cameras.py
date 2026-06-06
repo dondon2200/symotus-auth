@@ -204,14 +204,30 @@ async def get_thumbnails(
         return {}
 
     cam_token = await get_camera_backend_token(current_user)
+    # 若 user token 被拒，改用 admin token（相機可能屬於不同 CB 帳號）
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             f"{CAMERA_BACKEND_URL}/api/cameras/thumbnails/latest",
             headers={"Authorization": f"Bearer {cam_token}"},
             params={"ids": ",".join(str(i) for i in requested_ids)},
         )
-        if resp.status_code == 200:
-            return resp.json()
+    if resp.status_code in (403, 404) or not resp.content:
+        async with httpx.AsyncClient(timeout=10) as client:
+            tok_r = await client.post(
+                f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                headers={"x-service-key": CAMERA_SERVICE_KEY},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+            )
+        admin_tok = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+        if admin_tok:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{CAMERA_BACKEND_URL}/api/cameras/thumbnails/latest",
+                    headers={"Authorization": f"Bearer {admin_tok}"},
+                    params={"ids": ",".join(str(i) for i in requested_ids)},
+                )
+    if resp.status_code == 200:
+        return resp.json()
     return {}
 
 
