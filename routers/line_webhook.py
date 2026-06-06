@@ -77,6 +77,12 @@ LINE_TOOLS = [
             "end_date":{"type":"string"},
             "confirmed":{"type":"boolean"}},"required":["camera_id","start_date","end_date","confirmed"]}}},
     {"type":"function","function":{
+        "name":"get_shared_cameras","description":"查詢有哪些相機被分享給我，或我分享給別人的相機",
+        "parameters":{"type":"object","properties":{}}}},
+    {"type":"function","function":{
+        "name":"get_camera_schedule","description":"查詢相機的拍照排程（開機時間、結束時間、拍照間隔）",
+        "parameters":{"type":"object","properties":{"camera_id":{"type":"number"}},"required":["camera_id"]}}},
+    {"type":"function","function":{
         "name":"get_weather","description":"查詢天氣",
         "parameters":{"type":"object","properties":{
             "location":{"type":"string"}},"required":["location"]}}},
@@ -159,6 +165,28 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
                       "serial_id": serial, "start_date": args["start_date"], "end_date": args["end_date"],
                       "fps": 30, "resolution": "1920x1080"})
         return {"result": f"✅ 縮時任務已送出！相機：{cam_name}，{args['start_date']} 至 {args['end_date']}。可到網頁 /jobs 查看進度。"}
+
+    if name == "get_shared_cameras":
+        r = await (await httpx.AsyncClient(timeout=15).__aenter__()).get(f"{AUTH_SERVICE_URL}/cameras", headers=h)
+        if not r.is_success: return {"result": "無法取得相機列表"}
+        cams = r.json().get("cameras", [])
+        shared = [cam for cam in cams if cam.get("is_shared")]
+        owned = [cam for cam in cams if not cam.get("is_shared")]
+        parts = []
+        if owned:
+            names = ", ".join(cam.get("name","?") for cam in owned)
+            parts.append("你擁有：" + names)
+        if shared:
+            names = ", ".join(cam.get("name","?") for cam in shared)
+            parts.append("分享給你：" + names)
+        return {"result": "、".join(parts) if parts else "目前沒有任何相機"}
+
+    if name == "get_camera_schedule":
+        r = await (await httpx.AsyncClient(timeout=10).__aenter__()).get(f"{AUTH_SERVICE_URL}/cameras/{args['camera_id']}/timesnap", headers=h)
+        if not r.is_success: return {"result": "無法取得排程設定"}
+        d = r.json()
+        if not d.get("enable"): return {"result": "此相機未設定拍照排程"}
+        return {"result": f"拍照排程：開始 {d.get('start_time','?')}，結束 {d.get('end_time','?')}，間隔 {d.get('interval','?')} 分鐘，每天拍照 {d.get('shots_per_day','?')} 張"}
 
     if name == "get_weather":
         loc = args["location"].replace(" ", "+")
@@ -256,7 +284,7 @@ async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: s
     # 5. 存入臨時快取取得公開 token
     token = await _store_temp_image(img_bytes, content_type)
     FRONTEND_URL = os.getenv("FRONTEND_URL", "https://reseller.symotus.com:9443")
-    public_url = f"{FRONTEND_URL}/auth-api/cameras/temp-image/{token}"
+    public_url = f"{FRONTEND_URL}/auth-api/cameras/public/temp-image/{token}"
 
     # 6. 推送 LINE 圖片訊息
     await line_push(line_user_id, [
