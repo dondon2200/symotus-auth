@@ -133,3 +133,47 @@ async def serve_temp_image(token: str):
         del _temp_image_cache[token]
         raise HTTPException(410, "圖片已過期")
     return Response(content=data, media_type=content_type)
+
+
+@router.get("/live-frame/{camera_id}")
+async def live_camera_frame(camera_id: int, db: Session = Depends(get_db)):
+    """直接從 go2rtc 取即時截圖，供 LINE 使用（公開，無需登入）"""
+    from fastapi.responses import Response
+    # 查 camera ip 推導 stream name
+    import httpx as _httpx
+    from routers.cameras import get_camera_backend_token, CAMERA_BACKEND_URL, CAMERA_SERVICE_KEY
+    from models import User
+    
+    # 用 admin token 查 camera ip
+    async with _httpx.AsyncClient(timeout=8) as cl:
+        tok_r = await cl.post(f"{CAMERA_BACKEND_URL}/internal/auth/token",
+            headers={"x-service-key": CAMERA_SERVICE_KEY},
+            json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"})
+    admin_tok = tok_r.json().get("access_token","") if tok_r.status_code == 200 else ""
+    
+    stream_name = None
+    if admin_tok:
+        async with _httpx.AsyncClient(timeout=8) as cl:
+            cr = await cl.get(f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
+                headers={"Authorization": f"Bearer {admin_tok}"})
+        if cr.status_code == 200:
+            info = cr.json(); basic = info.get("basic_info", info)
+            ip = basic.get("ip_address", "")
+            if ip and len(ip.split(".")) >= 3:
+                stream_name = f"cam{ip.split('.')[2]}"
+    
+    if not stream_name:
+        raise HTTPException(404, "找不到串流")
+    
+    # 從 go2rtc 取即時截圖
+    async with _httpx.AsyncClient(timeout=15) as cl:
+        gr = await cl.get(f"https://user.symotus.com/go2rtc/api/frame.jpeg?src={stream_name}")
+    
+    if gr.status_code != 200 or not gr.content:
+        raise HTTPException(503, "相機目前無串流")
+    
+    return Response(
+        content=gr.content,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-cache", "Content-Length": str(len(gr.content))}
+    )

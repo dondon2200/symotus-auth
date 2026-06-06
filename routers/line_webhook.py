@@ -368,15 +368,15 @@ async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: s
     except Exception:
         pass
 
-    # 嘗試 go2rtc 即時截圖（真正的「現在」）
+    # 用 live-frame proxy 端點（直接 proxy go2rtc，不用 temp cache）
     if stream_name:
+        FRONTEND_URL = os.getenv("FRONTEND_URL", "https://reseller.symotus.com:9443")
+        public_url = f"{FRONTEND_URL}/auth-api/cameras/public/live-frame/{camera_id}"
         try:
-            async with httpx.AsyncClient(timeout=10) as cl:
-                gr = await cl.get(f"{GO2RTC_BASE}/api/frame.jpeg?src={stream_name}")
-            if gr.status_code == 200 and gr.content:
-                token = await _store_temp_image(gr.content, "image/jpeg")
-                FRONTEND_URL = os.getenv("FRONTEND_URL", "https://reseller.symotus.com:9443")
-                public_url = f"{FRONTEND_URL}/auth-api/cameras/public/temp-image/{token}"
+            # 先驗證 go2rtc 有串流才送 LINE
+            async with httpx.AsyncClient(timeout=8) as cl:
+                test = await cl.get(f"{GO2RTC_BASE}/api/frame.jpeg?src={stream_name}")
+            if test.status_code == 200 and test.content:
                 await line_push(line_user_id, [
                     {"type": "image", "originalContentUrl": public_url, "previewImageUrl": public_url}
                 ])
