@@ -66,11 +66,21 @@ async def send_line_push(line_user_id: str, camera_id: int, camera_name: str):
                     ]
                 },
                 "footer": {
-                    "type": "box", "layout": "vertical", "paddingAll": "12px",
-                    "contents": [{
-                        "type": "button", "style": "primary", "color": "#f97316",
-                        "action": {"type": "uri", "label": "查看相機", "uri": url}
-                    }]
+                    "type": "box", "layout": "vertical", "paddingAll": "12px", "spacing": "sm",
+                    "contents": [
+                        {
+                            "type": "button", "style": "primary", "color": "#f97316",
+                            "action": {"type": "uri", "label": "查看相機", "uri": url}
+                        },
+                        {
+                            "type": "button", "style": "secondary",
+                            "action": {
+                                "type": "message",
+                                "label": "取消開機通知",
+                                "text": f"取消相機通知 {camera_id}"
+                            }
+                        }
+                    ]
                 }
             }
         }]
@@ -95,13 +105,15 @@ def get_notify_line_ids(camera_id: int, db: Session) -> list[str]:
     # admin 一定通知
     for u in db.query(User).filter(User.role == "symotus_admin", User.line_id.isnot(None)).all():
         ids.add(u.line_id)
-    # camera_access 裡有 line_id 的用戶 & 授權者
+    # camera_access 裡有 line_id 且 notify_on_online=True 的用戶
     for acc in db.query(CameraAccess).filter(CameraAccess.camera_id == camera_id).all():
-        for uid in [acc.user_id, acc.granted_by]:
-            if uid:
-                u = db.query(User).filter(User.id == uid, User.line_id.isnot(None)).first()
-                if u:
-                    ids.add(u.line_id)
+        # 只通知有訂閱的用戶（notify_on_online 預設 True）
+        notify = getattr(acc, "notify_on_online", True)
+        if not notify:
+            continue
+        u = db.query(User).filter(User.id == acc.user_id, User.line_id.isnot(None)).first()
+        if u:
+            ids.add(u.line_id)
     return list(ids)
 
 

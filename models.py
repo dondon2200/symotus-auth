@@ -38,6 +38,7 @@ class User(Base):
 
 
 class CameraAccess(Base):
+    """相機存取授權"""
     """end_user 可以存取哪些相機（camera_id 對應現有後端的相機 ID）"""
     __tablename__ = "camera_access"
 
@@ -46,6 +47,7 @@ class CameraAccess(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     granted_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     permission_level = Column(String, default="photos_stream", nullable=False)  # full / photos_stream / stream_only
+    notify_on_online = Column(Boolean, default=True, nullable=False, server_default="true")  # 開機 LINE 通知
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", foreign_keys=[user_id], back_populates="camera_accesses")

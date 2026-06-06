@@ -271,6 +271,24 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
                 "text": f"您好！請先到 {os.getenv('FRONTEND_URL', 'https://reseller.symotus.com:9443')} 用 LINE 登入，才能使用 AI 助理功能"}])
             continue
 
+        # 特殊指令：取消相機通知（從 Flex Message 按鈕觸發）
+        if text.startswith("取消相機通知 "):
+            try:
+                cam_id = int(text.split(" ")[1])
+                access = db.query(CameraAccess).filter(
+                    CameraAccess.camera_id == cam_id,
+                    CameraAccess.user_id == user.id,
+                ).first()
+                if access:
+                    access.notify_on_online = False
+                    db.commit()
+                    from models import CameraAccess as CA
+                await line_reply(reply_token, [{"type": "text",
+                    "text": f"✅ 已取消相機 #{cam_id} 的開機通知。如需重新訂閱，請至網頁開機通知設定。"}])
+            except Exception:
+                await line_reply(reply_token, [{"type": "text", "text": "取消通知失敗，請稍後再試"}])
+            continue
+
         # 顯示載入動畫
         await line_loading(line_user_id)
 

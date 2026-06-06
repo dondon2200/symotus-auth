@@ -104,6 +104,12 @@ async def startup():
                     conn.commit()
                 except Exception:
                     conn.rollback()
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text("ALTER TABLE camera_access ADD COLUMN IF NOT EXISTS notify_on_online BOOLEAN DEFAULT TRUE NOT NULL"))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
 
             logger.info("DB connected and tables created!")
             # 啟動相機開機 LINE 推播背景工作
