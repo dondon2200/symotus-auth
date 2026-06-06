@@ -510,6 +510,24 @@ async def nas_images(
 
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token")
+
+    # 預先驗證 token 是否能存取此相機，不能就換 admin token
+    if cam_token and camera_id:
+        async with httpx.AsyncClient(timeout=8) as client:
+            test_r = await client.get(
+                f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
+                headers={"Authorization": f"Bearer {cam_token}"},
+            )
+        if test_r.status_code in (403, 404):
+            # 這個 token 沒有此相機存取權，改用 admin token
+            async with httpx.AsyncClient(timeout=10) as client:
+                tok_r = await client.post(
+                    f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                    headers={"x-service-key": CAMERA_SERVICE_KEY},
+                    json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                )
+            cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else cam_token
+
     limit = int(params.get("limit", 30))
     offset = int(params.get("offset", 0))
     start_time = params.get("start_time")
