@@ -54,6 +54,28 @@ LINE 版限制（直接說「請開啟網頁操作」）：
 - 今天日期：""" + datetime.now().strftime("%Y-%m-%d")
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
+# ── 對話記憶（per user, 30 分鐘無互動自動清除）────────────────────────────────
+import time as _time
+_HISTORY_TTL = 1800  # 30 分鐘
+_chat_history: dict[str, tuple[list, float]] = {}  # {line_user_id: (messages, last_ts)}
+
+def _get_history(uid: str) -> list:
+    """取得用戶對話歷史，超時自動清除"""
+    now = _time.time()
+    if uid in _chat_history:
+        msgs, ts = _chat_history[uid]
+        if now - ts < _HISTORY_TTL:
+            return msgs
+    return []
+
+def _save_history(uid: str, msgs: list):
+    """儲存對話歷史（最多保留最近 20 則）"""
+    _chat_history[uid] = (msgs[-20:], _time.time())
+
+def _clear_history(uid: str):
+    _chat_history.pop(uid, None)
+
+
 LINE_TOOLS = [
     {"type":"function","function":{
         "name":"list_cameras","description":"查詢用戶所有相機列表和在線狀態",
@@ -218,7 +240,10 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
 
 # ── AI 呼叫 ───────────────────────────────────────────────────────────────────
 async def call_ai_line(text: str, auth_token: str, line_user_id: str) -> dict:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text}]
+    # 載入對話歷史
+    history = _get_history(line_user_id)
+    history.append({"role": "user", "content": text})
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
     snapshot_action = None
 
     for _ in range(4):
@@ -235,7 +260,10 @@ async def call_ai_line(text: str, auth_token: str, line_user_id: str) -> dict:
 
         msg = resp.json().get("choices", [{}])[0].get("message", {})
         if not msg.get("tool_calls"):
-            return {"text": msg.get("content", "好的。"), "snapshot": snapshot_action}
+            ai_text = msg.get("content", "好的。")
+            history.append({"role": "assistant", "content": ai_text})
+            _save_history(line_user_id, history)
+            return {"text": ai_text, "snapshot": snapshot_action}
 
         messages.append(msg)
         for tc in msg.get("tool_calls", []):
@@ -250,7 +278,15 @@ async def call_ai_line(text: str, auth_token: str, line_user_id: str) -> dict:
                 messages.append({"role": "tool", "tool_call_id": tc["id"],
                                   "content": json.dumps(result["result"], ensure_ascii=False)})
 
-    return {"text": "操作完成。", "snapshot": snapshot_action}
+    ai_reply = "操作完成。"
+    for m in reversed(messages):
+        if m.get("role") == "assistant" and m.get("content"):
+            ai_reply = m["content"]
+            break
+    # 儲存完整對話到歷史（去掉 system prompt）
+    history.append({"role": "assistant", "content": ai_reply})
+    _save_history(line_user_id, history)
+    return {"text": ai_reply, "snapshot": snapshot_action}
 
 # ── 截圖處理 ─────────────────────────────────────────────────────────────────
 async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: str):
