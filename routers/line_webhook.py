@@ -41,12 +41,13 @@ SYSTEM_PROMPT = """你是 Symotus 縮時攝影平台的 AI 助理，透過 LINE 
 - 發送相機最新截圖（get_snapshot）
 - 確認某日有沒有正常拍照、拍了幾張（get_recent_photos）
 - 查詢拍照排程設定（get_camera_schedule）
+- 設定拍照排程（set_camera_schedule，需用戶確認才執行）
 - 查詢誰分享了哪台相機（get_shared_cameras）
 - 生成縮時影片（create_timelapse，需確認）
 - 查詢天氣（get_weather）
 
 LINE 版限制（說「請開啟網頁操作」）：
-- 修改相機設定（FTP/網路/開機時間等寫入操作）
+- FTP/網路/開機時間等設定（這些才需要網頁）
 - 帳單管理
 
 重要規則：
@@ -106,6 +107,15 @@ LINE_TOOLS = [
     {"type":"function","function":{
         "name":"get_camera_schedule","description":"查詢相機的拍照排程（開機時間、結束時間、拍照間隔）",
         "parameters":{"type":"object","properties":{"camera_id":{"type":"number"}},"required":["camera_id"]}}},
+    {"type":"function","function":{
+        "name":"set_camera_schedule","description":"設定相機的拍照排程（開機時間、結束時間、拍照間隔）。用戶確認後才執行。",
+        "parameters":{"type":"object","properties":{
+            "camera_id":{"type":"number","description":"相機 ID"},
+            "start_time":{"type":"string","description":"開始時間 HH:MM，例如 08:00"},
+            "end_time":{"type":"string","description":"結束時間 HH:MM，例如 18:00"},
+            "interval_minutes":{"type":"number","description":"拍照間隔（分鐘），例如 15"},
+            "confirmed":{"type":"boolean","description":"用戶是否已確認"}
+        },"required":["camera_id","start_time","end_time","interval_minutes","confirmed"]}}},
     {"type":"function","function":{
         "name":"get_weather","description":"查詢天氣",
         "parameters":{"type":"object","properties":{
@@ -224,6 +234,29 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
         d = r.json()
         if not d.get("enable"): return {"result": "此相機未設定拍照排程"}
         return {"result": f"拍照排程：開始 {d.get('start_time','?')}，結束 {d.get('end_time','?')}，間隔 {d.get('interval','?')} 分鐘，每天拍照 {d.get('shots_per_day','?')} 張"}
+
+    if name == "set_camera_schedule":
+        if not args.get("confirmed"):
+            start = args.get("start_time","?")
+            end = args.get("end_time","?")
+            interval = args.get("interval_minutes","?")
+            mins = (int(end.split(":")[0])*60+int(end.split(":")[1])) - (int(start.split(":")[0])*60+int(start.split(":")[1]))
+            shots = mins // int(interval) if mins > 0 and int(interval) > 0 else "?"
+            return {"result": f"確認設定：每天 {start}～{end}，每 {interval} 分鐘拍一張，每天約 {shots} 張。回覆「確認」執行。"}
+        # 組 timesnap payload（Camera Backend 格式）
+        payload = {
+            "enable": True,
+            "start_time": args["start_time"],
+            "end_time": args["end_time"],
+            "interval": int(args["interval_minutes"]),
+        }
+        async with httpx.AsyncClient(timeout=15) as cl:
+            r = await cl.put(f"{auth_token and AUTH_SERVICE_URL or AUTH_SERVICE_URL}/cameras/{args['camera_id']}/timesnap",
+                headers={**h, "Content-Type": "application/json"},
+                json=payload)
+        if r.is_success:
+            return {"result": f"✅ 排程已設定！相機 {args['camera_id']}：{args['start_time']}～{args['end_time']}，每 {args['interval_minutes']} 分鐘一張。"}
+        return {"result": f"設定失敗（{r.status_code}），請確認相機是否在線。"}
 
     if name == "get_weather":
         loc = args["location"].replace(" ", "+")
