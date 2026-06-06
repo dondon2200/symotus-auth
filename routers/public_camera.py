@@ -110,7 +110,7 @@ _temp_image_cache: dict[str, tuple[bytes, str, float]] = {}  # token → (data, 
 async def _store_temp_image(data: bytes, content_type: str) -> str:
     """存入快取，回傳 60 秒有效 token"""
     token = _secrets.token_urlsafe(16)
-    expires = _asyncio.get_event_loop().time() + 60
+    expires = _asyncio.get_event_loop().time() + 300  # 5 分鐘
     _temp_image_cache[token] = (data, content_type, expires)
     # 清理過期
     now = _asyncio.get_event_loop().time()
