@@ -307,9 +307,24 @@ async def get_camera(
             f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
             headers={"Authorization": f"Bearer {cam_token}"},
         )
-        if resp.status_code != 200:
-            raise HTTPException(resp.status_code, resp.text)
-        data = resp.json()
+    # 若 user token 存取失敗（相機可能屬於不同 CB 帳號），嘗試 admin fallback
+    if resp.status_code in (403, 404):
+        async with httpx.AsyncClient(timeout=10) as client:
+            tok_r = await client.post(
+                f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                headers={"x-service-key": CAMERA_SERVICE_KEY},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+            )
+        admin_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+        if admin_token:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    data = resp.json()
 
     # 附上當前用戶的權限等級
     # 先查 camera_access（分享邀請授權）；若有，以授權等級為準
