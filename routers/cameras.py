@@ -317,6 +317,38 @@ async def get_camera(
     return data
 
 
+@router.post("/{camera_id}/notify-subscribe")
+async def subscribe_online_notification(
+    camera_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """訂閱相機開機 LINE 通知（camera_notifier 已自動通知有 line_id 的用戶）"""
+    allowed_ids = get_allowed_camera_ids(current_user, db)
+    if allowed_ids is not None and camera_id not in allowed_ids:
+        raise HTTPException(403, "無此相機的存取權限")
+
+    if not current_user.line_id:
+        return {"subscribed": False, "message": "請先用 LINE 登入以接收通知", "needs_line": True}
+
+    # camera_notifier 會自動通知此用戶（有 line_id + camera_access），確認即可
+    # 確保 camera_access 存在（reseller 自己的相機可能沒有 camera_access）
+    access = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == camera_id,
+        CameraAccess.user_id == current_user.id,
+    ).first()
+    if not access and current_user.role != "symotus_admin":
+        db.add(CameraAccess(
+            camera_id=camera_id,
+            user_id=current_user.id,
+            granted_by=current_user.id,
+            permission_level="stream_only",
+        ))
+        db.commit()
+
+    return {"subscribed": True, "message": "開機時將透過 LINE 通知您"}
+
+
 @router.post("/{camera_id}/unbind")
 async def unbind_camera(
     camera_id: int,
