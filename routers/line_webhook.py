@@ -396,8 +396,7 @@ async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: s
 
     # 6. 推送 LINE 圖片訊息
     await line_push(line_user_id, [
-        {"type": "image", "originalContentUrl": public_url, "previewImageUrl": public_url},
-        {"type": "text", "text": f"📷 最新照片 · {taken_at}"}
+        {"type": "image", "originalContentUrl": public_url, "previewImageUrl": public_url}
     ])
 
 # ── Webhook endpoint ──────────────────────────────────────────────────────────
