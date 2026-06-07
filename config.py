@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # LINE OAuth - 讀取 LINE_CHANNEL_ID / LINE_CHANNEL_SECRET
     LINE_CHANNEL_ID: Optional[str] = None
     LINE_CHANNEL_SECRET: Optional[str] = None
+    LINE_LOGIN_CHANNEL_SECRET: Optional[str] = None  # LINE Login channel（OAuth 換 token 用）
     LINE_REDIRECT_URI: str = "https://reseller.symotus.com:9443/auth-api/auth/line/callback"
 
     # alias 讓舊程式碼也能用 LINE_CLIENT_ID
