@@ -328,17 +328,25 @@ async def _run_gdrive_background(job_id: int, files: list[dict], body_fps: int, 
             db.commit()
             return
 
-        # 上傳 Spark 階段：從磁碟讀，分批送
+        # 上傳 Spark 階段：採樣避免 413（Spark 有 payload 限制）
         job.status = "uploading"
         db.commit()
 
         callback_url = f"{settings.PUBLIC_BASE_URL}/jobs/gdrive/callback/{job_id}"
 
-        # 用 open file handles 做 multipart，不把全部載入記憶體
+        # 若照片超過 300 張，均勻採樣減少到 300（Spark 有大小限制）
+        MAX_SPARK_FILES = 300
+        if len(saved_files) > MAX_SPARK_FILES:
+            step = len(saved_files) / MAX_SPARK_FILES
+            sampled = [saved_files[int(i * step)] for i in range(MAX_SPARK_FILES)]
+            logger.info(f"GDrive job {job_id}: sampled {len(saved_files)} → {len(sampled)} files for Spark")
+        else:
+            sampled = saved_files
+
         file_handles = []
         form_files = []
         try:
-            for name, fpath in saved_files:
+            for name, fpath in sampled:
                 fh = open(fpath, "rb")
                 file_handles.append(fh)
                 form_files.append(("images", (name, fh, "image/jpeg")))
