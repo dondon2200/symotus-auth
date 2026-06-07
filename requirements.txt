@@ -11,3 +11,4 @@ python-multipart==0.0.12
 python-dotenv==1.0.1
 pydantic[email]==2.9.2
 pydantic-settings==2.5.2
+# force rebuild Sun Jun  7 04:14:46 UTC 2026
