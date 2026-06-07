@@ -826,3 +826,116 @@ async def create_project(
         except Exception:
             return JSONResponse(status_code=resp.status_code, content={"detail": resp.text})
 
+
+
+@router.post("/{camera_id}/prepare-timelapse")
+async def prepare_timelapse_folder(
+    camera_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """建立每天均勻取樣的縮時暫存資料夾，供 Spark /jobs/nas 使用"""
+    import shutil, math
+    from datetime import datetime as dt
+
+    body = await request.json()
+    serial_id: str = body.get("serial_id", "")
+    start_date: str = body.get("start_date", "")   # YYYY-MM-DD
+    end_date: str = body.get("end_date", "")
+    target_secs: int = int(body.get("target_duration_secs", 0))  # 0 = 不限
+    fps: int = int(body.get("fps", 30))
+
+    if not serial_id:
+        raise HTTPException(400, "serial_id 必填")
+
+    nas_base = f"/homes/firmness/{serial_id}"
+    if not os.path.isdir(nas_base):
+        raise HTTPException(404, f"找不到 NAS 資料夾：{nas_base}")
+
+    # 1. 列出日期子資料夾（YYYY-MM-DD 格式），依日期過濾
+    def valid_date(d):
+        try: dt.strptime(d, "%Y-%m-%d"); return True
+        except: return False
+
+    all_date_dirs = sorted([
+        d for d in os.listdir(nas_base)
+        if valid_date(d) and os.path.isdir(os.path.join(nas_base, d))
+    ])
+
+    if start_date: all_date_dirs = [d for d in all_date_dirs if d >= start_date]
+    if end_date:   all_date_dirs = [d for d in all_date_dirs if d <= end_date]
+
+    if not all_date_dirs:
+        raise HTTPException(404, "指定範圍內沒有照片")
+
+    # 2. 收集每天的照片列表
+    image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    def list_images(date_dir):
+        dpath = os.path.join(nas_base, date_dir)
+        files = sorted([
+            f for f in os.listdir(dpath)
+            if os.path.splitext(f)[1].lower() in image_exts
+        ])
+        return [(date_dir, f) for f in files]
+
+    photos_by_day = {d: list_images(d) for d in all_date_dirs}
+    total_photos = sum(len(v) for v in photos_by_day.values())
+    num_days = len(all_date_dirs)
+
+    # 3. 計算每天分配幾 frames
+    if target_secs > 0:
+        total_frames = target_secs * fps
+        frames_per_day = max(1, total_frames // num_days)
+    else:
+        # 不限制 → 直接用原始 nas_path，不建暫存
+        return {
+            "nas_folder": serial_id,
+            "total_photos": total_photos,
+            "sampled_photos": total_photos,
+            "days": num_days,
+            "estimated_secs": total_photos // fps,
+            "temp_created": False,
+        }
+
+    # 4. 每天均勻取樣
+    sampled: list[tuple[str, str]] = []
+    for date_dir, photos in photos_by_day.items():
+        if len(photos) <= frames_per_day:
+            sampled.extend(photos)
+        else:
+            step = len(photos) / frames_per_day
+            sampled.extend(photos[int(i * step)] for i in range(frames_per_day))
+
+    # 5. 建暫存資料夾，複製取樣照片（重新命名確保時間順序）
+    import time as _time
+    job_token = f"tl_{camera_id}_{int(_time.time())}"
+    temp_dir = f"/homes/firmness/{job_token}"
+    os.makedirs(temp_dir, exist_ok=True)
+
+    try:
+        for idx, (date_dir, fname) in enumerate(sampled):
+            src = os.path.join(nas_base, date_dir, fname)
+            ext = os.path.splitext(fname)[1]
+            dst = os.path.join(temp_dir, f"{idx:06d}{ext}")
+            if os.path.exists(src):
+                os.link(src, dst)  # hardlink 省空間
+    except OSError:
+        # hardlink 失敗（跨裝置）→ 用 symlink
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        os.makedirs(temp_dir, exist_ok=True)
+        for idx, (date_dir, fname) in enumerate(sampled):
+            src = os.path.join(nas_base, date_dir, fname)
+            ext = os.path.splitext(fname)[1]
+            dst = os.path.join(temp_dir, f"{idx:06d}{ext}")
+            if os.path.exists(src):
+                os.symlink(src, dst)
+
+    return {
+        "nas_folder": job_token,
+        "total_photos": total_photos,
+        "sampled_photos": len(sampled),
+        "days": num_days,
+        "estimated_secs": len(sampled) // fps,
+        "temp_created": True,
+    }
