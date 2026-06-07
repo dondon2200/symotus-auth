@@ -216,19 +216,21 @@ async def _list_drive_images(folder_id: str, max_images: Optional[int] = None) -
 
 
 async def _download_file_direct(session: httpx.AsyncClient, file_id: str) -> Optional[bytes]:
-    """用 Google Drive API 下載單張圖片"""
-    try:
-        resp = await session.get(
-            f"{GDRIVE_FILES_URL}/{file_id}",
-            params={"alt": "media", "key": GDRIVE_API_KEY},
-            follow_redirects=True,
-            timeout=30,
-        )
-        if resp.status_code == 200 and len(resp.content) > 1000:
-            return resp.content
-        return None
-    except Exception:
-        return None
+    """用公開 URL 下載 Google Drive 單張圖片（不需 API key，支援公開分享資料夾）"""
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    for attempt in range(3):  # 最多 3 次 retry
+        try:
+            resp = await session.get(url, follow_redirects=True, timeout=45)
+            if resp.status_code == 200 and len(resp.content) > 1000:
+                return resp.content
+            if resp.status_code in (403, 429) and attempt < 2:
+                await asyncio.sleep(2 ** attempt)  # 1s, 2s
+                continue
+            return None
+        except Exception:
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+    return None
 
 
 async def _run_gdrive_background_full(job_id: int, folder_id: str, body_fps: int, body_resolution: Optional[str], max_images: Optional[int] = None):
@@ -241,7 +243,7 @@ async def _run_gdrive_background_full(job_id: int, folder_id: str, body_fps: int
             return
 
         # 列出檔案清單
-        MAX_IMAGES = 500
+        MAX_IMAGES = 1000
         max_req = min(max_images or MAX_IMAGES, MAX_IMAGES)
         try:
             files = await _list_drive_images(folder_id, max_req)
@@ -392,44 +394,19 @@ async def create_gdrive_job(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """從 Google Drive 公開資料夾建立縮時影片 job（委派給 Camera Backend 處理）"""
-    # 先取得 Camera Backend user token（用 admin 帳號）
-    CAMERA_BACKEND = "https://user.symotus.com"
-    CAM_SVCKEY = os.environ.get("CAMERA_SERVICE_KEY", "")
-    async with httpx.AsyncClient(timeout=15) as client:
-        tok_resp = await client.post(
-            f"{CAMERA_BACKEND}/internal/auth/token",
-            headers={"x-service-key": CAM_SVCKEY},
-            json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
-        )
-    if tok_resp.status_code != 200:
-        raise HTTPException(502, f"無法取得 Camera Backend token：{tok_resp.text[:100]}")
-    cam_token = tok_resp.json().get("access_token", "")
+    """從 Google Drive 公開資料夾建立縮時影片 job（auth service 自己下載送 Spark）"""
+    # 解析 folder_id
+    import re
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", body.folder_url)
+    if not match:
+        raise HTTPException(400, "無效的 Google Drive 資料夾連結")
+    folder_id = match.group(1)
 
-    # 呼叫 Camera Backend 新 API
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{CAMERA_BACKEND}/api/timelapse/gdrive-import",
-            headers={"Authorization": f"Bearer {cam_token}"},
-            json={
-                "folder_url": body.folder_url,
-                "fps": body.fps,
-                "resolution": body.resolution,
-                "max_images": body.max_images,
-            },
-        )
-    if resp.status_code not in (200, 201):
-        raise HTTPException(502, f"Camera Backend 錯誤：{resp.text[:200]}")
-
-    cam_data = resp.json()
-    cam_job_id = cam_data.get("job_id")
-
-    # 在 Auth Service DB 記錄（spark_job_id 存 Camera Backend job_id）
+    # 建立 DB 記錄
     job = GDriveJob(
         user_id=current_user.id,
         folder_url=body.folder_url,
         status="pending",
-        spark_job_id=str(cam_job_id),
         fps=body.fps,
         resolution=body.resolution,
     )
@@ -437,11 +414,18 @@ async def create_gdrive_job(
     db.commit()
     db.refresh(job)
 
+    # 背景執行下載 + 送 Spark
+    asyncio.create_task(
+        _run_gdrive_background_full(
+            job.id, folder_id, body.fps, body.resolution, body.max_images
+        )
+    )
+
     return {
         "job_id": job.id,
         "status": "pending",
         "image_count": 0,
-        "message": "已委派 Camera Backend 開始處理",
+        "message": "已開始從 Google Drive 下載（最多 1000 張）",
         "warning": None,
     }
 
