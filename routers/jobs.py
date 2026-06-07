@@ -236,99 +236,64 @@ async def _download_file_direct(session: httpx.AsyncClient, file_id: str) -> Opt
 
 
 async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, body_fps: int, body_resolution, max_images=None):
-    """背景任務：Google Drive → NAS（用 gdown）→ Spark /jobs/nas（無張數限制、無 API key）"""
+    """背景任務：Google Drive → NAS（原本有效下載方式）→ Spark /jobs/nas"""
     from database import SessionLocal
     db = SessionLocal()
     nas_folder = f"gdrive_{job_id}"
     nas_path = f"/homes/firmness/{nas_folder}"
     try:
-        import shutil, concurrent.futures
+        import shutil
         job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
         if not job: return
 
-        job.status = "downloading"; db.commit()
-
-        # 建立 NAS 目標資料夾
         if os.path.exists(nas_path):
             shutil.rmtree(nas_path)
         os.makedirs(nas_path, exist_ok=True)
 
-        # 用 gdown 下載整個資料夾（不需 API key，支援公開分享資料夾）
-        folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
-        loop = asyncio.get_event_loop()
-
-        def run_gdown():
-            import gdown, glob
-            try:
-                gdown.download_folder(
-                    url=folder_url,
-                    output=nas_path,
-                    quiet=False,
-                    use_cookies=False,
-                    remaining_ok=True,
-                )
-                # gdown 會在 nas_path 下建子資料夾，把檔案移到 nas_path 根目錄
-                subdirs = [d for d in os.listdir(nas_path)
-                          if os.path.isdir(os.path.join(nas_path, d))]
-                for subdir in subdirs:
-                    subdir_path = os.path.join(nas_path, subdir)
-                    for fname in os.listdir(subdir_path):
-                        src = os.path.join(subdir_path, fname)
-                        dst = os.path.join(nas_path, fname)
-                        if not os.path.exists(dst):
-                            shutil.move(src, dst)
-                    shutil.rmtree(subdir_path, ignore_errors=True)
-                return None
-            except Exception as e:
-                return str(e)
-
-        # 在 executor 跑同步的 gdown（避免 blocking event loop）
-        error = await loop.run_in_executor(None, run_gdown)
-        if error:
-            job.status = "failed"; job.error_message = f"Google Drive 下載失敗：{error}"; db.commit()
+        # 1. 列清單（原本就能跑的方式）
+        job.status = "listing"; db.commit()
+        try:
+            files = await _list_drive_images(folder_id, max_images)
+        except Exception as e:
+            job.status = "failed"; job.error_message = f"無法讀取資料夾：{e}"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
+        if not files:
+            job.status = "failed"; job.error_message = "資料夾內沒有找到圖片"; db.commit()
+            shutil.rmtree(nas_path, ignore_errors=True); return
+        job.total_images = len(files); db.commit()
 
-        # 計算下載了幾張（支援子資料夾遞迴）
-        image_exts = {".jpg",".jpeg",".png",".bmp",".tif",".tiff"}
-        downloaded_files = [f for f in os.listdir(nas_path)
-                           if os.path.splitext(f)[1].lower() in image_exts]
-        downloaded = len(downloaded_files)
-        job.downloaded_count = downloaded
-        job.total_images = downloaded
+        # 2. 下載到 NAS（原本就能跑，用公開 URL drive.google.com/uc?export=download）
+        job.status = "downloading"; db.commit()
+        async with httpx.AsyncClient(timeout=60) as session:
+            for i, f in enumerate(files):
+                img_bytes = await _download_file_direct(session, f["id"])
+                if img_bytes:
+                    with open(os.path.join(nas_path, f["name"]), "wb") as fp:
+                        fp.write(img_bytes)
+                job.downloaded_count = i + 1
+                if (i + 1) % 50 == 0: db.commit()
+                if (i + 1) % 100 == 0: await asyncio.sleep(0.2)
         db.commit()
 
-        if downloaded < 10:
-            job.status = "failed"
-            job.error_message = f"只下載到 {downloaded} 張，請確認：1) 資料夾已公開分享 2) 資料夾內有圖片"
-            db.commit()
+        saved = len([x for x in os.listdir(nas_path) if not x.startswith(".")])
+        if saved < 10:
+            job.status = "failed"; job.error_message = f"只下載到 {saved} 張"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
 
-        # 呼叫 Spark /jobs/nas
+        # 3. Spark 從 NAS 讀（無大小限制）
         job.status = "submitted"; db.commit()
         callback_url = f"{settings.PUBLIC_BASE_URL}/jobs/gdrive/callback/{job_id}"
         async with httpx.AsyncClient(timeout=30) as client:
-            spark_resp = await client.post(
-                f"{SPARK_API_URL}/jobs/nas",
+            sr = await client.post(f"{SPARK_API_URL}/jobs/nas",
                 headers={"x-api-key": SPARK_API_KEY},
-                json={
-                    "nas_path": nas_folder,
-                    "callback_url": callback_url,
-                    "fps": body_fps,
-                    "resolution": body_resolution,
-                    "rain_fog_detection": False,
-                    "darkness_detection": False,
-                },
-            )
-        if spark_resp.status_code not in (200, 202):
-            job.status = "failed"
-            job.error_message = f"Spark 錯誤（{spark_resp.status_code}）：{spark_resp.text[:200]}"
-            db.commit()
+                json={"nas_path": nas_folder, "callback_url": callback_url,
+                      "fps": body_fps, "resolution": body_resolution,
+                      "rain_fog_detection": False, "darkness_detection": False})
+        if sr.status_code not in (200, 202):
+            job.status = "failed"; job.error_message = f"Spark 錯誤（{sr.status_code}）：{sr.text[:200]}"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
-
-        spark_data = spark_resp.json()
-        job.spark_job_id = str(spark_data.get("job_id", ""))
+        job.spark_job_id = str(sr.json().get("job_id", ""))
         job.status = "processing"; db.commit()
-
     except Exception as e:
         try:
             job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
@@ -336,6 +301,7 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, body_fps: int, b
         except Exception: pass
     finally:
         db.close()
+
 
 async def _run_gdrive_background_full(job_id: int, folder_id: str, body_fps: int, body_resolution: Optional[str], max_images: Optional[int] = None):
     """背景任務：列清單 + 分批下載照片 → 送 Spark"""
