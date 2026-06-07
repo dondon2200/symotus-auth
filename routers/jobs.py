@@ -424,7 +424,7 @@ async def create_gdrive_job(
                 "folder_url": body.folder_url,
                 "fps": body.fps,
                 "resolution": body.resolution,
-                "max_images": body.max_images or 1000,
+                "max_images": body.max_images,  # None = Camera Backend 決定上限
             },
         )
     if resp.status_code not in (200, 201):
