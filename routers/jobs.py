@@ -402,40 +402,56 @@ async def create_gdrive_job(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """從 Google Drive 公開資料夾建立縮時影片 job（auth service 自己下載送 Spark）"""
-    # 解析 folder_id
-    import re
-    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", body.folder_url)
-    if not match:
-        raise HTTPException(400, "無效的 Google Drive 資料夾連結")
-    folder_id = match.group(1)
-
-    # 建立 DB 記錄
-    job = GDriveJob(
-        user_id=current_user.id,
-        folder_url=body.folder_url,
-        status="pending",
-        fps=body.fps,
-        resolution=body.resolution,
-    )
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-
-    # 背景執行下載 + 送 Spark
-    asyncio.create_task(
-        _run_gdrive_background_full(
-            job.id, folder_id, body.fps, body.resolution, body.max_images
+    """從 Google Drive 公開資料夾建立縮時影片 job（委派給 Camera Backend）"""
+    CAMERA_BACKEND = "https://user.symotus.com"
+    CAM_SVCKEY = os.environ.get("CAMERA_SERVICE_KEY", "")
+    async with httpx.AsyncClient(timeout=15) as client:
+        tok_resp = await client.post(
+            f"{CAMERA_BACKEND}/internal/auth/token",
+            headers={"x-service-key": CAM_SVCKEY},
+            json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
         )
-    )
+    if tok_resp.status_code != 200:
+        raise HTTPException(502, f"無法取得 Camera Backend token")
+    cam_token = tok_resp.json().get("access_token", "")
 
-    return {
-        "job_id": job.id,
-        "status": "pending",
-        "image_count": 0,
-        "message": "已開始從 Google Drive 下載（最多 1000 張）",
-        "warning": None,
-    }
+    # 呼叫 Camera Backend gdrive-import API（下載到 NAS → Spark）
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            f"{CAMERA_BACKEND}/api/timelapse/gdrive-import",
+            headers={"Authorization": f"Bearer {cam_token}"},
+            json={
+                "folder_url": body.folder_url,
+                "fps": body.fps,
+                "resolution": body.resolution,
+                "max_images": body.max_images or 1000,
+            },
+        )
+    if resp.status_code not in (200, 201):
+        # Camera Backend 失敗 → fallback 到 auth service 自己下載
+        import re
+        match = re.search(r"/folders/([a-zA-Z0-9_-]+)", body.folder_url)
+        if not match:
+            raise HTTPException(400, "無效的 Google Drive 資料夾連結")
+        folder_id = match.group(1)
+        job = GDriveJob(
+            user_id=current_user.id, folder_url=body.folder_url,
+            status="pending", fps=body.fps, resolution=body.resolution,
+        )
+        db.add(job); db.commit(); db.refresh(job)
+        asyncio.create_task(_run_gdrive_background_full(
+            job.id, folder_id, body.fps, body.resolution, body.max_images
+        ))
+        return {"job_id": job.id, "status": "pending", "message": "Camera Backend 不可用，使用備用下載"}
+
+    cam_data = resp.json()
+    cam_job_id = cam_data.get("job_id")
+    job = GDriveJob(
+        user_id=current_user.id, folder_url=body.folder_url,
+        status="pending", spark_job_id=str(cam_job_id), fps=body.fps, resolution=body.resolution,
+    )
+    db.add(job); db.commit(); db.refresh(job)
+    return {"job_id": job.id, "status": "pending", "message": "Camera Backend 正在處理（下載 NAS → Spark）"}
 
 
 
