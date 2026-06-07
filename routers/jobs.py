@@ -258,7 +258,7 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, body_fps: int, b
         loop = asyncio.get_event_loop()
 
         def run_gdown():
-            import gdown
+            import gdown, glob
             try:
                 gdown.download_folder(
                     url=folder_url,
@@ -267,6 +267,17 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, body_fps: int, b
                     use_cookies=False,
                     remaining_ok=True,
                 )
+                # gdown 會在 nas_path 下建子資料夾，把檔案移到 nas_path 根目錄
+                subdirs = [d for d in os.listdir(nas_path)
+                          if os.path.isdir(os.path.join(nas_path, d))]
+                for subdir in subdirs:
+                    subdir_path = os.path.join(nas_path, subdir)
+                    for fname in os.listdir(subdir_path):
+                        src = os.path.join(subdir_path, fname)
+                        dst = os.path.join(nas_path, fname)
+                        if not os.path.exists(dst):
+                            shutil.move(src, dst)
+                    shutil.rmtree(subdir_path, ignore_errors=True)
                 return None
             except Exception as e:
                 return str(e)
@@ -277,7 +288,7 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, body_fps: int, b
             job.status = "failed"; job.error_message = f"Google Drive 下載失敗：{error}"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
 
-        # 計算下載了幾張
+        # 計算下載了幾張（支援子資料夾遞迴）
         image_exts = {".jpg",".jpeg",".png",".bmp",".tif",".tiff"}
         downloaded_files = [f for f in os.listdir(nas_path)
                            if os.path.splitext(f)[1].lower() in image_exts]
