@@ -164,9 +164,12 @@ def internal_update_job(
 import re
 import asyncio
 import os
+import logging
 import httpx
 from models import GDriveJob
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 SPARK_API_URL = settings.SPARK_API_URL
 SPARK_API_KEY = settings.SPARK_API_KEY
@@ -216,13 +219,35 @@ async def _list_drive_images(folder_id: str, max_images: Optional[int] = None) -
 
 
 async def _download_file_direct(session: httpx.AsyncClient, file_id: str) -> Optional[bytes]:
-    """用公開 URL 下載 Google Drive 單張圖片（不需 API key，支援公開分享資料夾）"""
-    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    """用公開 URL 下載 Google Drive 單張圖片（不需 API key，支援公開分享資料夾）。
+
+    重點：必須檢查 Content-Type 是否為 image/*，因為 Google 對大檔/異常會回傳
+    text/html 的「病毒掃描確認頁」或登入頁（長度可能 >1000），只看 length 會把 HTML
+    當成壞圖存下。遇到 HTML 確認頁則解析 confirm token 再下載一次。
+    """
+    base = "https://drive.google.com/uc?export=download"
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
+    url = f"{base}&id={file_id}"
     for attempt in range(3):  # 最多 3 次 retry
         try:
-            resp = await session.get(url, follow_redirects=True, timeout=45)
-            if resp.status_code == 200 and len(resp.content) > 1000:
+            resp = await session.get(url, headers=headers, follow_redirects=True, timeout=60)
+            ctype = resp.headers.get("content-type", "").lower()
+            if resp.status_code == 200 and ctype.startswith("image/") and len(resp.content) > 1000:
                 return resp.content
+            # 大檔會回 HTML 確認頁，解析 confirm token 後再抓一次
+            if resp.status_code == 200 and "text/html" in ctype:
+                m = re.search(r"confirm=([0-9A-Za-z_\-]+)", resp.text)
+                if m:
+                    confirm_url = f"{base}&confirm={m.group(1)}&id={file_id}"
+                    r2 = await session.get(confirm_url, headers=headers, follow_redirects=True, timeout=120)
+                    if (r2.status_code == 200
+                            and r2.headers.get("content-type", "").lower().startswith("image/")
+                            and len(r2.content) > 1000):
+                        return r2.content
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return None
             if resp.status_code in (403, 429) and attempt < 2:
                 await asyncio.sleep(2 ** attempt)  # 1s, 2s
                 continue
@@ -472,56 +497,25 @@ async def create_gdrive_job(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """從 Google Drive 公開資料夾建立縮時影片 job（委派給 Camera Backend）"""
-    CAMERA_BACKEND = "https://user.symotus.com"
-    CAM_SVCKEY = os.environ.get("CAMERA_SERVICE_KEY", "")
-    async with httpx.AsyncClient(timeout=15) as client:
-        tok_resp = await client.post(
-            f"{CAMERA_BACKEND}/internal/auth/token",
-            headers={"x-service-key": CAM_SVCKEY},
-            json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
-        )
-    if tok_resp.status_code != 200:
-        raise HTTPException(502, f"無法取得 Camera Backend token")
-    cam_token = tok_resp.json().get("access_token", "")
+    """從 Google Drive 公開資料夾建立縮時影片 job。
 
-    # 呼叫 Camera Backend gdrive-import API（下載到 NAS → Spark）
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            f"{CAMERA_BACKEND}/api/timelapse/gdrive-import",
-            headers={"Authorization": f"Bearer {cam_token}"},
-            json={
-                "folder_url": body.folder_url,
-                "fps": body.fps,
-                "resolution": body.resolution,
-                "max_images": body.max_images,  # None = Camera Backend 決定上限
-            },
-        )
-    if resp.status_code not in (200, 201):
-        # Camera Backend 失敗 → fallback 到 auth service 自己下載
-        import re
-        match = re.search(r"/folders/([a-zA-Z0-9_-]+)", body.folder_url)
-        if not match:
-            raise HTTPException(400, "無效的 Google Drive 資料夾連結")
-        folder_id = match.group(1)
-        job = GDriveJob(
-            user_id=current_user.id, folder_url=body.folder_url,
-            status="pending", fps=body.fps, resolution=body.resolution,
-        )
-        db.add(job); db.commit(); db.refresh(job)
-        asyncio.create_task(_run_gdrive_background_full(
-            job.id, folder_id, body.fps, body.resolution, body.max_images
-        ))
-        return {"job_id": job.id, "status": "pending", "message": "Camera Backend 不可用，使用備用下載"}
+    auth 自行處理整條鏈：用公開 URL 把照片下載到 NAS（/homes/firmness/gdrive_<id>）→ 呼叫
+    Spark POST /jobs/nas（Spark 直接從 NAS 讀，無大小/張數上限）。不再委派 Camera Backend
+    的 /api/timelapse/gdrive-import（其用需 OAuth 的 files.get?alt=media 對公開資料夾會 403）。
+    """
+    folder_id = _extract_folder_id(body.folder_url)
+    if not folder_id:
+        raise HTTPException(400, "無效的 Google Drive 資料夾連結，請確認貼上的是「資料夾」分享連結")
 
-    cam_data = resp.json()
-    cam_job_id = cam_data.get("job_id")
     job = GDriveJob(
         user_id=current_user.id, folder_url=body.folder_url,
-        status="pending", spark_job_id=str(cam_job_id), fps=body.fps, resolution=body.resolution,
+        status="pending", fps=body.fps, resolution=body.resolution,
     )
     db.add(job); db.commit(); db.refresh(job)
-    return {"job_id": job.id, "status": "pending", "message": "Camera Backend 正在處理（下載 NAS → Spark）"}
+    asyncio.create_task(_run_gdrive_nas_pipeline(
+        job.id, folder_id, body.fps, body.resolution, body.max_images
+    ))
+    return {"job_id": job.id, "status": "pending", "message": "已開始：下載照片到 NAS → Spark 生成"}
 
 
 
@@ -556,7 +550,11 @@ async def get_gdrive_job(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """查詢 Google Drive 縮時 job 進度（proxy Camera Backend）"""
+    """查詢 Google Drive 縮時 job 進度。
+
+    送 Spark 前（pending/listing/downloading/submitted）回本地 GDriveJob 進度；
+    一旦有 spark_job_id 就直接輪詢 Spark GET /jobs/{id} 取即時狀態（不再 proxy Camera Backend）。
+    """
     job = db.query(GDriveJob).filter(
         GDriveJob.id == job_id,
         GDriveJob.user_id == current_user.id,
@@ -564,57 +562,71 @@ async def get_gdrive_job(
     if not job:
         raise HTTPException(404, "找不到此任務")
 
-    if not job.spark_job_id:
-        return {"job_id": job.id, "status": "pending", "percent_complete": 0, "current_stage": "準備中"}
+    total = job.total_images or 0
+    downloaded = job.downloaded_count or 0
 
-    # Proxy Camera Backend 取即時狀態
-    CAMERA_BACKEND = "https://user.symotus.com"
-    CAM_SVCKEY = os.environ.get("CAMERA_SERVICE_KEY", "")
-    cam_status = {}
+    # 階段一：尚未送 Spark → 回本地下載進度
+    if not job.spark_job_id:
+        local_percent = {"pending": 2, "listing": 5, "downloading": 0, "submitted": 60, "failed": 0}
+        percent = local_percent.get(job.status, 2)
+        if job.status == "downloading" and total > 0:
+            percent = max(5, int(downloaded / total * 55))  # 下載階段佔 5~60%
+        stage_map = {
+            "pending": "準備中",
+            "listing": "讀取 Google Drive 資料夾中",
+            "downloading": f"下載照片中（{downloaded}/{total}）",
+            "submitted": "送出 Spark 生成中",
+            "failed": "失敗",
+        }
+        return {
+            "job_id": job.id,
+            "status": job.status,
+            "percent_complete": percent,
+            "image_count": total,
+            "downloaded_count": downloaded,
+            "current_stage": stage_map.get(job.status, "處理中"),
+            "video_download_url": job.video_url,
+            "error_message": job.error_message,
+        }
+
+    # 階段二：已送 Spark → 直接問 Spark
+    spark = {}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            tok_resp = await client.post(
-                f"{CAMERA_BACKEND}/internal/auth/token",
-                headers={"x-service-key": CAM_SVCKEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
-            )
-        cam_token = tok_resp.json().get("access_token", "") if tok_resp.status_code == 200 else ""
         async with httpx.AsyncClient(timeout=15) as client:
-            cam_resp = await client.get(
-                f"{CAMERA_BACKEND}/api/timelapse/jobs/{job.spark_job_id}",
-                headers={"Authorization": f"Bearer {cam_token}"},
+            sr = await client.get(
+                f"{SPARK_API_URL}/jobs/{job.spark_job_id}",
+                headers={"x-api-key": SPARK_API_KEY},
             )
-        if cam_resp.status_code == 200:
-            cam_status = cam_resp.json()
+        if sr.status_code == 200:
+            spark = sr.json()
     except Exception:
         pass
 
-    status = cam_status.get("status", job.status)
-    image_count = cam_status.get("image_count", 0)
-    downloaded = cam_status.get("downloaded_count", 0)
-    error = cam_status.get("error_message") or cam_status.get("spark_error")
-    video_url = cam_status.get("video_url")
+    sp = (spark.get("status") or job.status or "").lower()
+    if sp in ("completed", "done", "success"):
+        status = "completed"
+    elif sp in ("failed", "error"):
+        status = "failed"
+    else:
+        status = "processing"
 
-    # Camera Backend status → percent
-    percent_map = {"pending": 2, "listing": 5, "downloading": 0, "submitted": 70, "completed": 100, "failed": 0}
-    percent = percent_map.get(status, 2)
-    if status == "downloading" and image_count > 0:
-        percent = max(5, int(downloaded / image_count * 60))
+    percent = spark.get("percent_complete")
+    if percent is None:
+        percent = 100 if status == "completed" else (0 if status == "failed" else 70)
+    image_count = spark.get("image_count") or total
+    error = spark.get("error") or job.error_message
 
-    stage_map = {
-        "pending": "準備中",
-        "listing": "讀取 Google Drive 資料夾中",
-        "downloading": f"下載照片中（{downloaded}/{image_count}）",
-        "submitted": "送出 Spark 生成中",
-        "completed": "完成",
-        "failed": "失敗",
-    }
+    video_url = job.video_url
+    if status == "completed" and not video_url:
+        video_url = f"{SPARK_API_URL}/jobs/{job.spark_job_id}/download?api_key={SPARK_API_KEY}"
 
-    # 同步 DB
+    # 同步 DB 終態
     if status in ("completed", "failed") and job.status != status:
         job.status = status
-        if video_url: job.video_url = video_url
-        if error: job.error_message = error
+        if video_url:
+            job.video_url = video_url
+        if error:
+            job.error_message = error
         db.commit()
 
     return {
@@ -623,9 +635,9 @@ async def get_gdrive_job(
         "percent_complete": percent,
         "image_count": image_count,
         "downloaded_count": downloaded,
-        "current_stage": stage_map.get(status, "處理中"),
-        "video_download_url": video_url or job.video_url,
-        "error_message": error or job.error_message,
+        "current_stage": spark.get("current_stage") or ("生成中" if status == "processing" else status),
+        "video_download_url": video_url,
+        "error_message": error,
     }
 
 
