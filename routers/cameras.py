@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from typing import Optional
 import asyncio
+import logging
 import httpx
 
 from database import get_db
@@ -19,6 +20,8 @@ router = APIRouter(prefix="/cameras", tags=["cameras"])
 CAMERA_BACKEND_URL = "https://user.symotus.com"
 import os
 CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
+
+logger = logging.getLogger(__name__)
 
 
 async def get_camera_backend_token(user: User) -> str:
@@ -55,6 +58,57 @@ def get_allowed_camera_ids(user: User, db: Session) -> Optional[list[int]]:
     return [a.camera_id for a in accesses]
 
 
+async def _get_admin_camera_token() -> str:
+    """取得 Camera Backend 的 admin 備用 token（granted_by 非真正擁有者時 fallback 用）"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                headers={"x-service-key": CAMERA_SERVICE_KEY},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+            )
+            return r.json().get("access_token", "") if r.status_code == 200 else ""
+    except Exception as e:
+        logger.warning("admin fallback token 取得失敗: %s", e)
+        return ""
+
+
+async def fetch_camera_detail(camera_id: int, owner: Optional[User], admin_holder: dict) -> Optional[dict]:
+    """抓相機細節並攤平成 basic_info。
+
+    先用 owner 的 Camera Backend token；若 owner 無 token 或回非 200，
+    再退回 admin token 重試。失敗回 None。
+
+    重點：`granted_by`（owner）不一定是 Camera Backend 的真正擁有者——
+    跨層轉分享時（admin → reseller A → reseller B），A 自己也只是被分享，
+    用 A 的 token 取該相機會 403。授權已由 camera_access 在 DB 層把關，
+    admin token 僅用於取得顯示資料，不放寬權限。
+    """
+    owner_token = (await get_camera_backend_token(owner)) if owner else ""
+    for label in ("owner", "admin"):
+        if label == "owner":
+            token = owner_token
+        else:
+            if admin_holder.get("t") is None:
+                admin_holder["t"] = await _get_admin_camera_token()
+            token = admin_holder["t"]
+        if not token:
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if r.status_code == 200:
+                raw = r.json()
+                return raw.get("basic_info", raw)  # 攤平 detail 格式
+            logger.warning("fetch camera %s via %s token -> HTTP %s", camera_id, label, r.status_code)
+        except Exception as e:
+            logger.warning("fetch camera %s via %s token error: %s", camera_id, label, e)
+    return None
+
+
 @router.get("")
 async def list_cameras(
     current_user: User = Depends(get_current_user),
@@ -63,6 +117,7 @@ async def list_cameras(
     """取得用戶可存取的相機列表（Auth Service 控制權限）"""
     allowed_ids = get_allowed_camera_ids(current_user, db)
     cam_token = await get_camera_backend_token(current_user)
+    admin_token_holder = {"t": None}  # admin fallback token，lazy 取一次共用
 
     if cam_token:
         # 有 camera token：直接從 Camera Backend 拿自己的相機列表
@@ -108,61 +163,36 @@ async def list_cameras(
             if not access:
                 continue
             owner = db.query(User).filter(User.id == access.granted_by).first()
-            if not owner or not owner.camera_email:
+            cam_data = await fetch_camera_detail(cam_id, owner, admin_token_holder)
+            if not cam_data:
+                logger.warning("list_cameras: 無法取得分享相機 %s（user=%s granted_by=%s）",
+                               cam_id, current_user.id, access.granted_by)
                 continue
-            owner_token = await get_camera_backend_token(owner)
-            if not owner_token:
-                continue
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(f"{CAMERA_BACKEND_URL}/api/cameras/{cam_id}",
-                                     headers={"Authorization": f"Bearer {owner_token}"})
-                if r.status_code == 200:
-                    raw = r.json()
-                    cam_data = raw.get("basic_info", raw)  # 攤平 detail 格式
-                    cam_data["permission_level"] = a.permission_level if hasattr(a, 'permission_level') else "photos_stream"
-                    cam_data["is_shared"] = True
-                    cameras.append(cam_data)
+            cam_data["permission_level"] = access.permission_level or "photos_stream"
+            cam_data["is_shared"] = True
+            cameras.append(cam_data)
 
     # 額外：把 camera_access 裡的授權相機也加進來（reseller 接受邀請後）
     shared_ids = set(c.get("id") for c in cameras)
     shared_accesses = db.query(CameraAccess).filter(
         CameraAccess.user_id == current_user.id
     ).all()
-    # 取得 admin 備用 token（inviter 沒有 camera_email 時 fallback 用）
-    admin_fallback_token = None
     for access in shared_accesses:
         if access.camera_id in shared_ids:
             continue  # 已經有了
         owner = db.query(User).filter(User.id == access.granted_by).first()
-        owner_token = (await get_camera_backend_token(owner)) if owner else ""
-        if not owner_token:
-            # 嘗試用 admin 帳號 token 取相機資料
-            if admin_fallback_token is None:
-                try:
-                    async with httpx.AsyncClient(timeout=10) as client:
-                        tok_r = await client.post(
-                            f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                            headers={"x-service-key": CAMERA_SERVICE_KEY},
-                            json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
-                        )
-                        admin_fallback_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
-                except Exception:
-                    admin_fallback_token = ""
-            owner_token = admin_fallback_token
-        if not owner_token:
+        # granted_by 不一定是 Camera Backend 真正擁有者（跨層轉分享），
+        # fetch_camera_detail 會在 owner token 失敗(空或非 200)時退回 admin token 重試。
+        cam_data = await fetch_camera_detail(access.camera_id, owner, admin_token_holder)
+        if not cam_data:
+            logger.warning("list_cameras: 無法取得分享相機 %s（user=%s granted_by=%s）",
+                           access.camera_id, current_user.id, access.granted_by)
             continue
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{CAMERA_BACKEND_URL}/api/cameras/{access.camera_id}",
-                                 headers={"Authorization": f"Bearer {owner_token}"})
-            if r.status_code == 200:
-                raw = r.json()
-                cam_data = raw.get("basic_info", raw)  # 攤平 detail 格式
-                perm = access.permission_level if hasattr(access, "permission_level") and access.permission_level else "photos_stream"
-                cam_data["permission_level"] = perm
-                # 自己配對的相機（granted_by == self）顯示為「我的相機」，不是「分享給我」
-                cam_data["is_shared"] = (access.granted_by != current_user.id)
-                cameras.append(cam_data)
-                shared_ids.add(access.camera_id)
+        cam_data["permission_level"] = access.permission_level or "photos_stream"
+        # 自己配對的相機（granted_by == self）顯示為「我的相機」，不是「分享給我」
+        cam_data["is_shared"] = (access.granted_by != current_user.id)
+        cameras.append(cam_data)
+        shared_ids.add(access.camera_id)
 
     return {"cameras": cameras, "total": len(cameras)}
 
