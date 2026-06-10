@@ -13,9 +13,17 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# F-8：CORS 收斂為已知前端來源（前端與 /auth-api 同源，正常流量不依賴 CORS）
+_ALLOWED_ORIGINS = list({
+    settings.FRONTEND_URL,
+    "https://reseller.symotus.com:9443",
+    "https://user.symotus.com",
+    "https://admin.symotus.com",
+})
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -143,14 +151,10 @@ from fastapi.responses import JSONResponse
 async def global_exception_handler(request: Request, exc: Exception):
     import traceback
     logger.error(f"Unhandled exception: {exc}\n{traceback.format_exc()}")
+    # F-10：不外洩內部細節（路徑/SQL/上游回應）；CORS 交由中介層處理
     return JSONResponse(
         status_code=500,
-        content={"detail": str(exc)},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Methods": "*",
-        }
+        content={"detail": "伺服器發生錯誤，請稍後再試"},
     )
 
 @app.get("/health")

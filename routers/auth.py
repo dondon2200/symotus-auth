@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -50,8 +50,26 @@ def _store_login_handoff(bundle: dict) -> str:
     return code
 
 
+# F-8：簡易記憶體限流（單一 auth 容器），擋登入/註冊/換碼爆破
+_rl_buckets: dict = {}   # "bucket:ip" -> [count, reset_at]
+
+def _rate_limit(request: Request, bucket: str, max_req: int, window: int = 60):
+    xff = request.headers.get("x-forwarded-for") or ""
+    ip = xff.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    key = f"{bucket}:{ip}"
+    now = time.time()
+    entry = _rl_buckets.get(key)
+    if not entry or now > entry[1]:
+        _rl_buckets[key] = [1, now + window]
+        return
+    if entry[0] >= max_req:
+        raise HTTPException(429, "請求過於頻繁，請稍後再試")
+    entry[0] += 1
+
+
 @router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, db: Session = Depends(get_db)):
+async def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    _rate_limit(request, "login", 10)
     user = db.query(User).filter(
         (User.username == body.username) | (User.email == body.username)
     ).first()
@@ -119,8 +137,9 @@ class ExchangeRequest(BaseModel):
     code: str
 
 @router.post("/exchange", response_model=TokenResponse)
-def exchange_login_code(body: ExchangeRequest):
+def exchange_login_code(body: ExchangeRequest, request: Request):
     """F-7：用一次性 code 換取登入 token（OAuth callback 不再把 token 放 URL）"""
+    _rate_limit(request, "exchange", 30)
     entry = _login_handoff.pop(body.code, None)  # 一次性使用
     if not entry:
         raise HTTPException(400, "登入碼無效或已使用")
@@ -234,13 +253,15 @@ class UserCreateInternal(BaseModel):
     invite_token: Optional[str] = None
 
 @router.post("/register")
-async def register(body: UserCreateInternal, db: Session = Depends(get_db),
+async def register(body: UserCreateInternal, request: Request, db: Session = Depends(get_db),
                    x_service_key: str = Header(None)):
     """建立帳號。
     F-1 修補：公開註冊一律需「有效邀請連結」，且角色強制 end_user（杜絕外部指定 role 提權）。
     內部建帳號（指定 role / camera_email）需帶正確 x-service-key。
     """
     is_internal = bool(CAMERA_SERVICE_KEY) and x_service_key == CAMERA_SERVICE_KEY
+    if not is_internal:
+        _rate_limit(request, "register", 5)
 
     invite = None
     if not is_internal:
