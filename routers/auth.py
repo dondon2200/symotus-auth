@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -156,7 +156,7 @@ def _oauth_finish(db, oauth_field, oauth_id, email, full_name, invite_token_str=
             setattr(user, oauth_field, oauth_id); db.commit()
     if not user:
         invite = None
-        role = "reseller"
+        role = "end_user"   # F-2 修補：OAuth 自助註冊預設最低權限；reseller 僅由 admin 指派
         reseller_id = None
         if invite_token_str:
             invite = db.query(InviteToken).filter(
@@ -199,29 +199,63 @@ class UserCreateInternal(BaseModel):
     email: str
     full_name: Optional[str] = None
     password: str
-    role: str = "reseller"
+    role: str = "end_user"          # 預設最低權限；公開註冊一律強制 end_user
     camera_email: Optional[str] = None
+    invite_token: Optional[str] = None
 
 @router.post("/register")
 async def register(body: UserCreateInternal, db: Session = Depends(get_db),
-                   service_key: str = ""):
+                   x_service_key: str = Header(None)):
+    """建立帳號。
+    F-1 修補：公開註冊一律需「有效邀請連結」，且角色強制 end_user（杜絕外部指定 role 提權）。
+    內部建帳號（指定 role / camera_email）需帶正確 x-service-key。
+    """
+    is_internal = bool(CAMERA_SERVICE_KEY) and x_service_key == CAMERA_SERVICE_KEY
+
+    invite = None
+    if not is_internal:
+        # 公開路徑：必須有有效邀請；角色固定 end_user
+        if not body.invite_token:
+            raise HTTPException(403, "需要有效的邀請連結才能註冊")
+        invite = db.query(InviteToken).filter(
+            InviteToken.token == body.invite_token,
+            InviteToken.status == "pending",
+            InviteToken.expires_at > datetime.utcnow(),
+        ).first()
+        if not invite:
+            raise HTTPException(400, "邀請連結無效或已過期")
+        if invite.email and invite.email != body.email:
+            raise HTTPException(400, "此邀請連結限定特定 Email 使用")
+
     existing = db.query(User).filter(
         (User.username == body.username) | (User.email == body.email)
     ).first()
     if existing:
         raise HTTPException(400, "帳號或 Email 已存在")
+
     user = User(
         username=body.username,
         email=body.email,
         full_name=body.full_name,
         hashed_password=hash_password(body.password),
-        role=body.role,
+        role=body.role if is_internal else "end_user",
         is_active=True,
-        camera_email=body.camera_email,
+        reseller_id=invite.reseller_id if invite else None,
+        camera_email=body.camera_email if is_internal else None,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
+
+    # 邀請帶相機 → 建立 camera_access（與 OAuth _oauth_finish 行為一致；同時修掉 email 邀請註冊不掛相機的舊 bug）
+    if invite:
+        if invite.camera_ids:
+            for cam_id in invite.camera_ids:
+                db.add(CameraAccess(camera_id=cam_id, user_id=user.id, granted_by=invite.reseller_id))
+        invite.status = "accepted"; invite.accepted_by = user.id; invite.accepted_at = datetime.utcnow()
+        db.commit()
+        db.refresh(user)
+
     camera_tokens = await get_camera_token(user.id, user.email, user.role, user.camera_email)
     access_token = create_access_token(user, db)
     refresh = create_refresh_token()
