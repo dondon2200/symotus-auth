@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
-import httpx, secrets
+import httpx, secrets, time
 
 from database import get_db
 from models import User, RefreshToken, InviteToken, CameraAccess
@@ -35,6 +35,20 @@ async def get_camera_token(user_id: int, email: str, role: str, camera_email: Op
     return {}
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+# F-7：OAuth 登入完成後不把 token 放 URL，改以一次性短效 code 交換（單一 auth 容器，記憶體即可）
+_login_handoff: dict = {}   # code -> (bundle: dict, expires_at: float)
+_HANDOFF_TTL = 120          # 秒
+
+def _store_login_handoff(bundle: dict) -> str:
+    now = time.time()
+    for k in [k for k, (_, exp) in list(_login_handoff.items()) if exp < now]:
+        _login_handoff.pop(k, None)
+    code = secrets.token_urlsafe(24)
+    _login_handoff[code] = (bundle, now + _HANDOFF_TTL)
+    return code
+
 
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, db: Session = Depends(get_db)):
@@ -99,6 +113,22 @@ def me(current_user: User = Depends(get_current_user)):
             "email": current_user.email, "full_name": current_user.full_name,
             "role": current_user.role, "reseller_id": current_user.reseller_id,
             "is_active": current_user.is_active}
+
+
+class ExchangeRequest(BaseModel):
+    code: str
+
+@router.post("/exchange", response_model=TokenResponse)
+def exchange_login_code(body: ExchangeRequest):
+    """F-7：用一次性 code 換取登入 token（OAuth callback 不再把 token 放 URL）"""
+    entry = _login_handoff.pop(body.code, None)  # 一次性使用
+    if not entry:
+        raise HTTPException(400, "登入碼無效或已使用")
+    bundle, exp = entry
+    if exp < time.time():
+        raise HTTPException(400, "登入碼已過期")
+    return TokenResponse(**bundle)
+
 
 @router.get("/google/url")
 def google_url(invite_token: str = None):
@@ -314,18 +344,15 @@ async def line_callback(code: str, state: str = "", db: Session = Depends(get_db
             except Exception as cam_err:
                 print(f"[LINE callback] camera token error: {cam_err}")
 
-        auth_token = quote(token_resp.access_token, safe="")
-        refresh_token = quote(token_resp.refresh_token, safe="")
-        camera_token = quote(camera_tokens.get("access_token", ""), safe="")
-        camera_refresh = quote(camera_tokens.get("refresh_token", ""), safe="")
-
-        return RedirectResponse(
-            f"{frontend}/auth/callback"
-            f"?auth_token={auth_token}"
-            f"&refresh_token={refresh_token}"
-            f"&camera_token={camera_token}"
-            f"&camera_refresh_token={camera_refresh}"
-        )
+        # F-7：token 不放 URL —— 存一次性 code，前端 /auth/callback 再 POST /auth/exchange 取回
+        code_handoff = _store_login_handoff({
+            "access_token": token_resp.access_token,
+            "refresh_token": token_resp.refresh_token,
+            "expires_in": settings.JWT_EXPIRE_MINUTES * 60,
+            "camera_access_token": camera_tokens.get("access_token") or None,
+            "camera_refresh_token": camera_tokens.get("refresh_token") or None,
+        })
+        return RedirectResponse(f"{frontend}/auth/callback?code={code_handoff}")
     except Exception as e:
         print(f"[LINE callback] unexpected error: {e}")
         return RedirectResponse(f"{frontend}/login?error=line_failed")
