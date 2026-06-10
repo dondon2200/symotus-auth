@@ -12,7 +12,16 @@ from database import get_db
 from models import User, CameraInvitation
 from routers.cameras import get_camera_backend_token, CAMERA_BACKEND_URL
 
+import hmac as _hmac, hashlib as _hashlib, time as _time
+from config import settings
+
 router = APIRouter(prefix="/cameras/public", tags=["public-camera"])
+
+
+def _live_frame_sig(camera_id: int, exp: int) -> str:
+    """F-4：live-frame 簽章（HMAC-SHA256，防以 camera_id 枚舉任意相機畫面）"""
+    msg = f"{camera_id}:{exp}".encode()
+    return _hmac.new(settings.JWT_SECRET.encode(), msg, _hashlib.sha256).hexdigest()
 
 
 async def _get_public_cam(token: str, db: Session):
@@ -136,9 +145,12 @@ async def serve_temp_image(token: str):
 
 
 @router.get("/live-frame/{camera_id}")
-async def live_camera_frame(camera_id: int, db: Session = Depends(get_db)):
-    """直接從 go2rtc 取即時截圖，供 LINE 使用（公開，無需登入）"""
+async def live_camera_frame(camera_id: int, exp: int = 0, sig: str = "", db: Session = Depends(get_db)):
+    """直接從 go2rtc 取即時截圖，供 LINE 使用（公開但需簽章）。
+    F-4：必須帶有效 exp+sig（由 line_webhook 預簽），否則 403，杜絕以 camera_id 枚舉任意相機畫面。"""
     from fastapi.responses import Response
+    if not sig or exp < int(_time.time()) or not _hmac.compare_digest(sig, _live_frame_sig(camera_id, exp)):
+        raise HTTPException(403, "連結無效或已過期")
     # 查 camera ip 推導 stream name
     import httpx as _httpx
     from routers.cameras import get_camera_backend_token, CAMERA_BACKEND_URL, CAMERA_SERVICE_KEY

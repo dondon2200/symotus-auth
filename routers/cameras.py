@@ -485,15 +485,18 @@ async def unbind_camera(
         raise HTTPException(403, "無此相機的存取權限")
 
     if current_user.role == "end_user":
-        # end_user 只刪 camera_access 記錄
-        deleted = db.query(CameraAccess).filter(
+        # F-12：僅「完整(full)權限」帳號可解除綁定
+        access = db.query(CameraAccess).filter(
             CameraAccess.camera_id == camera_id,
             CameraAccess.user_id == current_user.id,
-        ).delete()
+        ).first()
+        if not access:
+            raise HTTPException(404, "存取權限不存在")
+        if access.permission_level != "full":
+            raise HTTPException(403, "需要完整(full)權限才能解除綁定")
+        db.delete(access)
         db.commit()
-        if deleted:
-            return {"success": True, "message": "已移除相機存取權限"}
-        raise HTTPException(404, "存取權限不存在")
+        return {"success": True, "message": "已移除相機存取權限"}
 
     # reseller: 呼叫 Camera Backend unbind
     cam_token = await get_camera_backend_token(current_user)

@@ -371,7 +371,12 @@ async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: s
     # 用 live-frame proxy 端點（直接 proxy go2rtc，不用 temp cache）
     if stream_name:
         FRONTEND_URL = os.getenv("FRONTEND_URL", "https://reseller.symotus.com:9443")
-        public_url = f"{FRONTEND_URL}/auth-api/cameras/public/live-frame/{camera_id}"
+        # F-4：以簽章 URL 提供 live-frame（30 分鐘有效），LINE 可抓圖但外部無法以 camera_id 枚舉
+        from routers.public_camera import _live_frame_sig
+        import time as _t
+        _exp = int(_t.time()) + 1800
+        _sig = _live_frame_sig(camera_id, _exp)
+        public_url = f"{FRONTEND_URL}/auth-api/cameras/public/live-frame/{camera_id}?exp={_exp}&sig={_sig}"
         try:
             # 先驗證 go2rtc 有串流才送 LINE
             async with httpx.AsyncClient(timeout=8) as cl:
