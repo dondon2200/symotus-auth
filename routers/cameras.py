@@ -756,6 +756,16 @@ async def proxy_camera_api(
     if allowed_ids is not None and camera_id not in allowed_ids:
         raise HTTPException(403, "無此相機的存取權限")
 
+    # F-5：寫入類操作（改設定/排程/PTZ/重啟等）需「完整(full)權限」。
+    # 依此相機的 camera_access.permission_level 判定；自有相機（無 camera_access）的 reseller/admin 不受限。
+    if request.method not in ("GET", "HEAD"):
+        access = db.query(CameraAccess).filter(
+            CameraAccess.camera_id == camera_id,
+            CameraAccess.user_id == current_user.id,
+        ).first()
+        if access and access.permission_level != "full":
+            raise HTTPException(403, "此操作需要完整(full)權限")
+
     cam_token = await get_camera_backend_token(current_user)
     # 若沒有自己的 token，嘗試用 camera_access granter 的 token
     if not cam_token:
