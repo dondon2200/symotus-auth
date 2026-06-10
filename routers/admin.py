@@ -42,12 +42,10 @@ def reseller_users(
 @router.get("/camera-access-by-user/{user_id}")
 def camera_access_by_user(
     user_id: int,
-    x_service_key: str = Header(None),
     db: Session = Depends(get_db),
+    _=Depends(require_role("symotus_admin")),
 ):
-    """列出某用戶所有 camera_access 的相機（含 basic_info，同步從 camera_access 取）"""
-    if x_service_key != CAMERA_SERVICE_KEY:
-        raise HTTPException(403, "Forbidden")
+    """列出某用戶所有 camera_access 的相機（F-6：改用 symotus_admin JWT，移除前端明碼 service-key）"""
     accesses = db.query(CameraAccess).filter(CameraAccess.user_id == user_id).all()
     return [{"id": a.camera_id, "name": None, "ip_address": None, "online_status": False} for a in accesses]
 
