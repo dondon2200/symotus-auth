@@ -73,6 +73,26 @@ async def _get_admin_camera_token() -> str:
         return ""
 
 
+async def _try_granter_token(camera_id: int, access, current_user: "User", db: Session) -> str:
+    """F-13：相機可能由非 admin 的 granter 帳號擁有。
+    若該 user 對此相機有 grant（且 granter≠自己），回傳「能存取該相機」的 granter token，否則回 ""。
+    優先於 admin fallback 使用，讓被分享、由真實 reseller 帳號擁有的相機可正常存取。"""
+    if not (access and access.granted_by and access.granted_by != current_user.id):
+        return ""
+    granter = db.query(User).filter(User.id == access.granted_by).first()
+    if not granter:
+        return ""
+    gtok = await get_camera_backend_token(granter)
+    if not gtok:
+        return ""
+    async with httpx.AsyncClient(timeout=8) as client:
+        r = await client.get(
+            f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
+            headers={"Authorization": f"Bearer {gtok}"},
+        )
+    return gtok if r.status_code == 200 else ""
+
+
 async def fetch_camera_detail(camera_id: int, owner: Optional[User], admin_holder: dict) -> Optional[dict]:
     """抓相機細節並攤平成 basic_info。
 
@@ -363,7 +383,15 @@ async def get_camera(
             f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
             headers={"Authorization": f"Bearer {cam_token}"},
         )
-    # 若 user token 存取失敗（相機可能屬於不同 CB 帳號），嘗試 admin fallback（僅 grant/admin）
+    # user token 存取失敗（相機可能屬於不同 CB 帳號）：F-13 先試 granter token，再退 admin fallback（僅 grant/admin）
+    if resp.status_code in (403, 404) and allow_fallback:
+        gtok = await _try_granter_token(camera_id, access, current_user, db)
+        if gtok:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
+                    headers={"Authorization": f"Bearer {gtok}"},
+                )
     if resp.status_code in (403, 404) and allow_fallback:
         async with httpx.AsyncClient(timeout=10) as client:
             tok_r = await client.post(
@@ -568,14 +596,18 @@ async def nas_images(
         if test_r.status_code in (403, 404):
             if not allow_fallback:
                 raise HTTPException(403, "無此相機的存取權限")
-            # 這個 token 沒有此相機存取權，改用 admin token
-            async with httpx.AsyncClient(timeout=10) as client:
-                tok_r = await client.post(
-                    f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                    headers={"x-service-key": CAMERA_SERVICE_KEY},
-                    json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
-                )
-            cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else cam_token
+            # F-13：先試 granter token（相機可能屬非 admin 的 granter 帳號），再退 admin token
+            gtok = await _try_granter_token(int(camera_id), access, current_user, db)
+            if gtok:
+                cam_token = gtok
+            else:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    tok_r = await client.post(
+                        f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                        headers={"x-service-key": CAMERA_SERVICE_KEY},
+                        json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                    )
+                cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else cam_token
 
     limit = int(params.get("limit", 30))
     offset = int(params.get("offset", 0))
@@ -809,7 +841,18 @@ async def proxy_camera_api(
             content=body,
             params=dict(request.query_params),
         )
-    # 若 user token 被拒（相機屬於不同 CB 帳號），自動換 admin token 重試（僅 grant/admin）
+    # user token 被拒（相機屬於不同 CB 帳號）：F-13 先試 granter token，再退 admin（僅 grant/admin）
+    if resp.status_code in (403, 404) and allow_fallback:
+        gtok = await _try_granter_token(camera_id, access, current_user, db)
+        if gtok:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.request(
+                    method=request.method,
+                    url=f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}/{path}",
+                    headers={"Authorization": f"Bearer {gtok}", "Content-Type": "application/json"},
+                    content=body,
+                    params=dict(request.query_params),
+                )
     if resp.status_code in (403, 404) and allow_fallback:
         async with httpx.AsyncClient(timeout=10) as client:
             tok_r = await client.post(
