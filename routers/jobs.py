@@ -313,11 +313,65 @@ async def _download_file_api(session: httpx.AsyncClient, token_mgr: "_TokenManag
 
 
 
+def _sample_by_day(nas_path: str, duration_seconds: int, fps: int):
+    """下載完之後，按天平均抽取照片，確保每天都有幀出現在影片中。
+    抽完的照片保留，其餘從 NAS 刪除，再送 Spark。
+    """
+    import re
+    from collections import defaultdict
+
+    all_files = sorted([
+        f for f in os.listdir(nas_path)
+        if not f.startswith(".") and os.path.isfile(os.path.join(nas_path, f))
+    ])
+    total = len(all_files)
+    frames_needed = duration_seconds * fps
+
+    if total <= frames_needed:
+        return  # 不需要抽取
+
+    # 嘗試從檔名解析日期（YYYYMMDD 或 YYYY-MM-DD 或 YYYY_MM_DD）
+    date_pattern = re.compile(r'(\d{4})[_\-]?(\d{2})[_\-]?(\d{2})')
+    by_day = defaultdict(list)
+    no_date = []
+    for f in all_files:
+        m = date_pattern.search(f)
+        if m:
+            by_day[f"{m.group(1)}{m.group(2)}{m.group(3)}"].append(f)
+        else:
+            no_date.append(f)
+
+    if not by_day:
+        # 沒找到日期 → 全局等間距抽取
+        step = total / frames_needed
+        keep = set(all_files[int(i * step)] for i in range(frames_needed))
+    else:
+        days = sorted(by_day.keys())
+        frames_per_day = max(1, frames_needed // len(days))
+        keep = set()
+        for day in days:
+            day_files = sorted(by_day[day])
+            n = len(day_files)
+            if n <= frames_per_day:
+                keep.update(day_files)
+            else:
+                step = n / frames_per_day
+                keep.update(day_files[int(i * step)] for i in range(frames_per_day))
+
+    # 刪除不在 keep 集合裡的檔案
+    for f in all_files:
+        if f not in keep:
+            try:
+                os.remove(os.path.join(nas_path, f))
+            except Exception:
+                pass
+
+
 async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_files: list[dict],
                                    refresh_token: Optional[str],
                                    body_fps: int, body_resolution, rain_fog: bool, darkness: bool,
                                    max_images=None, initial_access_token: Optional[str] = None,
-                                   initial_expires_in: int = 0):
+                                   initial_expires_in: int = 0, duration_seconds: Optional[int] = None):
     """背景任務：用消費者自己的 Drive 授權並發下載 → NAS → Spark /jobs/nas。
 
     下載清單 = 個別選取的照片（picked_files）+ 各選取資料夾列出的照片（依 id 去重）。
@@ -382,6 +436,12 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
             job.status = "failed"; job.error_message = f"只下載到 {saved} 張"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
 
+        # 2.5 按天抽取照片（確保每天都有、達到目標時長）
+        if duration_seconds and duration_seconds > 0:
+            await asyncio.to_thread(_sample_by_day, nas_path, duration_seconds, body_fps)
+            saved = len([x for x in os.listdir(nas_path) if not x.startswith(".")])
+            job.downloaded_count = saved; db.commit()
+
         # 3. Spark 從 NAS 讀（無大小限制）
         job.status = "submitted"; db.commit()
         callback_url = f"{settings.PUBLIC_BASE_URL}/jobs/gdrive/callback/{job_id}"
@@ -424,6 +484,7 @@ class GDriveJobRequest(BaseModel):
     image_recovery: bool = False
     stabilization: bool = False
     max_images: Optional[int] = None
+    duration_seconds: Optional[int] = None
 
 
 @router.post("/gdrive")
@@ -472,6 +533,7 @@ async def create_gdrive_job(
         job.id, folder_ids, picked_files, refresh_token, body.fps, body.resolution,
         body.rain_fog_detection, body.darkness_detection, body.max_images,
         access_token, td.get("expires_in", 0),
+        duration_seconds=body.duration_seconds,
     ))
     return {"job_id": job.id, "status": "pending", "message": "已開始：用你的 Google 權限下載照片 → Spark 生成"}
 
