@@ -189,7 +189,7 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
         async with httpx.AsyncClient(timeout=30) as c:
             sr = await c.post("https://user.symotus.com/spark/jobs/nas",
                 headers={"Content-Type":"application/json","x-api-key": SPARK_API_KEY},
-                json={"nas_path": serial, "callback_url": f"{os.getenv('FRONTEND_URL', 'https://reseller.symotus.com:9443')}/api/spark-callback",
+                json={"nas_path": serial, "callback_url": f"{os.getenv('FRONTEND_URL', 'https://user.symotus.com')}/api/spark-callback",
                       "fps": 30, "resolution": "1920x1080",
                       "rain_fog_detection": True, "darkness_detection": True,
                       "image_recovery": False, "stabilization": False,
@@ -310,7 +310,7 @@ async def call_ai_line(text: str, auth_token: str, line_user_id: str) -> dict:
             resp = await c.post("https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
                          "Content-Type": "application/json",
-                         "HTTP-Referer": os.getenv("FRONTEND_URL", "https://reseller.symotus.com:9443"), "X-Title": "Symotus LINE Bot"},
+                         "HTTP-Referer": os.getenv("FRONTEND_URL", "https://user.symotus.com"), "X-Title": "Symotus LINE Bot"},
                 json={"model": "openai/gpt-4o-mini", "messages": messages,
                       "tools": LINE_TOOLS, "tool_choice": "auto",
                       "max_tokens": 600, "temperature": 0.3})
@@ -370,7 +370,7 @@ async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: s
 
     # 用 live-frame proxy 端點（直接 proxy go2rtc，不用 temp cache）
     if stream_name:
-        FRONTEND_URL = os.getenv("FRONTEND_URL", "https://reseller.symotus.com:9443")
+        FRONTEND_URL = os.getenv("FRONTEND_URL", "https://user.symotus.com")
         # F-4：以簽章 URL 提供 live-frame（30 分鐘有效），LINE 可抓圖但外部無法以 camera_id 枚舉
         from routers.public_camera import _live_frame_sig
         import time as _t
@@ -428,7 +428,7 @@ async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: s
 
     # 5. 存入臨時快取取得公開 token
     token = await _store_temp_image(img_bytes, content_type)
-    FRONTEND_URL = os.getenv("FRONTEND_URL", "https://reseller.symotus.com:9443")
+    FRONTEND_URL = os.getenv("FRONTEND_URL", "https://user.symotus.com")
     public_url = f"{FRONTEND_URL}/auth-api/cameras/public/temp-image/{token}"
 
     # 6. 推送 LINE 圖片訊息
@@ -458,7 +458,7 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
         user = db.query(User).filter(User.line_id == line_user_id).first()
         if not user:
             await line_reply(reply_token, [{"type": "text",
-                "text": f"您好！請先到 {os.getenv('FRONTEND_URL', 'https://reseller.symotus.com:9443')} 用 LINE 登入，才能使用 AI 助理功能"}])
+                "text": f"您好！請先到 {os.getenv('FRONTEND_URL', 'https://user.symotus.com')} 用 LINE 登入，才能使用 AI 助理功能"}])
             continue
 
         # 特殊指令：取消相機通知（從 Flex Message 按鈕觸發）

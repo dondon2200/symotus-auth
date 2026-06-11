@@ -128,7 +128,10 @@ class GDriveJob(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    folder_url = Column(String, nullable=False)
+    folder_url = Column(String, nullable=True)              # 舊流程：公開分享連結（新流程不再使用）
+    folder_id = Column(String, nullable=True)               # 新流程：Picker 選到的資料夾 id
+    folder_name = Column(String, nullable=True)             # 資料夾顯示名稱（Picker 回傳）
+    google_refresh_token = Column(String, nullable=True)    # 消費者 Drive refresh token（長任務續期下載用）
     status = Column(String, nullable=False, default="pending")
     # pending → downloading → uploading → processing → completed | failed
     total_images = Column(Integer, default=0)       # Drive 資料夾內圖片總數

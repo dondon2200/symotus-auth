@@ -16,7 +16,6 @@ app = FastAPI(
 # F-8：CORS 收斂為已知前端來源（前端與 /auth-api 同源，正常流量不依賴 CORS）
 _ALLOWED_ORIGINS = list({
     settings.FRONTEND_URL,
-    "https://reseller.symotus.com:9443",
     "https://user.symotus.com",
     "https://admin.symotus.com",
 })
@@ -118,6 +117,20 @@ async def startup():
                     conn.commit()
                 except Exception:
                     conn.rollback()
+
+            # 補上 gdrive_jobs 新流程欄位（OAuth + Picker）並放寬 folder_url
+            with engine.connect() as conn:
+                for stmt in [
+                    "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS folder_id VARCHAR",
+                    "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS folder_name VARCHAR",
+                    "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS google_refresh_token VARCHAR",
+                    "ALTER TABLE gdrive_jobs ALTER COLUMN folder_url DROP NOT NULL",
+                ]:
+                    try:
+                        conn.execute(text(stmt))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
 
             logger.info("DB connected and tables created!")
             # 啟動相機開機 LINE 推播背景工作

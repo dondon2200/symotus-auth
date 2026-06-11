@@ -161,9 +161,9 @@ def internal_update_job(
 
 # ── Google Drive 縮時影片（背景下載 + 直接送 Spark）──────────────────────────────
 
-import re
 import asyncio
 import os
+import time
 import logging
 import httpx
 from models import GDriveJob
@@ -173,44 +173,107 @@ logger = logging.getLogger(__name__)
 
 SPARK_API_URL = settings.SPARK_API_URL
 SPARK_API_KEY = settings.SPARK_API_KEY
-GDRIVE_API_KEY = "AIzaSyAj-LJs2lbT7pjh0FFkOw-rRH-OMtMl3c4"
 GDRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
-GDRIVE_DOWNLOAD_URL = "https://drive.google.com/uc"  # 不走 API，直接 HTTP 下載
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+DOWNLOAD_CONCURRENCY = 12  # Drive API alt=media 並發路數（§3：8~16）
 
 
-def _extract_folder_id(folder_url: str) -> Optional[str]:
-    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", folder_url)
-    return m.group(1) if m else None
+# ── OAuth：用消費者授權碼換 token、refresh token 續期 ──────────────────────────
+
+async def _exchange_auth_code(auth_code: str) -> dict:
+    """用前端 GIS code client（ux_mode=popup）拿到的授權碼換 access + refresh token。
+
+    重點：popup 模式的授權碼必須以 redirect_uri='postmessage' 交換（GIS 慣例），
+    不是 web OAuth 的 GOOGLE_REDIRECT_URI。
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(GOOGLE_TOKEN_URL, data={
+            "code": auth_code,
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "redirect_uri": "postmessage",
+            "grant_type": "authorization_code",
+        })
+    if r.status_code != 200:
+        raise HTTPException(400, f"Google 授權碼交換失敗（{r.status_code}）：{r.text[:200]}")
+    return r.json()
 
 
-async def _list_drive_images(folder_id: str, max_images: Optional[int] = None) -> list[dict]:
-    """用 Google Drive API 列出資料夾內的圖片（只列清單，不下載）"""
-    files = []
+async def _refresh_access_token(refresh_token: str) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(GOOGLE_TOKEN_URL, data={
+            "refresh_token": refresh_token,
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+        })
+    if r.status_code != 200:
+        raise RuntimeError(f"refresh token 失效（{r.status_code}）：{r.text[:200]}")
+    return r.json()
+
+
+class _TokenManager:
+    """管理單一任務的 access token：將到期時用 refresh token 自動續期（asyncio.Lock 串行化）。
+
+    沒有 refresh token 時只用初始 access token（短任務夠用，~1hr）；過期且無法續期則丟出
+    明確錯誤，讓背景任務標記 job 失敗。
+    """
+    def __init__(self, refresh_token: Optional[str], access_token: Optional[str] = None, expires_in: int = 0):
+        self._refresh_token = refresh_token
+        self._access_token = access_token
+        # 提早 120 秒視為過期，避免邊界 race
+        self._expiry = (time.monotonic() + expires_in - 120) if access_token else 0.0
+        self._lock = asyncio.Lock()
+
+    async def _do_refresh(self):
+        if not self._refresh_token:
+            raise RuntimeError("access token 已過期且無 refresh token，無法續期")
+        td = await _refresh_access_token(self._refresh_token)
+        self._access_token = td["access_token"]
+        self._expiry = time.monotonic() + td.get("expires_in", 3600) - 120
+
+    async def get(self) -> str:
+        async with self._lock:
+            if not self._access_token or time.monotonic() >= self._expiry:
+                await self._do_refresh()
+            return self._access_token
+
+    async def force_refresh(self) -> str:
+        async with self._lock:
+            await self._do_refresh()
+            return self._access_token
+
+
+async def _list_drive_images(token_mgr: "_TokenManager", folder_id: str, max_images: Optional[int] = None) -> list[dict]:
+    """用消費者授權列出資料夾內的圖片（drive.file scope，Picker 選到的資料夾可列舉子項）。"""
+    files: list[dict] = []
     page_token = None
-    limit = max_images or 9999
+    limit = max_images or 100000
 
     async with httpx.AsyncClient(timeout=30) as client:
         while len(files) < limit:
+            access = await token_mgr.get()
             params = {
-                "q": f"'{folder_id}' in parents and trashed=false",
+                "q": f"'{folder_id}' in parents and mimeType contains 'image/' and trashed=false",
                 "fields": "nextPageToken,files(id,name,mimeType,size)",
-                "pageSize": min(1000, limit - len(files)),
-                "key": GDRIVE_API_KEY,
+                "pageSize": 1000,
                 "orderBy": "name",
+                "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
             }
             if page_token:
                 params["pageToken"] = page_token
 
-            resp = await client.get(GDRIVE_FILES_URL, params=params)
+            resp = await client.get(GDRIVE_FILES_URL, params=params,
+                                    headers={"Authorization": f"Bearer {access}"})
+            if resp.status_code == 401:
+                await token_mgr.force_refresh()
+                continue
             if resp.status_code != 200:
-                raise HTTPException(400, f"無法列出資料夾內容（{resp.status_code}）")
+                raise HTTPException(400, f"無法列出資料夾內容（{resp.status_code}）：{resp.text[:200]}")
 
             data = resp.json()
-            image_files = [
-                f for f in data.get("files", [])
-                if f.get("mimeType", "").startswith("image/")
-            ]
-            files.extend(image_files)
+            files.extend(data.get("files", []))
             page_token = data.get("nextPageToken")
             if not page_token:
                 break
@@ -218,54 +281,52 @@ async def _list_drive_images(folder_id: str, max_images: Optional[int] = None) -
     return files[:limit]
 
 
-async def _download_file_direct(session: httpx.AsyncClient, file_id: str) -> Optional[bytes]:
-    """用公開 URL 下載 Google Drive 單張圖片（不需 API key，支援公開分享資料夾）。
+def _write_file(path: str, data: bytes):
+    with open(path, "wb") as fp:
+        fp.write(data)
 
-    重點：必須檢查 Content-Type 是否為 image/*，因為 Google 對大檔/異常會回傳
-    text/html 的「病毒掃描確認頁」或登入頁（長度可能 >1000），只看 length 會把 HTML
-    當成壞圖存下。遇到 HTML 確認頁則解析 confirm token 再下載一次。
-    """
-    base = "https://drive.google.com/uc?export=download"
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
-    url = f"{base}&id={file_id}"
-    for attempt in range(3):  # 最多 3 次 retry
+
+async def _download_file_api(session: httpx.AsyncClient, token_mgr: "_TokenManager", file_id: str) -> Optional[bytes]:
+    """用消費者權限 + Drive API v3 files.get?alt=media 下載單張圖片（高配額、不限速、不跳病毒掃描頁）。"""
+    url = f"{GDRIVE_FILES_URL}/{file_id}"
+    params = {"alt": "media", "supportsAllDrives": "true"}
+    for attempt in range(4):
         try:
-            resp = await session.get(url, headers=headers, follow_redirects=True, timeout=60)
-            ctype = resp.headers.get("content-type", "").lower()
-            if resp.status_code == 200 and ctype.startswith("image/") and len(resp.content) > 1000:
+            access = await token_mgr.get()
+            resp = await session.get(url, params=params,
+                                     headers={"Authorization": f"Bearer {access}"},
+                                     follow_redirects=True, timeout=120)
+            if resp.status_code == 200 and len(resp.content) > 0:
                 return resp.content
-            # 大檔會回 HTML 確認頁，解析 confirm token 後再抓一次
-            if resp.status_code == 200 and "text/html" in ctype:
-                m = re.search(r"confirm=([0-9A-Za-z_\-]+)", resp.text)
-                if m:
-                    confirm_url = f"{base}&confirm={m.group(1)}&id={file_id}"
-                    r2 = await session.get(confirm_url, headers=headers, follow_redirects=True, timeout=120)
-                    if (r2.status_code == 200
-                            and r2.headers.get("content-type", "").lower().startswith("image/")
-                            and len(r2.content) > 1000):
-                        return r2.content
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                return None
-            if resp.status_code in (403, 429) and attempt < 2:
-                await asyncio.sleep(2 ** attempt)  # 1s, 2s
+            if resp.status_code == 401:
+                await token_mgr.force_refresh()
+                continue
+            if resp.status_code in (403, 429, 500, 502, 503) and attempt < 3:
+                await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s 退避
                 continue
             return None
         except Exception:
-            if attempt < 2:
+            if attempt < 3:
                 await asyncio.sleep(2 ** attempt)
     return None
 
 
 
 
-async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, body_fps: int, body_resolution, max_images=None):
-    """背景任務：Google Drive → NAS（原本有效下載方式）→ Spark /jobs/nas"""
+async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, refresh_token: Optional[str],
+                                   body_fps: int, body_resolution, rain_fog: bool, darkness: bool,
+                                   max_images=None, initial_access_token: Optional[str] = None,
+                                   initial_expires_in: int = 0):
+    """背景任務：用消費者自己的 Drive 授權並發下載 → NAS → Spark /jobs/nas。
+
+    下載走 Drive API v3 files.get?alt=media（per-user 配額、不限速、不跳病毒掃描頁），
+    並發 DOWNLOAD_CONCURRENCY 路；token 到期用 refresh token 自動續期。NAS→Spark 段沿用。
+    """
     from database import SessionLocal
     db = SessionLocal()
     nas_folder = f"gdrive_{job_id}"
     nas_path = f"/homes/firmness/{nas_folder}"
+    token_mgr = _TokenManager(refresh_token, initial_access_token, initial_expires_in)
     try:
         import shutil
         job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
@@ -275,10 +336,10 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, body_fps: int, b
             shutil.rmtree(nas_path)
         os.makedirs(nas_path, exist_ok=True)
 
-        # 1. 列清單（原本就能跑的方式）
+        # 1. 列清單（消費者授權）
         job.status = "listing"; db.commit()
         try:
-            files = await _list_drive_images(folder_id, max_images)
+            files = await _list_drive_images(token_mgr, folder_id, max_images)
         except Exception as e:
             job.status = "failed"; job.error_message = f"無法讀取資料夾：{e}"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
@@ -287,20 +348,25 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, body_fps: int, b
             shutil.rmtree(nas_path, ignore_errors=True); return
         job.total_images = len(files); db.commit()
 
-        # 2. 下載到 NAS（原本就能跑，用公開 URL drive.google.com/uc?export=download）
+        # 2. 並發下載到 NAS（Drive API alt=media）
         job.status = "downloading"; db.commit()
-        async with httpx.AsyncClient(timeout=60) as session:
-            for i, f in enumerate(files):
-                img_bytes = await _download_file_direct(session, f["id"])
-                if img_bytes:
-                    with open(os.path.join(nas_path, f["name"]), "wb") as fp:
-                        fp.write(img_bytes)
-                job.downloaded_count = i + 1
-                if (i + 1) % 50 == 0: db.commit()
-                if (i + 1) % 100 == 0: await asyncio.sleep(0.2)
-        db.commit()
+        sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+        progress = {"done": 0}
+        progress_lock = asyncio.Lock()
+        async with httpx.AsyncClient(timeout=120) as session:
+            async def fetch_one(f: dict):
+                async with sem:
+                    data = await _download_file_api(session, token_mgr, f["id"])
+                if data:
+                    await asyncio.to_thread(_write_file, os.path.join(nas_path, f["name"]), data)
+                async with progress_lock:
+                    progress["done"] += 1
+                    if progress["done"] % 25 == 0:
+                        job.downloaded_count = progress["done"]; db.commit()
+            await asyncio.gather(*[fetch_one(f) for f in files])
 
         saved = len([x for x in os.listdir(nas_path) if not x.startswith(".")])
+        job.downloaded_count = saved; db.commit()
         if saved < 10:
             job.status = "failed"; job.error_message = f"只下載到 {saved} 張"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
@@ -313,7 +379,7 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, body_fps: int, b
                 headers={"x-api-key": SPARK_API_KEY},
                 json={"nas_path": nas_folder, "callback_url": callback_url,
                       "fps": body_fps, "resolution": body_resolution,
-                      "rain_fog_detection": False, "darkness_detection": False})
+                      "rain_fog_detection": rain_fog, "darkness_detection": darkness})
         if sr.status_code not in (200, 202):
             job.status = "failed"; job.error_message = f"Spark 錯誤（{sr.status_code}）：{sr.text[:200]}"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
@@ -328,166 +394,16 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, body_fps: int, b
         db.close()
 
 
-async def _run_gdrive_background_full(job_id: int, folder_id: str, body_fps: int, body_resolution: Optional[str], max_images: Optional[int] = None):
-    """背景任務：列清單 + 分批下載照片 → 送 Spark"""
-    from database import SessionLocal
-    db = SessionLocal()
-    try:
-        job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
-        if not job:
-            return
-
-        # 列出檔案清單
-        MAX_IMAGES = 1000
-        max_req = min(max_images or MAX_IMAGES, MAX_IMAGES)
-        try:
-            files = await _list_drive_images(folder_id, max_req)
-        except Exception as e:
-            job.status = "failed"
-            job.error_message = f"無法讀取資料夾：{e}"
-            db.commit()
-            return
-
-        if not files:
-            job.status = "failed"
-            job.error_message = "資料夾內沒有找到圖片"
-            db.commit()
-            return
-
-        if len(files) < 100:
-            job.status = "failed"
-            job.error_message = f"圖片數量不足（{len(files)} 張），縮時影片至少需要 100 張"
-            db.commit()
-            return
-
-        job.total_images = len(files)
-        if len(files) >= MAX_IMAGES:
-            job.error_message = f"資料夾內超過 {MAX_IMAGES} 張照片，將只處理前 {MAX_IMAGES} 張"
-        db.commit()
-
-        await _run_gdrive_background(job_id, files, body_fps, body_resolution, _db=db)
-    except Exception as e:
-        try:
-            job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
-            if job:
-                job.status = "failed"
-                job.error_message = str(e)[:300]
-                db.commit()
-        except Exception:
-            pass
-    finally:
-        db.close()
-
-
-async def _run_gdrive_background(job_id: int, files: list[dict], body_fps: int, body_resolution: Optional[str], _db=None):
-    """背景任務：下載照片到磁碟 → 送 Spark（避免記憶體爆炸）"""
-    import tempfile, shutil
-    from database import SessionLocal
-    db = _db or SessionLocal()
-    own_db = _db is None
-    tmp_dir = None
-    try:
-        job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
-        if not job:
-            return
-
-        # 建暫存目錄
-        tmp_dir = tempfile.mkdtemp(prefix=f"gdrive_{job_id}_")
-
-        # 下載階段：寫磁碟，不存記憶體
-        job.status = "downloading"
-        db.commit()
-
-        saved_files = []
-        async with httpx.AsyncClient(timeout=60) as session:
-            for i, f in enumerate(files):
-                img_bytes = await _download_file_direct(session, f["id"])
-                if img_bytes:
-                    fpath = os.path.join(tmp_dir, f["name"])
-                    with open(fpath, "wb") as fp:
-                        fp.write(img_bytes)
-                    saved_files.append((f["name"], fpath))
-                    del img_bytes  # 立刻釋放記憶體
-                job.downloaded_count = i + 1
-                if (i + 1) % 10 == 0:
-                    db.commit()
-                if (i + 1) % 50 == 0:
-                    await asyncio.sleep(0.5)
-
-        job.downloaded_count = len(saved_files)
-        db.commit()
-
-        if len(saved_files) < 100:
-            job.status = "failed"
-            job.error_message = f"成功下載 {len(saved_files)} 張，不足 100 張無法生成縮時影片"
-            db.commit()
-            return
-
-        # 上傳 Spark 階段：採樣避免 413（Spark 有 payload 限制）
-        job.status = "uploading"
-        db.commit()
-
-        callback_url = f"{settings.PUBLIC_BASE_URL}/jobs/gdrive/callback/{job_id}"
-
-        # 若照片超過 300 張，均勻採樣減少到 300（Spark 有大小限制）
-        MAX_SPARK_FILES = 300
-        if len(saved_files) > MAX_SPARK_FILES:
-            step = len(saved_files) / MAX_SPARK_FILES
-            sampled = [saved_files[int(i * step)] for i in range(MAX_SPARK_FILES)]
-            logger.info(f"GDrive job {job_id}: sampled {len(saved_files)} → {len(sampled)} files for Spark")
-        else:
-            sampled = saved_files
-
-        file_handles = []
-        form_files = []
-        try:
-            for name, fpath in sampled:
-                fh = open(fpath, "rb")
-                file_handles.append(fh)
-                form_files.append(("images", (name, fh, "image/jpeg")))
-
-            async with httpx.AsyncClient(timeout=600) as client:
-                spark_resp = await client.post(
-                    f"{SPARK_API_URL}/jobs",
-                    headers={"x-api-key": SPARK_API_KEY},
-                    data={"callback_url": callback_url, "fps": str(body_fps)},
-                    files=form_files,
-                )
-        finally:
-            for fh in file_handles:
-                fh.close()
-
-        if spark_resp.status_code not in [200, 202]:
-            job.status = "failed"
-            job.error_message = f"Spark 服務錯誤（{spark_resp.status_code}）"
-            db.commit()
-            return
-
-        spark_data = spark_resp.json()
-        job.spark_job_id = str(spark_data.get("job_id", ""))
-        job.status = "processing"
-        db.commit()
-
-    except Exception as e:
-        try:
-            job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
-            if job:
-                job.status = "failed"
-                job.error_message = str(e)[:300]
-                db.commit()
-        except Exception:
-            pass
-    finally:
-        if tmp_dir and os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        if own_db:
-            db.close()
-
-
 class GDriveJobRequest(BaseModel):
-    folder_url: str
+    folder_id: str
+    folder_name: Optional[str] = None
+    auth_code: str
     fps: int = 30
     resolution: Optional[str] = "1920x1080"
+    rain_fog_detection: bool = False
+    darkness_detection: bool = False
+    image_recovery: bool = False
+    stabilization: bool = False
     max_images: Optional[int] = None
 
 
@@ -497,25 +413,44 @@ async def create_gdrive_job(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """從 Google Drive 公開資料夾建立縮時影片 job。
+    """從 Google Drive 建立縮時影片 job（OAuth + Picker 流程）。
 
-    auth 自行處理整條鏈：用公開 URL 把照片下載到 NAS（/homes/firmness/gdrive_<id>）→ 呼叫
-    Spark POST /jobs/nas（Spark 直接從 NAS 讀，無大小/張數上限）。不再委派 Camera Backend
-    的 /api/timelapse/gdrive-import（其用需 OAuth 的 files.get?alt=media 對公開資料夾會 403）。
+    消費者用 GIS code client 取得 drive.file 的 offline 授權碼（auth_code），後端在此換
+    refresh + access token，再用消費者自己的權限並發下載 Picker 選到的資料夾 → NAS
+    （/homes/firmness/gdrive_<id>）→ 呼叫 Spark POST /jobs/nas。不再爬公開連結。
     """
-    folder_id = _extract_folder_id(body.folder_url)
-    if not folder_id:
-        raise HTTPException(400, "無效的 Google Drive 資料夾連結，請確認貼上的是「資料夾」分享連結")
+    if not body.folder_id:
+        raise HTTPException(400, "缺少 folder_id（請用 Google Drive 選擇器選取資料夾）")
+    if not body.auth_code:
+        raise HTTPException(400, "缺少 Google 授權碼")
+    if not (settings.GOOGLE_CLIENT_ID and settings.GOOGLE_CLIENT_SECRET):
+        raise HTTPException(500, "伺服器未設定 Google OAuth 憑證（GOOGLE_CLIENT_ID/SECRET）")
+
+    # 用授權碼換 token（offline）。popup 模式以 redirect_uri='postmessage' 交換。
+    td = await _exchange_auth_code(body.auth_code)
+    access_token = td.get("access_token")
+    refresh_token = td.get("refresh_token")
+    if not access_token:
+        raise HTTPException(400, "Google 授權交換未取得 access token")
+    if not refresh_token:
+        # 用戶若先前已授權，Google 可能不再回 refresh token；短任務用 access token 仍可完成，
+        # 但超過 token 壽命的長任務無法續期。
+        logger.warning("GDrive auth_code 交換未取得 refresh_token（用戶可能已授權過）")
 
     job = GDriveJob(
-        user_id=current_user.id, folder_url=body.folder_url,
+        user_id=current_user.id,
+        folder_id=body.folder_id,
+        folder_name=body.folder_name,
+        google_refresh_token=refresh_token,
         status="pending", fps=body.fps, resolution=body.resolution,
     )
     db.add(job); db.commit(); db.refresh(job)
     asyncio.create_task(_run_gdrive_nas_pipeline(
-        job.id, folder_id, body.fps, body.resolution, body.max_images
+        job.id, body.folder_id, refresh_token, body.fps, body.resolution,
+        body.rain_fog_detection, body.darkness_detection, body.max_images,
+        access_token, td.get("expires_in", 0),
     ))
-    return {"job_id": job.id, "status": "pending", "message": "已開始：下載照片到 NAS → Spark 生成"}
+    return {"job_id": job.id, "status": "pending", "message": "已開始：用你的 Google 權限下載照片 → Spark 生成"}
 
 
 
@@ -533,6 +468,7 @@ async def list_gdrive_jobs(
             "job_id": job.id,
             "status": job.status,
             "folder_url": job.folder_url,
+            "folder_name": job.folder_name,
             "fps": job.fps,
             "resolution": job.resolution,
             "total_images": job.total_images,

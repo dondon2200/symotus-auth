@@ -16,7 +16,7 @@ from config import settings
 
 router = APIRouter(prefix="/invitations", tags=["invitations"])
 
-FRONTEND_URL = getattr(settings, "FRONTEND_URL", "https://reseller.symotus.com:9443")
+FRONTEND_URL = getattr(settings, "FRONTEND_URL", "https://user.symotus.com")
 
 
 PERMISSION_LABELS = {
