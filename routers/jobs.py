@@ -313,14 +313,16 @@ async def _download_file_api(session: httpx.AsyncClient, token_mgr: "_TokenManag
 
 
 
-async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, refresh_token: Optional[str],
+async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_files: list[dict],
+                                   refresh_token: Optional[str],
                                    body_fps: int, body_resolution, rain_fog: bool, darkness: bool,
                                    max_images=None, initial_access_token: Optional[str] = None,
                                    initial_expires_in: int = 0):
     """背景任務：用消費者自己的 Drive 授權並發下載 → NAS → Spark /jobs/nas。
 
-    下載走 Drive API v3 files.get?alt=media（per-user 配額、不限速、不跳病毒掃描頁），
-    並發 DOWNLOAD_CONCURRENCY 路；token 到期用 refresh token 自動續期。NAS→Spark 段沿用。
+    下載清單 = 個別選取的照片（picked_files）+ 各選取資料夾列出的照片（依 id 去重）。
+    走 Drive API v3 files.get?alt=media（per-user 配額、不限速、不跳病毒掃描頁），並發
+    DOWNLOAD_CONCURRENCY 路；token 到期用 refresh token 自動續期。NAS→Spark 段沿用。
     """
     from database import SessionLocal
     db = SessionLocal()
@@ -336,34 +338,43 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, refresh_token: O
             shutil.rmtree(nas_path)
         os.makedirs(nas_path, exist_ok=True)
 
-        # 1. 列清單（消費者授權）
+        # 1. 建下載清單：個別照片 + 各資料夾列出的照片（依 id 去重）
         job.status = "listing"; db.commit()
+        download: list[dict] = []
+        seen: set[str] = set()
+        for it in picked_files:
+            if it.get("id") and it["id"] not in seen:
+                seen.add(it["id"]); download.append({"id": it["id"], "name": it.get("name") or it["id"]})
         try:
-            files = await _list_drive_images(token_mgr, folder_id, max_images)
+            for folder_id in folder_ids:
+                for f in await _list_drive_images(token_mgr, folder_id, max_images):
+                    if f["id"] not in seen:
+                        seen.add(f["id"]); download.append({"id": f["id"], "name": f["name"]})
         except Exception as e:
             job.status = "failed"; job.error_message = f"無法讀取資料夾：{e}"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
-        if not files:
-            job.status = "failed"; job.error_message = "資料夾內沒有找到圖片"; db.commit()
+        if not download:
+            job.status = "failed"; job.error_message = "選取的項目中沒有找到圖片"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
-        job.total_images = len(files); db.commit()
+        job.total_images = len(download); db.commit()
 
-        # 2. 並發下載到 NAS（Drive API alt=media）
+        # 2. 並發下載到 NAS（Drive API alt=media）。檔名加序號前綴：保序＋避免同名覆蓋。
         job.status = "downloading"; db.commit()
         sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
         progress = {"done": 0}
         progress_lock = asyncio.Lock()
         async with httpx.AsyncClient(timeout=120) as session:
-            async def fetch_one(f: dict):
+            async def fetch_one(idx: int, item: dict):
                 async with sem:
-                    data = await _download_file_api(session, token_mgr, f["id"])
+                    data = await _download_file_api(session, token_mgr, item["id"])
                 if data:
-                    await asyncio.to_thread(_write_file, os.path.join(nas_path, f["name"]), data)
+                    safe = str(item["name"]).replace("/", "_").replace("\\", "_")
+                    await asyncio.to_thread(_write_file, os.path.join(nas_path, f"{idx:06d}_{safe}"), data)
                 async with progress_lock:
                     progress["done"] += 1
                     if progress["done"] % 25 == 0:
                         job.downloaded_count = progress["done"]; db.commit()
-            await asyncio.gather(*[fetch_one(f) for f in files])
+            await asyncio.gather(*[fetch_one(i, it) for i, it in enumerate(download)])
 
         saved = len([x for x in os.listdir(nas_path) if not x.startswith(".")])
         job.downloaded_count = saved; db.commit()
@@ -394,9 +405,17 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_id: str, refresh_token: O
         db.close()
 
 
+class FileRef(BaseModel):
+    id: str
+    name: Optional[str] = None
+
+
 class GDriveJobRequest(BaseModel):
-    folder_id: str
+    folder_id: Optional[str] = None          # 向後相容：單一資料夾
     folder_name: Optional[str] = None
+    folder_ids: Optional[list[str]] = None   # 多選：資料夾（後端列出內含照片）
+    files: Optional[list[FileRef]] = None    # 多選：個別照片
+    selection_name: Optional[str] = None     # 顯示用（如「2 個資料夾、30 張照片」）
     auth_code: str
     fps: int = 30
     resolution: Optional[str] = "1920x1080"
@@ -413,14 +432,18 @@ async def create_gdrive_job(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """從 Google Drive 建立縮時影片 job（OAuth + Picker 流程）。
+    """從 Google Drive 建立縮時影片 job（OAuth + Picker 流程，支援多選）。
 
-    消費者用 GIS code client 取得 drive.file 的 offline 授權碼（auth_code），後端在此換
-    refresh + access token，再用消費者自己的權限並發下載 Picker 選到的資料夾 → NAS
+    消費者用 GIS code client 取得 offline 授權碼（auth_code），後端在此換 refresh + access
+    token，再用消費者自己的權限並發下載 Picker 選到的「照片與/或資料夾」→ NAS
     （/homes/firmness/gdrive_<id>）→ 呼叫 Spark POST /jobs/nas。不再爬公開連結。
     """
-    if not body.folder_id:
-        raise HTTPException(400, "缺少 folder_id（請用 Google Drive 選擇器選取資料夾）")
+    folder_ids = list(body.folder_ids or [])
+    if body.folder_id:
+        folder_ids.append(body.folder_id)
+    picked_files = [{"id": f.id, "name": f.name} for f in (body.files or []) if f.id]
+    if not folder_ids and not picked_files:
+        raise HTTPException(400, "未選取任何資料夾或照片")
     if not body.auth_code:
         raise HTTPException(400, "缺少 Google 授權碼")
     if not (settings.GOOGLE_CLIENT_ID and settings.GOOGLE_CLIENT_SECRET):
@@ -439,14 +462,14 @@ async def create_gdrive_job(
 
     job = GDriveJob(
         user_id=current_user.id,
-        folder_id=body.folder_id,
-        folder_name=body.folder_name,
+        folder_id=(folder_ids[0] if folder_ids else None),
+        folder_name=body.selection_name or body.folder_name,
         google_refresh_token=refresh_token,
         status="pending", fps=body.fps, resolution=body.resolution,
     )
     db.add(job); db.commit(); db.refresh(job)
     asyncio.create_task(_run_gdrive_nas_pipeline(
-        job.id, body.folder_id, refresh_token, body.fps, body.resolution,
+        job.id, folder_ids, picked_files, refresh_token, body.fps, body.resolution,
         body.rain_fog_detection, body.darkness_detection, body.max_images,
         access_token, td.get("expires_in", 0),
     ))
