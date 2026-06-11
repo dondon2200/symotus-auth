@@ -536,15 +536,44 @@ async def unbind_camera(
         db.commit()
         return {"success": True, "message": "已移除相機存取權限"}
 
-    # reseller: 呼叫 Camera Backend unbind
+    # reseller / symotus_admin
+    access = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == camera_id,
+        CameraAccess.user_id == current_user.id,
+    ).first()
+
+    # (A) 被分享下來的相機（granted_by != self）：自己不是 Camera Backend 真正擁有者，
+    #     解除綁定只撤銷自己的存取，不動 Camera Backend（避免動到真正擁有者的相機）
+    if access and access.granted_by and access.granted_by != current_user.id:
+        db.delete(access)
+        db.commit()
+        return {"success": True, "message": "已移除相機存取權限"}
+
+    # (B) 自己配對的相機（granted_by == self 或無 grant）：真正呼叫 Camera Backend unbind。
+    #     token 依序：自己的 → admin fallback（涵蓋 admin-fallback 配對、無 camera_email 的情況）。
+    #     admin fallback 僅作用於「自己的相機」，不放寬到他人相機。
     cam_token = await get_camera_backend_token(current_user)
+    if not cam_token:
+        cam_token = await _get_admin_camera_token()
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
             f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}/unbind",
             headers={"Authorization": f"Bearer {cam_token}", "Content-Type": "application/json"},
             json={},
         )
+        # 自己 token 被 Camera Backend 拒（非真正擁有者）→ 用 admin fallback 再試一次
+        if resp.status_code == 403:
+            admin_tok = await _get_admin_camera_token()
+            if admin_tok and admin_tok != cam_token:
+                resp = await client.post(
+                    f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}/unbind",
+                    headers={"Authorization": f"Bearer {admin_tok}", "Content-Type": "application/json"},
+                    json={},
+                )
         if resp.status_code == 200:
+            if access:  # 同步清掉自己這筆 camera_access，避免殘留死記錄
+                db.delete(access)
+                db.commit()
             return resp.json()
         raise HTTPException(resp.status_code, resp.text)
 
