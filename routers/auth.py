@@ -17,6 +17,22 @@ CAMERA_BACKEND_URL = "https://user.symotus.com"
 import os
 CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
 
+# ── Host gate ──────────────────────────────────────────────────────────────
+ADMIN_HOSTS = {"admin.symotus.com"}
+
+def _get_host(request: Request) -> str:
+    return (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or ""
+    ).split(":")[0].lower()
+
+def _check_admin_host(host: str, role: str):
+    """admin.symotus.com 入口僅限 symotus_admin；否則 403。"""
+    if host in ADMIN_HOSTS and role != "symotus_admin":
+        raise HTTPException(status_code=403, detail="此入口僅限管理員登入")
+# ───────────────────────────────────────────────────────────────────────────
+
 async def get_camera_token(user_id: int, email: str, role: str, camera_email: Optional[str] = None) -> dict:
     """向 Camera Backend 換取 camera token"""
     try:
@@ -77,6 +93,10 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
         raise HTTPException(status_code=401, detail="帳號或密碼錯誤")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="帳號已停用")
+
+    # admin.symotus.com 入口僅限平台管理員
+    _check_admin_host(_get_host(request), user.role)
+
     access_token = create_access_token(user, db)
     refresh = create_refresh_token()
     db.add(RefreshToken(user_id=user.id, token=refresh,
@@ -158,7 +178,7 @@ def google_url(invite_token: str = None):
     return {"auth_url": f"https://accounts.google.com/o/oauth2/v2/auth?{params}", "state": state}
 
 @router.post("/google/token", response_model=TokenResponse)
-async def google_token(body: OAuthCallbackRequest, db: Session = Depends(get_db)):
+async def google_token(body: OAuthCallbackRequest, request: Request, db: Session = Depends(get_db)):
     invite_token_str = body.invite_token
     if body.state and ":" in body.state:
         _, invite_token_str = body.state.split(":", 1)
@@ -171,7 +191,8 @@ async def google_token(body: OAuthCallbackRequest, db: Session = Depends(get_db)
         r2 = await client.get("https://www.googleapis.com/oauth2/v3/userinfo",
                               headers={"Authorization": f"Bearer {td['access_token']}"})
         ui = r2.json()
-    return _oauth_finish(db, "google_id", ui["sub"], ui.get("email"), ui.get("name"), invite_token_str)
+    return _oauth_finish(db, "google_id", ui["sub"], ui.get("email"), ui.get("name"),
+                         invite_token_str, host=_get_host(request))
 
 @router.get("/line/url")
 def line_url(invite_token: str = None):
@@ -182,7 +203,7 @@ def line_url(invite_token: str = None):
     return {"auth_url": f"https://access.line.me/oauth2/v2.1/authorize?{params}", "state": state}
 
 @router.post("/line/token", response_model=TokenResponse)
-async def line_token(body: OAuthCallbackRequest, db: Session = Depends(get_db)):
+async def line_token(body: OAuthCallbackRequest, request: Request, db: Session = Depends(get_db)):
     invite_token_str = body.invite_token
     if body.state and ":" in body.state:
         _, invite_token_str = body.state.split(":", 1)
@@ -195,9 +216,10 @@ async def line_token(body: OAuthCallbackRequest, db: Session = Depends(get_db)):
         r2 = await client.get("https://api.line.me/v2/profile",
                                headers={"Authorization": f"Bearer {td['access_token']}"})
         profile = r2.json()
-    return _oauth_finish(db, "line_id", profile["userId"], td.get("email"), profile.get("displayName"), invite_token_str)
+    return _oauth_finish(db, "line_id", profile["userId"], td.get("email"), profile.get("displayName"),
+                         invite_token_str, host=_get_host(request))
 
-def _oauth_finish(db, oauth_field, oauth_id, email, full_name, invite_token_str=None):
+def _oauth_finish(db, oauth_field, oauth_id, email, full_name, invite_token_str=None, host: str = ""):
     user = db.query(User).filter_by(**{oauth_field: oauth_id}).first()
     if not user and email:
         user = db.query(User).filter(User.email == email).first()
@@ -235,6 +257,10 @@ def _oauth_finish(db, oauth_field, oauth_id, email, full_name, invite_token_str=
         db.commit(); db.refresh(user)
     if not user.is_active:
         raise HTTPException(403, "帳號已停用")
+
+    # admin.symotus.com 入口僅限平台管理員
+    _check_admin_host(host, user.role)
+
     refresh = create_refresh_token()
     db.add(RefreshToken(user_id=user.id, token=refresh,
         expires_at=datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)))
@@ -323,10 +349,11 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
 
 
 @router.get("/line/callback")
-async def line_callback(code: str, state: str = "", db: Session = Depends(get_db)):
+async def line_callback(code: str, state: str = "", request: Request = None, db: Session = Depends(get_db)):
     from fastapi.responses import RedirectResponse
     from urllib.parse import quote
     frontend = settings.FRONTEND_URL
+    host = _get_host(request) if request else ""
     try:
         invite_token_str = None
         if state and ":" in state:
@@ -348,7 +375,8 @@ async def line_callback(code: str, state: str = "", db: Session = Depends(get_db
             profile = r2.json()
 
         token_resp = _oauth_finish(db, "line_id", profile["userId"],
-                                   td.get("email"), profile.get("displayName"), invite_token_str)
+                                   td.get("email"), profile.get("displayName"),
+                                   invite_token_str, host=host)
 
         user = db.query(User).filter(User.line_id == profile["userId"]).first()
 
@@ -374,6 +402,10 @@ async def line_callback(code: str, state: str = "", db: Session = Depends(get_db
             "camera_refresh_token": camera_tokens.get("refresh_token") or None,
         })
         return RedirectResponse(f"{frontend}/auth/callback?code={code_handoff}")
+    except HTTPException as he:
+        if he.status_code == 403 and "管理員" in he.detail:
+            return RedirectResponse(f"{frontend}/login?error=admin_only")
+        return RedirectResponse(f"{frontend}/login?error=line_failed")
     except Exception as e:
         print(f"[LINE callback] unexpected error: {e}")
         return RedirectResponse(f"{frontend}/login?error=line_failed")
