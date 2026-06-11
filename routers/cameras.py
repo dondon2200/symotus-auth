@@ -242,20 +242,28 @@ async def get_thumbnails(
             params={"ids": ",".join(str(i) for i in requested_ids)},
         )
     if resp.status_code in (403, 404) or not resp.content:
-        async with httpx.AsyncClient(timeout=10) as client:
-            tok_r = await client.post(
-                f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
-            )
-        admin_tok = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
-        if admin_tok:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    f"{CAMERA_BACKEND_URL}/api/cameras/thumbnails/latest",
-                    headers={"Authorization": f"Bearer {admin_tok}"},
-                    params={"ids": ",".join(str(i) for i in requested_ids)},
+        # F-3：非 admin 僅對「有 camera_access grant 的相機」允許 admin fallback
+        if current_user.role == "symotus_admin":
+            fb_ids = requested_ids
+        else:
+            granted = {a.camera_id for a in db.query(CameraAccess).filter(
+                CameraAccess.user_id == current_user.id).all()}
+            fb_ids = [i for i in requested_ids if i in granted]
+        if fb_ids:
+            async with httpx.AsyncClient(timeout=10) as client:
+                tok_r = await client.post(
+                    f"{CAMERA_BACKEND_URL}/internal/auth/token",
+                    headers={"x-service-key": CAMERA_SERVICE_KEY},
+                    json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
                 )
+            admin_tok = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+            if admin_tok:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(
+                        f"{CAMERA_BACKEND_URL}/api/cameras/thumbnails/latest",
+                        headers={"Authorization": f"Bearer {admin_tok}"},
+                        params={"ids": ",".join(str(i) for i in fb_ids)},
+                    )
     if resp.status_code == 200:
         return resp.json()
     return {}
@@ -333,12 +341,14 @@ async def get_camera(
         CameraAccess.camera_id == camera_id,
         CameraAccess.user_id == current_user.id,
     ).first()
+    # F-3：僅當有 camera_access grant 或為 admin 時，才允許 granter/admin fallback
+    allow_fallback = (access is not None) or current_user.role == "symotus_admin"
     if not cam_token and access and access.granted_by:
         owner = db.query(User).filter(User.id == access.granted_by).first()
         if owner:
             cam_token = await get_camera_backend_token(owner)
-    # 最後 fallback admin
-    if not cam_token:
+    # 最後 fallback admin（僅 grant/admin）
+    if not cam_token and allow_fallback:
         async with httpx.AsyncClient(timeout=10) as client:
             tok_r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
@@ -347,14 +357,14 @@ async def get_camera(
             )
         cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
     if not cam_token:
-        raise HTTPException(502, "無法取得 Camera Backend token")
+        raise HTTPException(403, "無此相機的存取權限")
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
             headers={"Authorization": f"Bearer {cam_token}"},
         )
-    # 若 user token 存取失敗（相機可能屬於不同 CB 帳號），嘗試 admin fallback
-    if resp.status_code in (403, 404):
+    # 若 user token 存取失敗（相機可能屬於不同 CB 帳號），嘗試 admin fallback（僅 grant/admin）
+    if resp.status_code in (403, 404) and allow_fallback:
         async with httpx.AsyncClient(timeout=10) as client:
             tok_r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
@@ -530,21 +540,25 @@ async def nas_images(
     params = dict(request.query_params)
     camera_id = params.get("camera_id")
 
-    # 沒有自己的 token（分享用戶）→ 用 granter 的 token
-    if not cam_token and camera_id:
+    # F-3：此相機的 grant（決定是否允許 granter/admin fallback）
+    access = None
+    if camera_id:
         access = db.query(CameraAccess).filter(
             CameraAccess.user_id == current_user.id,
             CameraAccess.camera_id == int(camera_id),
         ).first()
-        if access and access.granted_by:
-            owner = db.query(User).filter(User.id == access.granted_by).first()
-            if owner:
-                cam_token = await get_camera_backend_token(owner)
+    allow_fallback = (access is not None) or current_user.role == "symotus_admin"
+
+    # 沒有自己的 token（分享用戶）→ 用 granter 的 token
+    if not cam_token and access and access.granted_by:
+        owner = db.query(User).filter(User.id == access.granted_by).first()
+        if owner:
+            cam_token = await get_camera_backend_token(owner)
 
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token")
 
-    # 預先驗證 token 是否能存取此相機，不能就換 admin token
+    # 預先驗證 token 是否能存取此相機，不能就換 admin token（僅 grant/admin 允許）
     if cam_token and camera_id:
         async with httpx.AsyncClient(timeout=8) as client:
             test_r = await client.get(
@@ -552,6 +566,8 @@ async def nas_images(
                 headers={"Authorization": f"Bearer {cam_token}"},
             )
         if test_r.status_code in (403, 404):
+            if not allow_fallback:
+                raise HTTPException(403, "無此相機的存取權限")
             # 這個 token 沒有此相機存取權，改用 admin token
             async with httpx.AsyncClient(timeout=10) as client:
                 tok_r = await client.post(
@@ -756,29 +772,25 @@ async def proxy_camera_api(
     if allowed_ids is not None and camera_id not in allowed_ids:
         raise HTTPException(403, "無此相機的存取權限")
 
+    # 此相機的 camera_access grant（供 F-5 等級檢查 與 F-3 fallback 閘 共用）
+    access = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == camera_id,
+        CameraAccess.user_id == current_user.id,
+    ).first()
+    allow_fallback = (access is not None) or current_user.role == "symotus_admin"
+
     # F-5：寫入類操作（改設定/排程/PTZ/重啟等）需「完整(full)權限」。
-    # 依此相機的 camera_access.permission_level 判定；自有相機（無 camera_access）的 reseller/admin 不受限。
-    if request.method not in ("GET", "HEAD"):
-        access = db.query(CameraAccess).filter(
-            CameraAccess.camera_id == camera_id,
-            CameraAccess.user_id == current_user.id,
-        ).first()
-        if access and access.permission_level != "full":
-            raise HTTPException(403, "此操作需要完整(full)權限")
+    if request.method not in ("GET", "HEAD") and access and access.permission_level != "full":
+        raise HTTPException(403, "此操作需要完整(full)權限")
 
     cam_token = await get_camera_backend_token(current_user)
     # 若沒有自己的 token，嘗試用 camera_access granter 的 token
-    if not cam_token:
-        access = db.query(CameraAccess).filter(
-            CameraAccess.user_id == current_user.id,
-            CameraAccess.camera_id == camera_id,
-        ).first()
-        if access and access.granted_by:
-            owner = db.query(User).filter(User.id == access.granted_by).first()
-            if owner:
-                cam_token = await get_camera_backend_token(owner)
-    # 最後 fallback 到 admin token
-    if not cam_token:
+    if not cam_token and access and access.granted_by:
+        owner = db.query(User).filter(User.id == access.granted_by).first()
+        if owner:
+            cam_token = await get_camera_backend_token(owner)
+    # 最後 fallback 到 admin token（僅 grant/admin）
+    if not cam_token and allow_fallback:
         async with httpx.AsyncClient(timeout=10) as client:
             tok_r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
@@ -797,8 +809,8 @@ async def proxy_camera_api(
             content=body,
             params=dict(request.query_params),
         )
-    # 若 user token 被拒（相機屬於不同 CB 帳號），自動換 admin token 重試
-    if resp.status_code in (403, 404):
+    # 若 user token 被拒（相機屬於不同 CB 帳號），自動換 admin token 重試（僅 grant/admin）
+    if resp.status_code in (403, 404) and allow_fallback:
         async with httpx.AsyncClient(timeout=10) as client:
             tok_r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
