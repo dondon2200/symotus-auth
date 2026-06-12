@@ -280,12 +280,21 @@ class UserCreateInternal(BaseModel):
 
 @router.post("/register")
 async def register(body: UserCreateInternal, request: Request, db: Session = Depends(get_db),
-                   x_service_key: str = Header(None)):
+                   x_service_key: str = Header(None),
+                   authorization: str = Header(None)):
     """建立帳號。
     F-1 修補：公開註冊一律需「有效邀請連結」，且角色強制 end_user（杜絕外部指定 role 提權）。
-    內部建帳號（指定 role / camera_email）需帶正確 x-service-key。
+    內部建帳號（指定 role / camera_email）需帶正確 x-service-key 或 symotus_admin JWT。
     """
     is_internal = bool(CAMERA_SERVICE_KEY) and x_service_key == CAMERA_SERVICE_KEY
+    if not is_internal and authorization:
+        try:
+            token = authorization.replace("Bearer ", "")
+            payload = decode_token(token)
+            if payload.get("role") == "symotus_admin":
+                is_internal = True
+        except Exception:
+            pass
     if not is_internal:
         _rate_limit(request, "register", 5)
 
