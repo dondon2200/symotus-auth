@@ -15,6 +15,18 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer()
 
 
+def to_backend_role(role: Optional[str]) -> str:
+    """把 Auth Service 角色字串對映成 Camera Backend 認得的角色。
+
+    Camera Backend 的角色枚舉只有 admin|manager|user（見 docs/core_API.json
+    schema UserUpdate）。我方的 `symotus_admin` 它不認得，會被當成普通 user →
+    admin-fallback token 其實拿不到 admin 權限（無法存取/刪除他人或孤兒相機，
+    回 403）。這裡把 symotus_admin → admin。reseller/end_user 維持原字串：
+    後端對非 admin 是依帳號 ownership（email→user）授權，與 role 字串無關。
+    """
+    return "admin" if role == "symotus_admin" else (role or "user")
+
+
 def hash_password(password: str) -> str:
     # bcrypt 限制 72 bytes
     return pwd_context.hash(password[:72])

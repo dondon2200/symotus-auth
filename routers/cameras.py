@@ -13,7 +13,7 @@ import httpx
 
 from database import get_db
 from models import User, CameraAccess
-from auth import get_current_user
+from auth import get_current_user, to_backend_role
 
 router = APIRouter(prefix="/cameras", tags=["cameras"])
 
@@ -38,7 +38,7 @@ async def get_camera_backend_token(user: User) -> str:
         resp = await client.post(
             f"{CAMERA_BACKEND_URL}/internal/auth/token",
             headers={"x-service-key": CAMERA_SERVICE_KEY},
-            json={"user_id": 0, "email": user.camera_email, "role": user.role},
+            json={"user_id": 0, "email": user.camera_email, "role": to_backend_role(user.role)},
         )
         if resp.status_code == 200:
             return resp.json().get("access_token", "")
@@ -65,7 +65,7 @@ async def _get_admin_camera_token() -> str:
             r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
                 headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
             )
             return r.json().get("access_token", "") if r.status_code == 200 else ""
     except Exception as e:
@@ -274,7 +274,7 @@ async def get_thumbnails(
                 tok_r = await client.post(
                     f"{CAMERA_BACKEND_URL}/internal/auth/token",
                     headers={"x-service-key": CAMERA_SERVICE_KEY},
-                    json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                    json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
                 )
             admin_tok = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
             if admin_tok:
@@ -305,7 +305,7 @@ async def create_camera(
             tok_r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
                 headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
             )
         cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
     if not cam_token:
@@ -373,7 +373,7 @@ async def get_camera(
             tok_r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
                 headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
             )
         cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
     if not cam_token:
@@ -397,7 +397,7 @@ async def get_camera(
             tok_r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
                 headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
             )
         admin_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
         if admin_token:
@@ -634,7 +634,7 @@ async def nas_images(
                     tok_r = await client.post(
                         f"{CAMERA_BACKEND_URL}/internal/auth/token",
                         headers={"x-service-key": CAMERA_SERVICE_KEY},
-                        json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                        json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
                     )
                 cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else cam_token
 
@@ -856,7 +856,7 @@ async def proxy_camera_api(
             tok_r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
                 headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
             )
         cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
     body = await request.body()
@@ -887,7 +887,7 @@ async def proxy_camera_api(
             tok_r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
                 headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
             )
         admin_tok = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
         if admin_tok:
@@ -936,7 +936,7 @@ async def create_project(
             tok_r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
                 headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"},
+                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
             )
         cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
     if not cam_token:

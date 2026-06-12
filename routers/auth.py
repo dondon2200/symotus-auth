@@ -9,7 +9,8 @@ from database import get_db
 from models import User, RefreshToken, InviteToken, CameraAccess
 from schemas import LoginRequest, TokenResponse, RefreshRequest, OAuthCallbackRequest
 from auth import (hash_password, verify_password, create_access_token,
-                  create_refresh_token, decode_token, get_current_user)
+                  create_refresh_token, decode_token, get_current_user,
+                  to_backend_role)
 from config import settings
 
 
@@ -41,7 +42,7 @@ async def get_camera_token(user_id: int, email: str, role: str, camera_email: Op
             resp = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
                 headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": user_id, "email": actual_email, "role": role},
+                json={"user_id": user_id, "email": actual_email, "role": to_backend_role(role)},
             )
             print(f"[Camera token] {actual_email} -> {resp.status_code}: {resp.text[:100]}")
             if resp.status_code == 200:

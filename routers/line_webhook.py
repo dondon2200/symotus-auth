@@ -411,7 +411,7 @@ async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: s
     async with httpx.AsyncClient(timeout=10) as cl:
         tok_r = await cl.post(f"{CAMERA_BACKEND_URL}/internal/auth/token",
             headers={"x-service-key": CAMERA_SERVICE_KEY},
-            json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"})
+            json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"})
     if not tok_r.is_success:
         await line_push(line_user_id, [{"type":"text","text":"無法取得相機授權。"}])
         return
@@ -515,7 +515,7 @@ async def line_snapshot(camera_id: int, t: int, sig: str):
     async with httpx.AsyncClient(timeout=10) as c:
         tok_r = await c.post(f"{CAMERA_BACKEND_URL}/internal/auth/token",
             headers={"x-service-key": CAMERA_SERVICE_KEY},
-            json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"})
+            json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"})
     cam_token = tok_r.json().get("access_token", "") if tok_r.is_success else ""
 
     async with httpx.AsyncClient(timeout=20) as c:

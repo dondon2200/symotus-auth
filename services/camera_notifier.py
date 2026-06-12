@@ -22,7 +22,7 @@ async def _get_admin_token() -> str:
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.post(f"{CAMERA_BACKEND_URL}/internal/auth/token",
             headers={"x-service-key": CAMERA_SERVICE_KEY},
-            json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"})
+            json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"})
         return r.json().get("access_token", "") if r.is_success else ""
 
 

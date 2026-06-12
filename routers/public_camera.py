@@ -160,7 +160,7 @@ async def live_camera_frame(camera_id: int, exp: int = 0, sig: str = "", db: Ses
     async with _httpx.AsyncClient(timeout=8) as cl:
         tok_r = await cl.post(f"{CAMERA_BACKEND_URL}/internal/auth/token",
             headers={"x-service-key": CAMERA_SERVICE_KEY},
-            json={"user_id": 0, "email": "admin@timelapse.com", "role": "symotus_admin"})
+            json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"})
     admin_tok = tok_r.json().get("access_token","") if tok_r.status_code == 200 else ""
     
     stream_name = None
