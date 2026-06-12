@@ -311,6 +311,14 @@ async def create_camera(
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token，請確認 camera_email 設定")
     used_admin_fallback = not current_user.camera_email
+    # LINE 合成 email 的帳號在 list_cameras 會被「只信任 camera_access」的安全過濾擋下
+    # （見 list_cameras 的 is_line_email 區塊）。因此即使用自己的 token 配對成功，
+    # 也必須補一筆 camera_access，否則自己配對的相機不會出現在首頁。
+    is_line_email = bool(
+        current_user.camera_email
+        and current_user.camera_email.startswith("line_")
+        and current_user.camera_email.endswith("@symotus.com")
+    )
     body = await request.body()
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
@@ -323,8 +331,10 @@ async def create_camera(
         except Exception:
             return JSONResponse(status_code=resp.status_code, content={"detail": resp.text})
 
-    # 若用 admin fallback 配對，自動幫 reseller 建立 camera_access（full 權限）
-    if resp.status_code in (200, 201) and used_admin_fallback and current_user.role == "reseller":
+    # 自動幫 reseller 建立 camera_access（full 權限）：
+    # - admin fallback 配對（無 camera_email）→ 沒有後端帳號，靠 camera_access 才看得到
+    # - LINE 合成 email reseller → 會被 list_cameras 的 LINE 安全過濾擋下，同樣需要 grant
+    if resp.status_code in (200, 201) and current_user.role == "reseller" and (used_admin_fallback or is_line_email):
         camera_id = resp_data.get("id") or resp_data.get("basic_info", {}).get("id")
         if camera_id:
             existing = db.query(CameraAccess).filter(
