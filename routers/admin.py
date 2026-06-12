@@ -3,10 +3,21 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import User, CameraAccess, TechSupportGrant
 from schemas import UserResponse
-from auth import require_role
+from auth import require_role, decode_token
 from datetime import datetime
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+def _is_admin(x_service_key: str, authorization: str) -> bool:
+    if bool(CAMERA_SERVICE_KEY) and x_service_key == CAMERA_SERVICE_KEY:
+        return True
+    if authorization:
+        try:
+            payload = decode_token(authorization.replace("Bearer ", ""))
+            return payload.get("role") == "symotus_admin"
+        except Exception:
+            pass
+    return False
 
 @router.get("/resellers")
 def list_resellers(
@@ -102,10 +113,11 @@ def get_camera_access(
 @router.get("/users")
 def list_all_users(
     x_service_key: str = Header(None),
+    authorization: str = Header(None),
     db: Session = Depends(get_db),
 ):
-    """列出所有用戶（service key 保護）"""
-    if x_service_key != CAMERA_SERVICE_KEY:
+    """列出所有用戶（service key 或 symotus_admin JWT 保護）"""
+    if not _is_admin(x_service_key, authorization):
         raise HTTPException(status_code=403, detail="Invalid service key")
     users = db.query(User).all()
     return [{"id": u.id, "username": u.username, "email": u.email,
@@ -117,10 +129,11 @@ def update_user_admin(
     user_id: int,
     body: dict,
     x_service_key: str = Header(None),
+    authorization: str = Header(None),
     db: Session = Depends(get_db),
 ):
-    """更新用戶屬性：camera_email、role、is_active（service key 保護）"""
-    if x_service_key != CAMERA_SERVICE_KEY:
+    """更新用戶屬性：camera_email、role、is_active（service key 或 symotus_admin JWT 保護）"""
+    if not _is_admin(x_service_key, authorization):
         raise HTTPException(status_code=403, detail="Invalid service key")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
