@@ -14,7 +14,7 @@ def _is_admin(x_service_key: str, authorization: str) -> bool:
     if authorization:
         try:
             payload = decode_token(authorization.replace("Bearer ", ""))
-            return payload.get("role") == "symotus_admin"
+            return payload.role == "symotus_admin"
         except Exception:
             pass
     return False
