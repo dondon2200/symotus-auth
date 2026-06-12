@@ -151,6 +151,40 @@ def update_user_admin(
             "role": user.role, "camera_email": user.camera_email,
             "camera_user_id": user.camera_user_id, "is_active": user.is_active}
 
+
+@router.post("/camera-access")
+def add_camera_access(
+    body: dict,
+    x_service_key: str = Header(None),
+    authorization: str = Header(None),
+    db: Session = Depends(get_db),
+):
+    """手動新增 camera_access 記錄（admin 用）"""
+    if not _is_admin(x_service_key, authorization):
+        raise HTTPException(status_code=403, detail="Invalid service key")
+    camera_id = body.get("camera_id")
+    user_id = body.get("user_id")
+    granted_by = body.get("granted_by", user_id)
+    permission_level = body.get("permission_level", "full")
+    if not camera_id or not user_id:
+        raise HTTPException(status_code=400, detail="camera_id and user_id required")
+    existing = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == camera_id,
+        CameraAccess.user_id == user_id,
+    ).first()
+    if existing:
+        return {"status": "already_exists", "id": existing.id}
+    access = CameraAccess(
+        camera_id=camera_id,
+        user_id=user_id,
+        granted_by=granted_by,
+        permission_level=permission_level,
+    )
+    db.add(access)
+    db.commit()
+    db.refresh(access)
+    return {"status": "created", "id": access.id, "camera_id": camera_id, "user_id": user_id}
+
 @router.post("/migrate/add-camera-user-id")
 def migrate_add_camera_user_id(
     x_service_key: str = Header(None),
