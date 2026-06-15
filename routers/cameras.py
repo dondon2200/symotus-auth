@@ -353,7 +353,7 @@ async def create_camera(
     return JSONResponse(status_code=resp.status_code, content=resp_data)
 
 
-@router.get("/{camera_id}")
+@router.get("/{camera_id:int}")  # :int 轉換器，避免 /projects 等字面路徑被當成 camera_id 而 422
 async def get_camera(
     camera_id: int,
     current_user: User = Depends(get_current_user),
