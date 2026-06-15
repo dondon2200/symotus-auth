@@ -827,17 +827,19 @@ async def nas_image(
         )
 
 
+@router.api_route("/{camera_id:int}", methods=["PUT", "PATCH"])  # bare /cameras/{id} 寫入（如改名）
 @router.api_route("/{camera_id}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_camera_api(
     camera_id: int,
-    path: str,
     request: Request,
+    path: str = "",
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     通用 proxy：所有其他相機 API（設定、排程等）
     先驗證權限，再轉發到 Camera Backend
+    path 為空時轉發到 /api/cameras/{id} 本體（如更新相機名稱）。
     """
     allowed_ids = get_allowed_camera_ids(current_user, db)
     if allowed_ids is not None and camera_id not in allowed_ids:
@@ -871,11 +873,12 @@ async def proxy_camera_api(
         cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
     body = await request.body()
     headers = {"Authorization": f"Bearer {cam_token}", "Content-Type": "application/json"}
+    target_url = f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}" + (f"/{path}" if path else "")
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.request(
             method=request.method,
-            url=f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}/{path}",
+            url=target_url,
             headers=headers,
             content=body,
             params=dict(request.query_params),
@@ -887,7 +890,7 @@ async def proxy_camera_api(
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.request(
                     method=request.method,
-                    url=f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}/{path}",
+                    url=target_url,
                     headers={"Authorization": f"Bearer {gtok}", "Content-Type": "application/json"},
                     content=body,
                     params=dict(request.query_params),
@@ -904,7 +907,7 @@ async def proxy_camera_api(
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.request(
                     method=request.method,
-                    url=f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}/{path}",
+                    url=target_url,
                     headers={"Authorization": f"Bearer {admin_tok}", "Content-Type": "application/json"},
                     content=body,
                     params=dict(request.query_params),
