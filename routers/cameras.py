@@ -603,6 +603,58 @@ async def unbind_camera(
         raise HTTPException(resp.status_code, resp.text)
 
 
+@router.delete("/{camera_id:int}")  # 隱藏的永久刪除（前端只在 ?joseph 時顯示按鈕）
+async def delete_camera(
+    camera_id: int,
+    confirm: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    永久刪除相機（破壞性，無法復原）。
+    安全閘：
+    1. 僅 reseller / symotus_admin（end_user 一律拒）。
+    2. 需 ?confirm=true，防誤觸。
+    3. 只用「使用者自己的」真實 Camera Backend token（user_id=0 + 本人 email）；
+       不做 granter / admin fallback —— 不是自己擁有的相機 Camera Backend 會回 403，
+       藉此天然限制成「只能刪自己擁有的相機」，杜絕用他人 token 越權刪除。
+       （刻意避開 camera-delete-backend-500 雷區：不使用 admin@timelapse user_id=0 token。）
+    """
+    if current_user.role not in ("reseller", "symotus_admin"):
+        raise HTTPException(403, "僅系統管理員或相機擁有者可刪除相機")
+    if not confirm:
+        raise HTTPException(400, "需帶 ?confirm=true 才會真正刪除")
+
+    # 被分享下來的相機（granter != self）不得刪除，只能解除綁定
+    access = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == camera_id,
+        CameraAccess.user_id == current_user.id,
+    ).first()
+    if access and access.granted_by and access.granted_by != current_user.id:
+        raise HTTPException(403, "此相機為他人分享，僅能解除綁定，無法刪除")
+
+    cam_token = await get_camera_backend_token(current_user)
+    if not cam_token:
+        raise HTTPException(403, "無法取得可刪除此相機的有效憑證")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.delete(
+            f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
+            headers={"Authorization": f"Bearer {cam_token}"},
+        )
+    logger.warning(
+        "CAMERA_DELETE user=%s role=%s camera=%s status=%s",
+        current_user.id, current_user.role, camera_id, resp.status_code,
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(resp.status_code, resp.text)
+
+    # 清掉所有殘留的 camera_access，避免死記錄
+    db.query(CameraAccess).filter(CameraAccess.camera_id == camera_id).delete()
+    db.commit()
+    return {"success": True, "camera_id": camera_id}
+
+
 # ── NAS Images proxy ───────────────────────────────────────────────────────────
 
 @router.get("/nas/images")
