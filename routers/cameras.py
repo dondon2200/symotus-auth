@@ -122,7 +122,22 @@ async def fetch_camera_detail(camera_id: int, owner: Optional[User], admin_holde
                 )
             if r.status_code == 200:
                 raw = r.json()
-                return raw.get("basic_info", raw)  # 攤平 detail 格式
+                cam = raw.get("basic_info", raw)  # 攤平 detail 格式
+                # 補抓電量資料（basic_info 不含電量欄位，需從 /battery 取得）
+                try:
+                    async with httpx.AsyncClient(timeout=5) as bc:
+                        br = await bc.get(
+                            f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}/battery",
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                    if br.status_code == 200:
+                        battery_data = br.json()
+                        for bk in ("last_battery_pct", "last_battery_status", "battery_updated_at"):
+                            if bk in battery_data:
+                                cam[bk] = battery_data[bk]
+                except Exception as be:
+                    logger.debug("fetch battery %s via %s token error: %s", camera_id, label, be)
+                return cam
             logger.warning("fetch camera %s via %s token -> HTTP %s", camera_id, label, r.status_code)
         except Exception as e:
             logger.warning("fetch camera %s via %s token error: %s", camera_id, label, e)
