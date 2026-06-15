@@ -239,7 +239,11 @@ def _oauth_finish(db, oauth_field, oauth_id, email, full_name, invite_token_str=
                 raise HTTPException(400, "邀請連結無效或已過期")
             if invite.email and invite.email != email:
                 raise HTTPException(400, "此邀請連結限定特定 Email 使用")
-            role = "end_user"
+            # 角色依邀請指定；「reseller」需再確認發邀請者為 platform admin（縱深防禦）
+            if invite.intended_role == "reseller":
+                inviter = db.query(User).filter(User.id == invite.reseller_id).first()
+                if inviter and inviter.role == "symotus_admin":
+                    role = "reseller"
             reseller_id = invite.reseller_id
         base = (email or "").split("@")[0] or oauth_id[:8]
         username = base
@@ -251,6 +255,11 @@ def _oauth_finish(db, oauth_field, oauth_id, email, full_name, invite_token_str=
         setattr(user, oauth_field, oauth_id)
         db.add(user); db.flush()
         if invite:
+            # 預綁 Camera Backend 帳號（reseller 邀請）：接受者一登入即可換 camera token
+            if invite.camera_email:
+                user.camera_email = invite.camera_email
+            if invite.camera_user_id:
+                user.camera_user_id = invite.camera_user_id
             if invite.camera_ids:
                 for cam_id in invite.camera_ids:
                     db.add(CameraAccess(camera_id=cam_id, user_id=user.id, granted_by=invite.reseller_id))
@@ -314,6 +323,13 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
         if invite.email and invite.email != body.email:
             raise HTTPException(400, "此邀請連結限定特定 Email 使用")
 
+    # 公開邀請路徑：角色依邀請指定（「reseller」需發邀請者為 platform admin）
+    invite_role = "end_user"
+    if invite and invite.intended_role == "reseller":
+        inviter = db.query(User).filter(User.id == invite.reseller_id).first()
+        if inviter and inviter.role == "symotus_admin":
+            invite_role = "reseller"
+
     existing = db.query(User).filter(
         (User.username == body.username) | (User.email == body.email)
     ).first()
@@ -325,10 +341,10 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
         email=body.email,
         full_name=body.full_name,
         hashed_password=hash_password(body.password),
-        role=body.role if is_internal else "end_user",
+        role=body.role if is_internal else invite_role,
         is_active=True,
         reseller_id=invite.reseller_id if invite else None,
-        camera_email=body.camera_email if is_internal else None,
+        camera_email=(body.camera_email if is_internal else (invite.camera_email if invite else None)),
     )
     db.add(user)
     db.commit()
@@ -336,6 +352,8 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
 
     # 邀請帶相機 → 建立 camera_access（與 OAuth _oauth_finish 行為一致；同時修掉 email 邀請註冊不掛相機的舊 bug）
     if invite:
+        if invite.camera_user_id:
+            user.camera_user_id = invite.camera_user_id
         if invite.camera_ids:
             for cam_id in invite.camera_ids:
                 db.add(CameraAccess(camera_id=cam_id, user_id=user.id, granted_by=invite.reseller_id))

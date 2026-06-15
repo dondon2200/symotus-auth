@@ -16,10 +16,27 @@ def create_invite(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("reseller", "symotus_admin"))
 ):
+    # 角色把關：只有 symotus_admin 能發「reseller」邀請；其餘一律 end_user。
+    # camera_email/camera_user_id 僅在 reseller 邀請（且由 admin 發）時預綁。
+    intended_role = "end_user"
+    camera_email = None
+    camera_user_id = None
+    if body.intended_role == "reseller":
+        if current_user.role != "symotus_admin":
+            raise HTTPException(403, "只有平台管理員能發出 reseller 邀請")
+        intended_role = "reseller"
+        camera_email = body.camera_email
+        camera_user_id = body.camera_user_id
+    elif body.intended_role not in ("end_user", None, ""):
+        raise HTTPException(400, "intended_role 僅能是 end_user 或 reseller")
+
     invite = InviteToken(
         reseller_id=current_user.id,
         camera_ids=body.camera_ids,
         email=body.email,
+        intended_role=intended_role,
+        camera_email=camera_email,
+        camera_user_id=camera_user_id,
         expires_at=datetime.utcnow() + timedelta(hours=body.expires_hours),
     )
     db.add(invite); db.commit(); db.refresh(invite)

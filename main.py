@@ -132,6 +132,19 @@ async def startup():
                     except Exception:
                         conn.rollback()
 
+            # 補上 invite_tokens 的角色 + 預綁 Camera Backend 帳號欄位
+            with engine.connect() as conn:
+                for stmt in [
+                    "ALTER TABLE invite_tokens ADD COLUMN IF NOT EXISTS intended_role VARCHAR NOT NULL DEFAULT 'end_user'",
+                    "ALTER TABLE invite_tokens ADD COLUMN IF NOT EXISTS camera_email VARCHAR",
+                    "ALTER TABLE invite_tokens ADD COLUMN IF NOT EXISTS camera_user_id INTEGER",
+                ]:
+                    try:
+                        conn.execute(text(stmt))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+
             logger.info("DB connected and tables created!")
             # 啟動相機開機 LINE 推播背景工作
             from services.camera_notifier import start_camera_notifier

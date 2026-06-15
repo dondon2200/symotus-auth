@@ -63,6 +63,11 @@ class InviteToken(Base):
     reseller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     camera_ids = Column(ARRAY(Integer), nullable=True)  # 邀請時預先分配的相機，null = 不預分配
     email = Column(String, nullable=True)  # 限定 email，null = 任何人都可以用
+    # 接受邀請後賦予的角色（預設 end_user；僅 symotus_admin 發的邀請可指定 reseller）
+    intended_role = Column(String, nullable=False, default="end_user")
+    # reseller 邀請時預綁定的 Camera Backend 帳號（讓接受者一登入就能取 camera token、管理相機）
+    camera_email = Column(String, nullable=True)
+    camera_user_id = Column(Integer, nullable=True)
     status = Column(String, nullable=False, default="pending")  # pending | accepted | expired | revoked
     expires_at = Column(DateTime, nullable=False)
     accepted_by = Column(Integer, ForeignKey("users.id"), nullable=True)
