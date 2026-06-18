@@ -1,21 +1,26 @@
 """
 背景工作：每 5 分鐘檢查相機狀態，開機時推 LINE 通知
 """
-import asyncio, logging, httpx, os
+import asyncio, logging, httpx, os, time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
 from database import SessionLocal
 from models import User, CameraAccess
 
 logger = logging.getLogger(__name__)
 
+TW_TZ = ZoneInfo("Asia/Taipei")   # 容器跑 UTC，顯示時間一律轉台北時間
+
 CAMERA_BACKEND_URL = "https://user.symotus.com"
 CAMERA_SERVICE_KEY = os.getenv("CAMERA_SERVICE_KEY", "")
 LINE_ACCESS_TOKEN  = os.getenv("LINE_ACCESS_TOKEN", "")
 FRONTEND_URL       = os.getenv("FRONTEND_URL", "https://user.symotus.com")
-CHECK_INTERVAL     = 60   # 1 分鐘
+CHECK_INTERVAL     = 60          # 每 60 秒輪詢一次
+NOTIFY_COOLDOWN    = 6 * 3600    # 同一台相機 6 小時內不重複推播（防連線抖動洗版）
 
 _prev_status: dict[int, bool] = {}
+_last_notified: dict[int, float] = {}   # cam_id -> 上次推播的 epoch 秒
 
 
 async def _get_admin_token() -> str:
@@ -61,7 +66,7 @@ async def send_line_push(line_user_id: str, camera_id: int, camera_name: str):
                         {"type": "text", "text": camera_name, "weight": "bold", "size": "xl"},
                         {"type": "text", "text": "已成功開機上線，可開始拍照",
                          "size": "sm", "color": "#666666", "wrap": True},
-                        {"type": "text", "text": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        {"type": "text", "text": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M"),
                          "size": "xs", "color": "#aaaaaa"}
                     ]
                 },
@@ -122,16 +127,24 @@ async def check_and_notify():
     cameras = await get_camera_list()
     if not cameras:
         return
+    now = time.time()
     db = SessionLocal()
     try:
         for cam in cameras:
             cam_id = cam.get("id")
-            is_online = cam.get("online_status", False)
-            if _prev_status.get(cam_id) is False and is_online:
-                cam_name = cam.get("name", f"相機 {cam_id}")
-                logger.info(f"{cam_name} came online → pushing LINE")
-                for lid in get_notify_line_ids(cam_id, db):
-                    await send_line_push(lid, cam_id, cam_name)
+            is_online = bool(cam.get("online_status", False))   # 正規化：避免 0/None 與 False 比較落差
+            was_online = _prev_status.get(cam_id)
+            if was_online is False and is_online:
+                # 冷卻窗：同一台相機短時間連線抖動不重複推播
+                last = _last_notified.get(cam_id, 0)
+                if now - last < NOTIFY_COOLDOWN:
+                    logger.info(f"camera {cam_id} came online but within cooldown, skip push")
+                else:
+                    cam_name = cam.get("name", f"相機 {cam_id}")
+                    logger.info(f"{cam_name} came online → pushing LINE")
+                    for lid in get_notify_line_ids(cam_id, db):
+                        await send_line_push(lid, cam_id, cam_name)
+                    _last_notified[cam_id] = now
             _prev_status[cam_id] = is_online
     finally:
         db.close()
@@ -142,7 +155,7 @@ async def start_camera_notifier():
     logger.info("Camera notifier starting...")
     cameras = await get_camera_list()
     for cam in cameras:
-        _prev_status[cam.get("id")] = cam.get("online_status", False)
+        _prev_status[cam.get("id")] = bool(cam.get("online_status", False))
     logger.info(f"Watching {len(_prev_status)} cameras")
     while True:
         await asyncio.sleep(CHECK_INTERVAL)

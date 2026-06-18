@@ -4,7 +4,10 @@ LINE Messaging API Webhook
 """
 import hmac, hashlib, base64, json, asyncio, os
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Request, HTTPException, Depends
+
+TW_TZ = ZoneInfo("Asia/Taipei")   # 容器跑 UTC，「今天日期」需轉台北時間
 from sqlalchemy.orm import Session
 import httpx
 
@@ -57,7 +60,7 @@ LINE 版限制（說「請開啟網頁操作」）：
 - 繁體中文，簡潔有力
 - 不要使用 Markdown 語法（不要用 ![](...)、**粗體** 等）
 - 照片由系統另外傳送，文字回應不需要包含圖片連結
-- 今天日期：""" + datetime.now().strftime("%Y-%m-%d")
+- 今天日期：""" + datetime.now(TW_TZ).strftime("%Y-%m-%d")
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
 # ── 對話記憶（per user, 30 分鐘無互動自動清除）────────────────────────────────
@@ -168,7 +171,7 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
     if name == "get_recent_photos":
         cam_id = args["camera_id"]; date = args.get("date", "")
         from datetime import timedelta
-        end = date or datetime.now().strftime("%Y-%m-%d")
+        end = date or datetime.now(TW_TZ).strftime("%Y-%m-%d")
         start = (datetime.strptime(end, "%Y-%m-%d") - timedelta(days=6)).strftime("%Y-%m-%d")
         qs = f"camera_id={cam_id}&limit=1&offset=0&start_time={start}T00:00:00&end_time={end}T23:59:59"
         async with httpx.AsyncClient(timeout=30) as c:
