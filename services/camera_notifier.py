@@ -1,7 +1,12 @@
 """
-背景工作：每 5 分鐘檢查相機狀態，開機時推 LINE 通知
+背景工作：每 60 秒檢查相機狀態，每次「開機上線」推 LINE 通知。
+
+相機多為排程式定時開關機（例：08:00-20:00 每 15 分鐘開機一次、每次約數分鐘），
+因此每一次真正的開機都應通知。為避免單次開機 session 內因心跳抖動造成的
+瞬間 online→offline→online 重複通知，採「離線確認」機制：相機要連續離線達
+OFFLINE_CONFIRM_POLLS 次輪詢才視為「真的關機」，才為下一次開機重新武裝。
 """
-import asyncio, logging, httpx, os, time
+import asyncio, logging, httpx, os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
@@ -16,11 +21,13 @@ CAMERA_BACKEND_URL = "https://user.symotus.com"
 CAMERA_SERVICE_KEY = os.getenv("CAMERA_SERVICE_KEY", "")
 LINE_ACCESS_TOKEN  = os.getenv("LINE_ACCESS_TOKEN", "")
 FRONTEND_URL       = os.getenv("FRONTEND_URL", "https://user.symotus.com")
-CHECK_INTERVAL     = 60          # 每 60 秒輪詢一次
-NOTIFY_COOLDOWN    = 6 * 3600    # 同一台相機 6 小時內不重複推播（防連線抖動洗版）
+CHECK_INTERVAL        = 60   # 每 60 秒輪詢一次
+OFFLINE_CONFIRM_POLLS = 3    # 連續離線 N 次輪詢(≈3 分鐘)才視為「真的關機」，可再為下次開機通知
 
-_prev_status: dict[int, bool] = {}
-_last_notified: dict[int, float] = {}   # cam_id -> 上次推播的 epoch 秒
+# 每台相機是否已為「本次開機」發過通知（True=已發、不再重發；離線確認後重置為 False）
+_notified: dict[int, bool] = {}
+# 連續離線輪詢次數；達 OFFLINE_CONFIRM_POLLS 才確認關機並重新武裝
+_offline_streak: dict[int, int] = {}
 
 
 async def _get_admin_token() -> str:
@@ -123,40 +130,42 @@ def get_notify_line_ids(camera_id: int, db: Session) -> list[str]:
 
 
 async def check_and_notify():
-    global _prev_status
     cameras = await get_camera_list()
     if not cameras:
         return
-    now = time.time()
     db = SessionLocal()
     try:
         for cam in cameras:
             cam_id = cam.get("id")
             is_online = bool(cam.get("online_status", False))   # 正規化：避免 0/None 與 False 比較落差
-            was_online = _prev_status.get(cam_id)
-            if was_online is False and is_online:
-                # 冷卻窗：同一台相機短時間連線抖動不重複推播
-                last = _last_notified.get(cam_id, 0)
-                if now - last < NOTIFY_COOLDOWN:
-                    logger.info(f"camera {cam_id} came online but within cooldown, skip push")
-                else:
+            if is_online:
+                if not _notified.get(cam_id, False):
+                    # 本次開機尚未通知過 → 推播一次
                     cam_name = cam.get("name", f"相機 {cam_id}")
-                    logger.info(f"{cam_name} came online → pushing LINE")
+                    logger.info(f"{cam_name} booted online → pushing LINE")
                     for lid in get_notify_line_ids(cam_id, db):
                         await send_line_push(lid, cam_id, cam_name)
-                    _last_notified[cam_id] = now
-            _prev_status[cam_id] = is_online
+                    _notified[cam_id] = True
+                _offline_streak[cam_id] = 0
+            else:
+                # 連續離線達門檻才確認「真的關機」，為下次開機重新武裝
+                _offline_streak[cam_id] = _offline_streak.get(cam_id, 0) + 1
+                if _offline_streak[cam_id] >= OFFLINE_CONFIRM_POLLS:
+                    _notified[cam_id] = False
     finally:
         db.close()
 
 
 async def start_camera_notifier():
-    """初始化狀態快取，然後每 5 分鐘檢查一次"""
+    """初始化狀態快取，然後每 60 秒檢查一次"""
     logger.info("Camera notifier starting...")
     cameras = await get_camera_list()
     for cam in cameras:
-        _prev_status[cam.get("id")] = bool(cam.get("online_status", False))
-    logger.info(f"Watching {len(_prev_status)} cameras")
+        cid = cam.get("id")
+        online = bool(cam.get("online_status", False))
+        _notified[cid] = online                                   # 啟動時已在線者不補通知
+        _offline_streak[cid] = 0 if online else OFFLINE_CONFIRM_POLLS  # 已離線者立即武裝
+    logger.info(f"Watching {len(_notified)} cameras")
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
         try:
