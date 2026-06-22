@@ -244,23 +244,35 @@ class _TokenManager:
             return self._access_token
 
 
-async def _list_drive_images(token_mgr: "_TokenManager", folder_id: str, max_images: Optional[int] = None) -> list[dict]:
-    """用消費者授權列出資料夾內的圖片（drive.file scope，Picker 選到的資料夾可列舉子項）。"""
-    files: list[dict] = []
-    page_token = None
-    limit = max_images or 100000
+async def _list_drive_images(token_mgr: "_TokenManager", folder_id: str,
+                             max_images: Optional[int] = None,
+                             _seen: Optional[set] = None, _depth: int = 0) -> list[dict]:
+    """用消費者授權遞迴列出資料夾內所有圖片（drive.readonly scope）。
 
+    遞迴展開子資料夾（最深 8 層），含 Shared Drive，以 file id 去重避免捷徑重複計算。
+    """
+    if _depth > 8:
+        return []
+    if _seen is None:
+        _seen = set()
+
+    images: list[dict] = []
+    limit = max_images or 100_000
+    FOLDER_MIME = "application/vnd.google-apps.folder"
+    base_params = {
+        "q": f"'{folder_id}' in parents and trashed=false",
+        "fields": "nextPageToken,files(id,name,mimeType,size,shortcutDetails)",
+        "pageSize": "1000",
+        "orderBy": "name",
+        "supportsAllDrives": "true",
+        "includeItemsFromAllDrives": "true",
+    }
+
+    page_token = None
     async with httpx.AsyncClient(timeout=30) as client:
-        while len(files) < limit:
+        while len(images) < limit:
             access = await token_mgr.get()
-            params = {
-                "q": f"'{folder_id}' in parents and mimeType contains 'image/' and trashed=false",
-                "fields": "nextPageToken,files(id,name,mimeType,size)",
-                "pageSize": 1000,
-                "orderBy": "name",
-                "supportsAllDrives": "true",
-                "includeItemsFromAllDrives": "true",
-            }
+            params = {**base_params}
             if page_token:
                 params["pageToken"] = page_token
 
@@ -273,12 +285,31 @@ async def _list_drive_images(token_mgr: "_TokenManager", folder_id: str, max_ima
                 raise HTTPException(400, f"無法列出資料夾內容（{resp.status_code}）：{resp.text[:200]}")
 
             data = resp.json()
-            files.extend(data.get("files", []))
+            for f in data.get("files", []):
+                mime = f.get("mimeType", "")
+                fid = f["id"]
+
+                # 展開捷徑：取真實目標 id／mimeType
+                if mime == "application/vnd.google-apps.shortcut":
+                    sd = f.get("shortcutDetails", {})
+                    fid = sd.get("targetId", fid)
+                    mime = sd.get("targetMimeType", "")
+
+                if fid in _seen:
+                    continue
+                _seen.add(fid)
+
+                if mime == FOLDER_MIME:
+                    sub = await _list_drive_images(token_mgr, fid, limit - len(images), _seen, _depth + 1)
+                    images.extend(sub)
+                elif mime.startswith("image/"):
+                    images.append({"id": fid, "name": f["name"], "mimeType": mime})
+
             page_token = data.get("nextPageToken")
             if not page_token:
                 break
 
-    return files[:limit]
+    return images[:limit]
 
 
 def _write_file(path: str, data: bytes):
@@ -374,9 +405,10 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
                                    initial_expires_in: int = 0, duration_seconds: Optional[int] = None):
     """背景任務：用消費者自己的 Drive 授權並發下載 → NAS → Spark /jobs/nas。
 
-    下載清單 = 個別選取的照片（picked_files）+ 各選取資料夾列出的照片（依 id 去重）。
-    走 Drive API v3 files.get?alt=media（per-user 配額、不限速、不跳病毒掃描頁），並發
-    DOWNLOAD_CONCURRENCY 路；token 到期用 refresh token 自動續期。NAS→Spark 段沿用。
+    下載清單 = 個別選取的照片（picked_files）+ 各選取資料夾遞迴展開的照片（drive.readonly，含
+    子資料夾、Shared Drive、捷徑，依 id 去重）。
+    走 Drive API v3 files.get?alt=media（per-user 配額、不限速），並發 DOWNLOAD_CONCURRENCY 路；
+    token 到期用 refresh token 自動續期。NAS→Spark 段沿用。
     """
     from database import SessionLocal
     db = SessionLocal()
