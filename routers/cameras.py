@@ -837,6 +837,22 @@ async def nas_images(
                     break
                 for f in files:
                     f["date"] = date_str
+                    # 從 image_url 解析時間（檔名格式通常為 HHMMSS.jpg）
+                    if "image_url" in f and not f.get("taken_at"):
+                        try:
+                            import re as _re
+                            img = f["image_url"]
+                            # 嘗試從路徑或 query string 中取出 6 位數字
+                            m = _re.search(r"[/=](\d{6})\.jpe?g", img, _re.IGNORECASE)
+                            if not m:
+                                m = _re.search(r"(\d{6})\.jpe?g", img, _re.IGNORECASE)
+                            if m:
+                                t = m.group(1)
+                                hh, mm, ss = int(t[0:2]), int(t[2:4]), int(t[4:6])
+                                if hh < 24 and mm < 60 and ss < 60:
+                                    f["taken_at"] = f"{date_str}T{t[0:2]}:{t[2:4]}:{t[4:6]}"
+                        except Exception:
+                            pass
                 collected.extend(files)
                 folder_offset += len(files)
                 need -= len(files)
