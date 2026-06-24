@@ -269,14 +269,16 @@ async def get_thumbnails(
         return {}
 
     cam_token = await get_camera_backend_token(current_user)
-    # 若 user token 被拒，改用 admin token（相機可能屬於不同 CB 帳號）
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            f"{CAMERA_BACKEND_URL}/api/cameras/thumbnails/latest",
-            headers={"Authorization": f"Bearer {cam_token}"},
-            params={"ids": ",".join(str(i) for i in requested_ids)},
-        )
-    if resp.status_code in (403, 404) or not resp.content:
+    # end_user 沒有 camera_email → cam_token 為空 → 直接走 admin fallback，省掉一次 401 round-trip
+    resp = None
+    if cam_token:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{CAMERA_BACKEND_URL}/api/cameras/thumbnails/latest",
+                headers={"Authorization": f"Bearer {cam_token}"},
+                params={"ids": ",".join(str(i) for i in requested_ids)},
+            )
+    if not cam_token or resp is None or resp.status_code != 200 or not resp.content:
         # F-3：非 admin 僅對「有 camera_access grant 的相機」允許 admin fallback
         if current_user.role == "symotus_admin":
             fb_ids = requested_ids
