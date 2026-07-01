@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Header, Request
+from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -196,10 +196,14 @@ async def google_token(body: OAuthCallbackRequest, request: Request, db: Session
                          invite_token_str, host=_get_host(request))
 
 @router.get("/line/url")
-def line_url(invite_token: str = None):
+def line_url(response: Response, invite_token: str = None):
     state = secrets.token_urlsafe(16)
     if invite_token:
         state = f"{state}:{invite_token}"
+    # 綁定 state 到短效 HttpOnly cookie，/line/callback 比對以防 CSRF。
+    # SameSite=Lax 才會在 LINE 導回（top-level GET）時帶上此 cookie。
+    response.set_cookie("line_oauth_state", state, max_age=600,
+                        httponly=True, secure=True, samesite="lax", path="/")
     params = f"response_type=code&client_id={settings.LINE_CLIENT_ID}&redirect_uri={settings.LINE_REDIRECT_URI}&state={state}&scope=profile openid email"
     return {"auth_url": f"https://access.line.me/oauth2/v2.1/authorize?{params}", "state": state}
 
@@ -382,6 +386,12 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
     from urllib.parse import quote
     frontend = settings.FRONTEND_URL
     host = _get_host(request) if request else ""
+    # round-trip 驗證：LINE 回傳的 state 必須等於 /line/url 時寫入 cookie 的值
+    saved_state = request.cookies.get("line_oauth_state") if request else None
+    if not state or not saved_state or not secrets.compare_digest(state, saved_state):
+        resp = RedirectResponse(f"{frontend}/login?error=state_mismatch")
+        resp.delete_cookie("line_oauth_state", path="/")
+        return resp
     try:
         invite_token_str = None
         if state and ":" in state:
@@ -429,7 +439,9 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
             "camera_access_token": camera_tokens.get("access_token") or None,
             "camera_refresh_token": camera_tokens.get("refresh_token") or None,
         })
-        return RedirectResponse(f"{frontend}/auth/callback?code={code_handoff}")
+        resp = RedirectResponse(f"{frontend}/auth/callback?code={code_handoff}")
+        resp.delete_cookie("line_oauth_state", path="/")
+        return resp
     except HTTPException as he:
         if he.status_code == 403 and "管理員" in he.detail:
             return RedirectResponse(f"{frontend}/login?error=admin_only")
