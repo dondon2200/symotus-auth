@@ -74,6 +74,29 @@ def decode_token(token: str) -> TokenPayload:
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+
+def create_line_bind_token(user_id: int) -> str:
+    """短效簽章 ticket：讓已登入用戶把 LINE 帳號綁到「當前這個 user」。
+    夾帶在 LINE OAuth 的 state 裡經 callback 帶回，10 分鐘有效。"""
+    payload = {
+        "sub": str(user_id),
+        "purpose": "line_bind",
+        "exp": datetime.utcnow() + timedelta(minutes=10),
+    }
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_line_bind_token(token: str) -> Optional[int]:
+    """驗證綁定 ticket，回傳 user_id；無效/過期/用途不符回 None。"""
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        if payload.get("purpose") != "line_bind":
+            return None
+        return int(payload["sub"])
+    except Exception:
+        return None
+
+
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     db: Session = Depends(get_db),

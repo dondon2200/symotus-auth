@@ -450,58 +450,76 @@ async def get_camera(
     return data
 
 
+# ── 開機通知共用邏輯 ──────────────────────────────────────────────────────────
+async def _is_following_oa(line_id: str) -> bool:
+    """檢查用戶是否追蹤官方帳號。LINE API 逾時/錯誤時降級放行（回 True），
+    只有明確 404 才判定未追蹤，避免暫時性失敗誤擋既有好友的訂閱（0-b）。"""
+    token = os.environ.get("LINE_ACCESS_TOKEN", "")
+    if not token:
+        return True
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(
+                f"https://api.line.me/v2/bot/profile/{line_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        return r.status_code != 404
+    except Exception:
+        return True
+
+
+def _set_notify(db: Session, camera_id: int, user: User, value: bool) -> None:
+    """設定某用戶對某相機的開機通知；更新所有符合列，無列則建一列（0-c/0-d）。
+    建列讓 admin（原本無 camera_access 列、以全域權限收通知）也能留下退訂標記。"""
+    rows = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == camera_id,
+        CameraAccess.user_id == user.id,
+    ).all()
+    if rows:
+        for acc in rows:
+            acc.notify_on_online = value
+    else:
+        db.add(CameraAccess(
+            camera_id=camera_id, user_id=user.id,
+            granted_by=user.id, permission_level="stream_only",
+            notify_on_online=value,
+        ))
+
+
+def _is_subscribed(db: Session, camera_id: int, user: User) -> bool:
+    """判斷此用戶目前是否會收到該相機的開機通知。
+    admin 預設會收（除非有明確退訂列）；其餘角色需有 notify_on_online=True 的列。"""
+    rows = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == camera_id,
+        CameraAccess.user_id == user.id,
+    ).all()
+    has_true = any(getattr(a, "notify_on_online", False) for a in rows)
+    has_false = any(getattr(a, "notify_on_online", True) is False for a in rows)
+    if user.role == "symotus_admin":
+        return has_true or not has_false
+    return has_true
+
+
 @router.post("/{camera_id}/notify-subscribe")
 async def subscribe_online_notification(
     camera_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """訂閱或查詢相機開機 LINE 通知狀態"""
+    """訂閱相機開機 LINE 通知"""
     allowed_ids = get_allowed_camera_ids(current_user, db)
     if allowed_ids is not None and camera_id not in allowed_ids:
         raise HTTPException(403, "無此相機的存取權限")
 
     if not current_user.line_id:
         return {"subscribed": False, "needs_line": True, "is_following": False,
-                "message": "請先加入官方 LINE 帳號"}
-
-    # 檢查是否有追蹤 LINE Bot（呼叫 LINE API 取得 profile，404 = 未追蹤）
-    # 0-b：LINE API 逾時/錯誤時「降級放行」——用戶已綁 line_id，不因暫時性失敗
-    # 把「要加訂第二台」的既有好友誤退回 needs_line；只有明確收到 404 才擋。
-    LINE_ACCESS_TOKEN = os.environ.get("LINE_ACCESS_TOKEN", "")
-    is_following = True
-    if LINE_ACCESS_TOKEN:
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                r = await client.get(
-                    f"https://api.line.me/v2/bot/profile/{current_user.line_id}",
-                    headers={"Authorization": f"Bearer {LINE_ACCESS_TOKEN}"}
-                )
-            if r.status_code == 404:
-                is_following = False        # 明確未追蹤官方帳號
-        except Exception:
-            is_following = True             # 逾時/網路錯誤：降級放行，不阻擋訂閱
-
-    if not is_following:
+                "message": "請先綁定 LINE 帳號"}
+    if not await _is_following_oa(current_user.line_id):
         return {"subscribed": False, "needs_line": True, "is_following": False,
                 "message": "請先加入官方 LINE 帳號以接收通知"}
 
-    # 設定 notify_on_online=True（0-c：更新所有符合列，避免重複列造成殘留而「取消不掉」）
-    rows = db.query(CameraAccess).filter(
-        CameraAccess.camera_id == camera_id,
-        CameraAccess.user_id == current_user.id,
-    ).all()
-    if not rows:
-        db.add(CameraAccess(
-            camera_id=camera_id, user_id=current_user.id,
-            granted_by=current_user.id, permission_level="stream_only",
-            notify_on_online=True,
-        ))
-    else:
-        for acc in rows:
-            acc.notify_on_online = True
+    _set_notify(db, camera_id, current_user, True)
     db.commit()
-
     return {"subscribed": True, "is_following": True, "message": "開機時將透過 LINE 通知您"}
 
 
@@ -512,21 +530,7 @@ async def unsubscribe_online_notification(
     db: Session = Depends(get_db),
 ):
     """取消相機開機 LINE 通知"""
-    # 0-c：關閉所有符合列（含重複列）；0-d：若無存取列（例：admin 以全域權限收通知），
-    # 建一列僅作為「退訂」標記，讓 admin 也能真正取消。
-    rows = db.query(CameraAccess).filter(
-        CameraAccess.camera_id == camera_id,
-        CameraAccess.user_id == current_user.id,
-    ).all()
-    if rows:
-        for acc in rows:
-            acc.notify_on_online = False
-    else:
-        db.add(CameraAccess(
-            camera_id=camera_id, user_id=current_user.id,
-            granted_by=current_user.id, permission_level="stream_only",
-            notify_on_online=False,
-        ))
+    _set_notify(db, camera_id, current_user, False)
     db.commit()
     return {"subscribed": False, "message": "已取消開機通知"}
 
@@ -540,12 +544,55 @@ async def get_notify_status(
     """查詢此相機的通知訂閱狀態"""
     if not current_user.line_id:
         return {"subscribed": False, "needs_line": True}
-    rows = db.query(CameraAccess).filter(
-        CameraAccess.camera_id == camera_id,
-        CameraAccess.user_id == current_user.id,
-    ).all()
-    # 任一列開啟即視為已訂閱（0-c：容忍重複列）
-    return {"subscribed": any(getattr(a, "notify_on_online", False) for a in rows)}
+    return {"subscribed": _is_subscribed(db, camera_id, current_user)}
+
+
+@router.get("/notify-settings")
+async def notify_settings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """集中式通知設定：回傳此用戶已訂閱 / 已退訂的相機清單（P1）。
+    相機名稱由前端從 /cameras 取得，這裡只回訂閱狀態，避免重複打 Camera Backend。"""
+    if not current_user.line_id:
+        return {"needs_line": True, "role": current_user.role, "subscribed": [], "suppressed": []}
+    rows = db.query(CameraAccess).filter(CameraAccess.user_id == current_user.id).all()
+    subscribed = sorted({a.camera_id for a in rows if getattr(a, "notify_on_online", False)})
+    suppressed = sorted({a.camera_id for a in rows
+                         if getattr(a, "notify_on_online", True) is False} - set(subscribed))
+    return {"needs_line": False, "role": current_user.role,
+            "subscribed": subscribed, "suppressed": suppressed}
+
+
+@router.post("/notify-bulk")
+async def notify_bulk(
+    body: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """批量開/關開機通知（P1「一鍵全開/全關」）。
+    body: {"subscribe": bool, "camera_ids": [int, ...]}。
+    camera_ids 由前端帶入（通常為畫面上可見的相機）；會再以權限過濾。"""
+    subscribe = bool(body.get("subscribe", True))
+    camera_ids = [int(c) for c in (body.get("camera_ids") or [])]
+    allowed_ids = get_allowed_camera_ids(current_user, db)
+    if allowed_ids is not None:
+        allowed_set = set(allowed_ids)
+        camera_ids = [c for c in camera_ids if c in allowed_set]
+
+    if subscribe:
+        if not current_user.line_id:
+            return {"needs_line": True, "message": "請先綁定 LINE 帳號"}
+        if not await _is_following_oa(current_user.line_id):
+            return {"needs_line": True, "message": "請先加入官方 LINE 帳號以接收通知"}
+
+    for cam_id in camera_ids:
+        _set_notify(db, cam_id, current_user, subscribe)
+    db.commit()
+
+    rows = db.query(CameraAccess).filter(CameraAccess.user_id == current_user.id).all()
+    result = sorted({a.camera_id for a in rows if getattr(a, "notify_on_online", False)})
+    return {"ok": True, "subscribed": result, "count": len(camera_ids)}
 
 
 @router.post("/{camera_id}/unbind")

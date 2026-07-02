@@ -10,7 +10,7 @@ from models import User, RefreshToken, InviteToken, CameraAccess
 from schemas import LoginRequest, TokenResponse, RefreshRequest, OAuthCallbackRequest
 from auth import (hash_password, verify_password, create_access_token,
                   create_refresh_token, decode_token, get_current_user,
-                  to_backend_role)
+                  to_backend_role, create_line_bind_token, decode_line_bind_token)
 from config import settings
 
 
@@ -195,6 +195,25 @@ async def google_token(body: OAuthCallbackRequest, request: Request, db: Session
     return _oauth_finish(db, "google_id", ui["sub"], ui.get("email"), ui.get("name"),
                          invite_token_str, host=_get_host(request))
 
+async def _line_email(client: httpx.AsyncClient, td: dict) -> Optional[str]:
+    """從 LINE token 回應取 email。
+
+    C：LINE 的 email 藏在 `id_token`(JWT) 內，不是 token 回應頂層欄位，
+    需呼叫 verify 端點解出。缺這步時「相同 email 的 LINE 登入」無法併回原帳號，
+    會另開 {userId}@oauth.local 分裂帳號。email scope 未授權時回 None。"""
+    idt = td.get("id_token")
+    if not idt:
+        return None
+    try:
+        vr = await client.post("https://api.line.me/oauth2/v2.1/verify",
+                               data={"id_token": idt, "client_id": settings.LINE_CLIENT_ID})
+        if vr.is_success:
+            return vr.json().get("email")
+    except Exception:
+        pass
+    return None
+
+
 @router.get("/line/url")
 def line_url(response: Response, invite_token: str = None):
     state = secrets.token_urlsafe(16)
@@ -202,6 +221,17 @@ def line_url(response: Response, invite_token: str = None):
         state = f"{state}:{invite_token}"
     # 綁定 state 到短效 HttpOnly cookie，/line/callback 比對以防 CSRF。
     # SameSite=Lax 才會在 LINE 導回（top-level GET）時帶上此 cookie。
+    response.set_cookie("line_oauth_state", state, max_age=600,
+                        httponly=True, secure=True, samesite="lax", path="/")
+    params = f"response_type=code&client_id={settings.LINE_CLIENT_ID}&redirect_uri={settings.LINE_REDIRECT_URI}&state={state}&scope=profile openid email"
+    return {"auth_url": f"https://access.line.me/oauth2/v2.1/authorize?{params}", "state": state}
+
+@router.get("/line/bind-url")
+def line_bind_url(response: Response, current_user: User = Depends(get_current_user)):
+    """A：已登入用戶取得「綁定 LINE」授權連結。state 夾帶簽章 ticket 標識當前用戶，
+    /line/callback 依 ticket 把 LINE 綁到「這個帳號」，而非以 email 比對或另開新帳號。"""
+    ticket = create_line_bind_token(current_user.id)
+    state = f"{secrets.token_urlsafe(16)}:bind:{ticket}"
     response.set_cookie("line_oauth_state", state, max_age=600,
                         httponly=True, secure=True, samesite="lax", path="/")
     params = f"response_type=code&client_id={settings.LINE_CLIENT_ID}&redirect_uri={settings.LINE_REDIRECT_URI}&state={state}&scope=profile openid email"
@@ -221,7 +251,8 @@ async def line_token(body: OAuthCallbackRequest, request: Request, db: Session =
         r2 = await client.get("https://api.line.me/v2/profile",
                                headers={"Authorization": f"Bearer {td['access_token']}"})
         profile = r2.json()
-    return _oauth_finish(db, "line_id", profile["userId"], td.get("email"), profile.get("displayName"),
+        email = await _line_email(client, td)   # C：從 id_token 取 email 以支援併帳
+    return _oauth_finish(db, "line_id", profile["userId"], email, profile.get("displayName"),
                          invite_token_str, host=_get_host(request))
 
 def _oauth_finish(db, oauth_field, oauth_id, email, full_name, invite_token_str=None, host: str = ""):
@@ -394,7 +425,11 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
         return resp
     try:
         invite_token_str = None
-        if state and ":" in state:
+        bind_user_id = None
+        # A：state 夾帶 bind ticket → 綁定流程（把 LINE 綁到當前登入用戶，而非登入/建帳）
+        if state and ":bind:" in state:
+            bind_user_id = decode_line_bind_token(state.split(":bind:", 1)[1])
+        elif state and ":" in state:
             _, invite_token_str = state.split(":", 1)
 
         async with httpx.AsyncClient() as client:
@@ -411,9 +446,26 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
             r2 = await client.get("https://api.line.me/v2/profile",
                                    headers={"Authorization": f"Bearer {td['access_token']}"})
             profile = r2.json()
+            email = await _line_email(client, td)   # C：從 id_token 取 email 以支援併帳
+
+        # A：綁定流程 —— 把 LINE userId 綁到 ticket 指定的既有用戶
+        if bind_user_id is not None:
+            line_uid = profile["userId"]
+            target = db.query(User).filter(User.id == bind_user_id).first()
+            existing = db.query(User).filter(User.line_id == line_uid).first()
+            if not target:
+                resp = RedirectResponse(f"{frontend}/notifications?line_bind=error")
+            elif existing and existing.id != target.id:
+                resp = RedirectResponse(f"{frontend}/notifications?line_bind=conflict")
+            else:
+                target.line_id = line_uid
+                db.commit()
+                resp = RedirectResponse(f"{frontend}/notifications?line_bind=ok")
+            resp.delete_cookie("line_oauth_state", path="/")
+            return resp
 
         token_resp = _oauth_finish(db, "line_id", profile["userId"],
-                                   td.get("email"), profile.get("displayName"),
+                                   email, profile.get("displayName"),
                                    invite_token_str, host=host)
 
         user = db.query(User).filter(User.line_id == profile["userId"]).first()
