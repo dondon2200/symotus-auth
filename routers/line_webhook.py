@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 import httpx
 
 from database import get_db
-from models import User
+from models import User, CameraAccess
 from auth import create_access_token, create_refresh_token
 from models import RefreshToken
 from config import settings
@@ -468,14 +468,21 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
         if text.startswith("取消相機通知 "):
             try:
                 cam_id = int(text.split(" ")[1])
-                access = db.query(CameraAccess).filter(
+                # 0-c：關閉所有符合列；0-d：若無存取列（admin 全域收通知）建一列作退訂標記
+                rows = db.query(CameraAccess).filter(
                     CameraAccess.camera_id == cam_id,
                     CameraAccess.user_id == user.id,
-                ).first()
-                if access:
-                    access.notify_on_online = False
-                    db.commit()
-                    from models import CameraAccess as CA
+                ).all()
+                if rows:
+                    for access in rows:
+                        access.notify_on_online = False
+                else:
+                    db.add(CameraAccess(
+                        camera_id=cam_id, user_id=user.id,
+                        granted_by=user.id, permission_level="stream_only",
+                        notify_on_online=False,
+                    ))
+                db.commit()
                 await line_reply(reply_token, [{"type": "text",
                     "text": f"✅ 已取消相機 #{cam_id} 的開機通知。如需重新訂閱，請至網頁開機通知設定。"}])
             except Exception:

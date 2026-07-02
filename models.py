@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, ARRAY
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, ARRAY, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
@@ -41,6 +41,9 @@ class CameraAccess(Base):
     """相機存取授權"""
     """end_user 可以存取哪些相機（camera_id 對應現有後端的相機 ID）"""
     __tablename__ = "camera_access"
+    # 0-c：同一 (相機, 用戶) 只應有一列，杜絕重複列導致「取消一列另一列仍通知」。
+    # 註：僅對新建立的資料表生效；既有正式庫的重複列由執行期 update-all 邏輯容錯處理。
+    __table_args__ = (UniqueConstraint("camera_id", "user_id", name="uq_camera_access_camera_user"),)
 
     id = Column(Integer, primary_key=True, index=True)
     camera_id = Column(Integer, nullable=False, index=True)  # 現有後端的 camera ID

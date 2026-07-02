@@ -114,9 +114,17 @@ async def send_line_push(line_user_id: str, camera_id: int, camera_name: str):
 def get_notify_line_ids(camera_id: int, db: Session) -> list[str]:
     """找應收通知的所有 LINE user ID"""
     ids = set()
-    # admin 一定通知
+    # 0-d：對本相機明確退訂（notify_on_online=False）的 user_id，即使是 admin 也不通知。
+    opted_out = {
+        acc.user_id for acc in db.query(CameraAccess).filter(
+            CameraAccess.camera_id == camera_id,
+            CameraAccess.notify_on_online == False,
+        ).all()
+    }
+    # admin 預設通知，但尊重其對本相機的退訂
     for u in db.query(User).filter(User.role == "symotus_admin", User.line_id.isnot(None)).all():
-        ids.add(u.line_id)
+        if u.id not in opted_out:
+            ids.add(u.line_id)
     # camera_access 裡有 line_id 且 notify_on_online=True 的用戶
     for acc in db.query(CameraAccess).filter(CameraAccess.camera_id == camera_id).all():
         # 只通知有訂閱的用戶（notify_on_online 預設 True）
