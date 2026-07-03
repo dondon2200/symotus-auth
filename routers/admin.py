@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
 from models import User, CameraAccess, TechSupportGrant
-from schemas import UserResponse
+from schemas import UserResponse, TechSupportGrantResponse
 from auth import require_role, decode_token
 from datetime import datetime
 
@@ -61,7 +61,7 @@ def camera_access_by_user(
     return [{"id": a.camera_id, "name": None, "ip_address": None, "online_status": False} for a in accesses]
 
 
-@router.get("/support/grants")
+@router.get("/support/grants", response_model=list[TechSupportGrantResponse])
 def all_grants(
     db: Session = Depends(get_db),
     _=Depends(require_role("symotus_admin"))

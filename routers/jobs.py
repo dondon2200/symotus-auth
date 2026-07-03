@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from database import get_db
 from models import User, TimelapsJob
 from auth import get_current_user
+from schemas import UtcDatetime, utc_iso
 
 router = APIRouter(prefix="/jobs", tags=["timelapse_jobs"])
 
@@ -37,8 +38,8 @@ class JobResponse(BaseModel):
     end_date: Optional[str]
     fps: Optional[int]
     resolution: Optional[str]
-    created_at: datetime
-    updated_at: datetime
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
 
     class Config:
         from_attributes = True
@@ -592,7 +593,7 @@ async def list_gdrive_jobs(
             "downloaded_count": job.downloaded_count,
             "video_download_url": job.video_url,
             "error_message": job.error_message,
-            "created_at": job.created_at.isoformat() if job.created_at else None,
+            "created_at": utc_iso(job.created_at),
         }
         for job in jobs
     ]

@@ -1,6 +1,22 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, PlainSerializer
 from typing import Optional, List
-from datetime import datetime
+from typing_extensions import Annotated
+from datetime import datetime, timezone
+
+
+def utc_iso(v: Optional[datetime]) -> Optional[str]:
+    """DB 內的 datetime 皆為 naive UTC（datetime.utcnow）。序列化時補上 UTC 時區，
+    輸出帶 offset 的 ISO 字串（例：2026-07-03T15:30:00+00:00），前端 new Date() 才能
+    正確解析為絕對時刻並轉台北時間；否則無 offset 會被當成瀏覽器本地時間，慢 8 小時。"""
+    if v is None:
+        return None
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=timezone.utc)
+    return v.isoformat()
+
+
+# 回應用 datetime：一律輸出帶時區 offset 的 ISO 字串
+UtcDatetime = Annotated[datetime, PlainSerializer(utc_iso, when_used="json")]
 
 
 # ── Auth ──────────────────────────────────────────
@@ -43,7 +59,7 @@ class UserResponse(BaseModel):
     reseller_id: Optional[int]
     google_id: Optional[str]
     line_id: Optional[str]
-    created_at: datetime
+    created_at: UtcDatetime
 
     class Config:
         from_attributes = True
@@ -75,10 +91,10 @@ class InviteResponse(BaseModel):
     intended_role: str = "end_user"
     camera_email: Optional[str] = None
     status: str
-    expires_at: datetime
+    expires_at: UtcDatetime
     accepted_by: Optional[int]
-    accepted_at: Optional[datetime]
-    created_at: datetime
+    accepted_at: Optional[UtcDatetime]
+    created_at: UtcDatetime
 
     class Config:
         from_attributes = True
@@ -88,7 +104,7 @@ class InvitePreview(BaseModel):
     reason: Optional[str] = None  # expired | revoked | already_used | not_found
     reseller_name: Optional[str] = None
     camera_count: Optional[int] = None
-    expires_at: Optional[datetime] = None
+    expires_at: Optional[UtcDatetime] = None
 
 
 # ── Camera Access ──────────────────────────────────────────
@@ -100,7 +116,7 @@ class CameraAccessResponse(BaseModel):
     camera_id: int
     user_id: int
     granted_by: int
-    created_at: datetime
+    created_at: UtcDatetime
     user: Optional[UserResponse] = None
 
     class Config:
@@ -116,9 +132,9 @@ class TechSupportGrantResponse(BaseModel):
     id: int
     reseller_id: int
     camera_ids: Optional[List[int]]
-    expires_at: datetime
-    revoked_at: Optional[datetime]
-    created_at: datetime
+    expires_at: UtcDatetime
+    revoked_at: Optional[UtcDatetime]
+    created_at: UtcDatetime
 
     class Config:
         from_attributes = True

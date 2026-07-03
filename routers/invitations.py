@@ -13,6 +13,7 @@ from database import get_db
 from models import User, CameraInvitation, CameraAccess
 from auth import get_current_user, require_role
 from config import settings
+from schemas import utc_iso
 
 router = APIRouter(prefix="/invitations", tags=["invitations"])
 
@@ -53,7 +54,7 @@ def create_invitation(
         return {
             "id": existing_inv.id, "token": existing_inv.token,
             "invite_url": invite_url, "camera_name": existing_inv.camera_name,
-            "expires_at": existing_inv.expires_at.isoformat() if existing_inv.expires_at else None,
+            "expires_at": utc_iso(existing_inv.expires_at),
             "reused": True,
         }
 
@@ -80,7 +81,7 @@ def create_invitation(
         "token": token,
         "invite_url": invite_url,
         "camera_name": inv.camera_name,
-        "expires_at": expires_at.isoformat() if expires_at else None,
+        "expires_at": utc_iso(expires_at),
     }
 
 
@@ -105,7 +106,7 @@ def list_my_invitations(
             "inviter_name": (inviter.full_name or inviter.username or inviter.email) if inviter else "未知",
             "permission_level": inv.permission_level,
             "note": inv.note,
-            "created_at": inv.created_at.isoformat() if inv.created_at else None,
+            "created_at": utc_iso(inv.created_at),
         })
     return result
 
@@ -129,7 +130,7 @@ def preview_invitation(token: str, db: Session = Depends(get_db)):
         "note": inv.note,
         "permission_level": inv.permission_level,
         "permission_label": PERMISSION_LABELS.get(inv.permission_level, ""),
-        "expires_at": inv.expires_at.isoformat() if inv.expires_at else None,
+        "expires_at": utc_iso(inv.expires_at),
     }
 
 
@@ -207,11 +208,11 @@ def list_sent_invitations(
             "id": inv.id, "token": inv.token, "camera_id": inv.camera_id,
             "camera_name": inv.camera_name, "status": inv.status,
             "invite_url": f"{FRONTEND_URL}/camera-invite/{inv.token}",
-            "created_at": inv.created_at.isoformat() if inv.created_at else None,
+            "created_at": utc_iso(inv.created_at),
             "permission_level": inv.permission_level,
             "permission_label": PERMISSION_LABELS.get(inv.permission_level, ""),
             "invitee_name": (invitee.full_name or invitee.username or invitee.email) if invitee else None,
-            "expires_at": inv.expires_at.isoformat() if inv.expires_at else None,
+            "expires_at": utc_iso(inv.expires_at),
         })
     return result
 
