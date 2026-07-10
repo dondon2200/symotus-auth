@@ -500,6 +500,29 @@ def _is_subscribed(db: Session, camera_id: int, user: User) -> bool:
     return has_true
 
 
+@router.get("/{camera_id}/live-frame-url")
+async def get_live_frame_url(
+    camera_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """回傳簽章過的公開即時截圖 URL（給 AI 助理/LINE 用，30 分鐘有效）
+    供「看一下畫面」這類需要真正即時畫面（非 NAS 歷史照片）的請求使用
+    """
+    import time as _time
+    from routers.public_camera import _live_frame_sig
+
+    allowed_ids = get_allowed_camera_ids(current_user, db)
+    if allowed_ids is not None and camera_id not in allowed_ids:
+        raise HTTPException(403, "無此相機的存取權限")
+
+    exp = int(_time.time()) + 1800
+    sig = _live_frame_sig(camera_id, exp)
+    frontend_url = os.getenv("FRONTEND_URL", "https://admin.symotus.com")
+    url = f"{frontend_url}/auth-api/cameras/public/live-frame/{camera_id}?exp={exp}&sig={sig}"
+    return {"url": url}
+
+
 @router.post("/{camera_id}/notify-subscribe")
 async def subscribe_online_notification(
     camera_id: int,
