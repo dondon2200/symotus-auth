@@ -101,11 +101,12 @@ LINE_TOOLS = [
             "camera_id":{"type":"number"},
             "date":{"type":"string","description":"YYYY-MM-DD，不填查近 7 天"}},"required":["camera_id"]}}},
     {"type":"function","function":{
-        "name":"create_timelapse","description":"生成縮時影片，需用戶確認",
+        "name":"create_timelapse","description":"生成縮時影片，需用戶確認。若用戶要求限制影片長度（例如「30秒的縮時」），務必帶上 target_duration_secs",
         "parameters":{"type":"object","properties":{
             "camera_id":{"type":"number"},
             "start_date":{"type":"string"},
             "end_date":{"type":"string"},
+            "target_duration_secs":{"type":"number","description":"影片目標秒數，若用戶沒指定則不填（不限制，用全部照片）"},
             "confirmed":{"type":"boolean"}},"required":["camera_id","start_date","end_date","confirmed"]}}},
     {"type":"function","function":{
         "name":"get_shared_cameras","description":"查詢有哪些相機被分享給我，或我分享給別人的相機",
@@ -181,8 +182,10 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
         return {"result": {"total": d.get("data", {}).get("total", 0), "dates": d.get("debug", {}).get("date_folders_found", []), "period": f"{start}~{end}"}}
 
     if name == "create_timelapse":
+        target_secs = args.get("target_duration_secs") or 0
         if not args.get("confirmed"):
-            return {"result": f"請確認：為相機 {args['camera_id']} 生成 {args['start_date']} 至 {args['end_date']} 的縮時影片？回覆「確認」後我會送出任務。"}
+            dur_txt = f"，限制長度 {target_secs} 秒" if target_secs else ""
+            return {"result": f"請確認：為相機 {args['camera_id']} 生成 {args['start_date']} 至 {args['end_date']} 的縮時影片{dur_txt}？回覆「確認」後我會送出任務。"}
         cam_url = f"{AUTH_SERVICE_URL}/cameras/{args['camera_id']}"
         try:
             async with httpx.AsyncClient(timeout=15) as c:
@@ -194,14 +197,31 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
         cd = cr.json(); serial = cd.get("basic_info", cd).get("device_serial_id")
         cam_name = cd.get("basic_info", cd).get("name", f"相機 {args['camera_id']}")
         if not serial: return {"result": f"[DEBUG] 找不到序號 raw_response={json.dumps(cd)[:300]}"}
+
+        nas_path = serial
+        # 若有指定時長，先呼叫 prepare-timelapse 做每天均勻抽片（跟網頁邏輯一致）
+        if target_secs > 0:
+            prep_url = f"{AUTH_SERVICE_URL}/cameras/{args['camera_id']}/prepare-timelapse"
+            try:
+                async with httpx.AsyncClient(timeout=60) as c:
+                    pr = await c.post(prep_url, headers={**h, "Content-Type": "application/json"},
+                        json={"serial_id": serial, "start_date": args["start_date"], "end_date": args["end_date"],
+                              "target_duration_secs": target_secs, "fps": 30})
+                if pr.is_success:
+                    nas_path = pr.json().get("nas_folder", serial)
+                else:
+                    return {"result": f"[DEBUG] 抽片失敗 status={pr.status_code} body={pr.text[:200]}"}
+            except Exception as e:
+                return {"result": f"[DEBUG] 抽片連線失敗 error={type(e).__name__}: {e}"}
+
         async with httpx.AsyncClient(timeout=30) as c:
             sr = await c.post("https://user.symotus.com/spark/jobs/nas",
                 headers={"Content-Type":"application/json","x-api-key": SPARK_API_KEY},
-                json={"nas_path": serial, "callback_url": f"{os.getenv('FRONTEND_URL', 'https://user.symotus.com')}/api/spark-callback",
+                json={"nas_path": nas_path, "callback_url": f"{os.getenv('FRONTEND_URL', 'https://user.symotus.com')}/api/spark-callback",
                       "fps": 30, "resolution": "1920x1080",
                       "rain_fog_detection": True, "darkness_detection": True,
                       "image_recovery": False, "stabilization": False,
-                      "start_date": args["start_date"], "end_date": args["end_date"]})
+                      **({"start_date": args["start_date"], "end_date": args["end_date"]} if target_secs <= 0 else {})})
         if not sr.is_success: return {"result": f"Spark 失敗：{sr.status_code}"}
         job_id = sr.json().get("job_id")
         async with httpx.AsyncClient(timeout=10) as c:
