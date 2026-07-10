@@ -336,56 +336,44 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
 
 # ── AI 呼叫 ───────────────────────────────────────────────────────────────────
 async def call_ai_line(text: str, auth_token: str, line_user_id: str) -> dict:
-    # 載入對話歷史
+    """改為呼叫網頁版共用的 /api/assistant，兩邊共用同一套 prompt/工具/邏輯，
+    修一次 bug 兩邊都生效，不用再各自維護一份。"""
     history = _get_history(line_user_id)
     history.append({"role": "user", "content": text})
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-    snapshot_action = None
 
-    for _ in range(4):
-        async with httpx.AsyncClient(timeout=30) as c:
-            resp = await c.post("https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                         "Content-Type": "application/json",
-                         "HTTP-Referer": os.getenv("FRONTEND_URL", "https://user.symotus.com"), "X-Title": "Symotus LINE Bot"},
-                json={"model": "openai/gpt-4o-mini", "messages": messages,
-                      "tools": LINE_TOOLS, "tool_choice": "auto",
-                      "max_tokens": 600, "temperature": 0.3})
-        if not resp.is_success:
-            return {"text": "AI 服務暫時無法使用，請稍後再試。"}
+    assistant_url = f"{os.getenv('FRONTEND_URL', 'https://admin.symotus.com')}/api/assistant"
+    try:
+        async with httpx.AsyncClient(timeout=40) as c:
+            resp = await c.post(assistant_url,
+                headers={"Content-Type": "application/json"},
+                json={"messages": history, "auth_token": auth_token})
+    except Exception as e:
+        return {"text": f"[DEBUG] 呼叫共用 AI 服務失敗 error={type(e).__name__}: {e}", "snapshot": None}
 
-        msg = resp.json().get("choices", [{}])[0].get("message", {})
-        if not msg.get("tool_calls"):
-            ai_text = msg.get("content", "好的。")
-            history.append({"role": "assistant", "content": ai_text})
-            _save_history(line_user_id, history)
-            return {"text": ai_text, "snapshot": snapshot_action}
+    if not resp.is_success:
+        return {"text": f"[DEBUG] 共用 AI 服務錯誤 status={resp.status_code} body={resp.text[:300]}", "snapshot": None}
 
-        messages.append(msg)
-        for tc in msg.get("tool_calls", []):
-            args = json.loads(tc["function"]["arguments"] or "{}")
-            result = await execute_tool(tc["function"]["name"], args, auth_token, line_user_id)
-            # DEBUG 訊息直接原文回傳，不讓 AI 重新描述
-            if isinstance(result.get("result"), str) and result["result"].startswith("[DEBUG]"):
-                return {"text": result["result"], "snapshot": None}
-            # 截圖是特殊處理
-            if result.get("result") == "snapshot":
-                snapshot_action = result
-                messages.append({"role": "tool", "tool_call_id": tc["id"],
-                                  "content": "截圖取得中，即將發送圖片給用戶"})
-            else:
-                messages.append({"role": "tool", "tool_call_id": tc["id"],
-                                  "content": json.dumps(result["result"], ensure_ascii=False)})
+    data = resp.json()
+    ai_text = data.get("message", "好的。")
+    actions = data.get("actions", []) or []
 
-    ai_reply = "操作完成。"
-    for m in reversed(messages):
-        if m.get("role") == "assistant" and m.get("content"):
-            ai_reply = m["content"]
-            break
-    # 儲存完整對話到歷史（去掉 system prompt）
-    history.append({"role": "assistant", "content": ai_reply})
+    photo_url = None
+    extra_lines = []
+    for act in actions:
+        a_type = act.get("type")
+        if a_type == "photo" and act.get("path"):
+            photo_url = act["path"]
+        elif a_type in ("navigate", "spotlight") and act.get("path"):
+            extra_lines.append(f"🔗 https://admin.symotus.com{act['path']}")
+
+    if extra_lines:
+        ai_text = ai_text + "\n\n" + "\n".join(extra_lines)
+
+    history.append({"role": "assistant", "content": ai_text})
     _save_history(line_user_id, history)
-    return {"text": ai_reply, "snapshot": snapshot_action}
+
+    snapshot_action = {"photo_url": photo_url} if photo_url else None
+    return {"text": ai_text, "snapshot": snapshot_action}
 
 # ── 截圖處理 ─────────────────────────────────────────────────────────────────
 GO2RTC_BASE = "https://user.symotus.com/go2rtc"
@@ -562,11 +550,13 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
         # 回覆文字
         await line_reply(reply_token, [{"type": "text", "text": result["text"]}])
 
-        # 若有截圖需求，另外 push 圖片
-        if result.get("snapshot"):
-            snap = result["snapshot"]
-            asyncio.create_task(get_and_push_snapshot(
-                line_user_id, snap["snapshot_camera_id"], snap["auth_token"], snap.get("snapshot_date", "")))
+        # 若共用 AI 回傳了 photo action，直接推送圖片給用戶
+        if result.get("snapshot") and result["snapshot"].get("photo_url"):
+            await line_push(line_user_id, [{
+                "type": "image",
+                "originalContentUrl": result["snapshot"]["photo_url"],
+                "previewImageUrl": result["snapshot"]["photo_url"],
+            }])
 
     return {"status": "ok"}
 
