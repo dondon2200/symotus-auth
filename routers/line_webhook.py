@@ -95,8 +95,10 @@ LINE_TOOLS = [
         "name":"get_camera_status","description":"查詢特定相機狀態",
         "parameters":{"type":"object","properties":{"camera_id":{"type":"number"}},"required":["camera_id"]}}},
     {"type":"function","function":{
-        "name":"get_snapshot","description":"取得相機最新截圖並發送給用戶。用戶說「讓我看相機」「看一下畫面」時使用",
-        "parameters":{"type":"object","properties":{"camera_id":{"type":"number","description":"相機 ID（從 list_cameras 取得）"}},"required":["camera_id"]}}},
+        "name":"get_snapshot","description":"取得相機截圖並發送給用戶。用戶說「讓我看相機」「看一下畫面」時不填 date（取最新）；用戶指定日期（例如「7/1的照片」）時務必帶上 date 參數，會從 NAS 抓該日最新一張",
+        "parameters":{"type":"object","properties":{
+            "camera_id":{"type":"number","description":"相機 ID（從 list_cameras 取得）"},
+            "date":{"type":"string","description":"YYYY-MM-DD，指定日期時填寫；不填則取目前最新即時畫面"}},"required":["camera_id"]}}},
     {"type":"function","function":{
         "name":"get_recent_photos","description":"查詢相機近期照片數量",
         "parameters":{"type":"object","properties":{
@@ -169,7 +171,7 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
         return {"result": {"name": info.get("name"), "online": info.get("online_status"), "last_seen": info.get("last_seen")}}
 
     if name == "get_snapshot":
-        return {"result": "snapshot", "snapshot_camera_id": args["camera_id"], "auth_token": auth_token}
+        return {"result": "snapshot", "snapshot_camera_id": args["camera_id"], "snapshot_date": args.get("date") or "", "auth_token": auth_token}
 
     if name == "get_recent_photos":
         cam_id = args["camera_id"]; date = args.get("date", "")
@@ -388,12 +390,36 @@ async def call_ai_line(text: str, auth_token: str, line_user_id: str) -> dict:
 # ── 截圖處理 ─────────────────────────────────────────────────────────────────
 GO2RTC_BASE = "https://user.symotus.com/go2rtc"
 
-async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: str):
-    """取相機即時截圖（go2rtc）或最新 NAS 照片 → 推送 LINE 圖片訊息"""
+async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: str, date: str = ""):
+    """取相機即時截圖（go2rtc）或指定日期/最新 NAS 照片 → 推送 LINE 圖片訊息"""
     from routers.public_camera import _store_temp_image, _temp_image_cache
 
-    # 先查 camera 的 ip 以取得 stream_name
     h = {"Authorization": f"Bearer {auth_token}"}
+
+    # 指定日期時，一定要查 NAS 歷史照片，不能用即時串流（跳過 live-frame）
+    if date:
+        async with httpx.AsyncClient(timeout=30) as cl:
+            r = await cl.get(
+                f"{AUTH_SERVICE_URL}/cameras/nas/images?camera_id={camera_id}&limit=1&offset=0"
+                f"&start_time={date}T00:00:00&end_time={date}T23:59:59",
+                headers=h,
+            )
+        if not r.is_success:
+            await line_push(line_user_id, [{"type":"text","text":f"查詢 {date} 照片失敗，請稍後再試。"}])
+            return
+        files = r.json().get("data", {}).get("files", [])
+        if not files:
+            await line_push(line_user_id, [{"type":"text","text":f"{date} 沒有拍攝到照片紀錄。"}])
+            return
+        image_url = files[0].get("image_url", "")
+        full_path = image_url.replace("&thumbnail=true", "").replace("thumbnail=true&", "").replace("?thumbnail=true", "")
+        photo_url = f"https://user.symotus.com{full_path}" if full_path.startswith("/") else full_path
+        await line_push(line_user_id, [
+            {"type": "image", "originalContentUrl": photo_url, "previewImageUrl": photo_url}
+        ])
+        return
+
+    # 沒指定日期：先查 camera 的 ip 以取得 stream_name（即時串流）
     stream_name = None
     try:
         async with httpx.AsyncClient(timeout=8) as cl:
@@ -540,7 +566,7 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
         if result.get("snapshot"):
             snap = result["snapshot"]
             asyncio.create_task(get_and_push_snapshot(
-                line_user_id, snap["snapshot_camera_id"], snap["auth_token"]))
+                line_user_id, snap["snapshot_camera_id"], snap["auth_token"], snap.get("snapshot_date", "")))
 
     return {"status": "ok"}
 
