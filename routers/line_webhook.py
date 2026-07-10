@@ -336,6 +336,9 @@ async def call_ai_line(text: str, auth_token: str, line_user_id: str) -> dict:
         for tc in msg.get("tool_calls", []):
             args = json.loads(tc["function"]["arguments"] or "{}")
             result = await execute_tool(tc["function"]["name"], args, auth_token, line_user_id)
+            # DEBUG 訊息直接原文回傳，不讓 AI 重新描述
+            if isinstance(result.get("result"), str) and result["result"].startswith("[DEBUG]"):
+                return {"text": result["result"], "snapshot": None}
             # 截圖是特殊處理
             if result.get("result") == "snapshot":
                 snapshot_action = result
