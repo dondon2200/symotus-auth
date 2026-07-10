@@ -358,22 +358,27 @@ async def call_ai_line(text: str, auth_token: str, line_user_id: str) -> dict:
     actions = data.get("actions", []) or []
 
     photo_url = None
-    extra_lines = []
+    nav_links: list[dict] = []
+    NAV_LABELS = {
+        "/jobs": "查看進度", "/dashboard": "前往儀表板", "/gdrive": "Google Drive 縮時",
+        "/support": "技術支援", "/admin/users": "用戶管理", "/admin/support": "技術支援管理",
+    }
     for act in actions:
         a_type = act.get("type")
-        if a_type == "photo" and act.get("path"):
-            photo_url = act["path"]
-        elif a_type in ("navigate", "spotlight") and act.get("path"):
-            extra_lines.append(f"🔗 https://admin.symotus.com{act['path']}")
-
-    if extra_lines:
-        ai_text = ai_text + "\n\n" + "\n".join(extra_lines)
+        path = act.get("path") or ""
+        if a_type == "photo" and path:
+            photo_url = path
+        elif a_type in ("navigate", "spotlight") and path:
+            label = NAV_LABELS.get(path.split("?")[0])
+            if not label:
+                label = "查看相機" if path.startswith("/camera/") else "開啟頁面"
+            nav_links.append({"path": path, "label": label[:20]})
 
     history.append({"role": "assistant", "content": ai_text})
     _save_history(line_user_id, history)
 
     snapshot_action = {"photo_url": photo_url} if photo_url else None
-    return {"text": ai_text, "snapshot": snapshot_action}
+    return {"text": ai_text, "snapshot": snapshot_action, "nav_links": nav_links}
 
 # ── 截圖處理 ─────────────────────────────────────────────────────────────────
 GO2RTC_BASE = "https://user.symotus.com/go2rtc"
@@ -556,6 +561,23 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
                 "type": "image",
                 "originalContentUrl": result["snapshot"]["photo_url"],
                 "previewImageUrl": result["snapshot"]["photo_url"],
+            }])
+
+        # 若有導頁需求，推送可點擊按鈕（LINE Buttons Template），最多一則（LINE 限制）
+        nav_links = result.get("nav_links") or []
+        if nav_links:
+            link = nav_links[0]
+            full_url = f"https://admin.symotus.com{link['path']}"
+            await line_push(line_user_id, [{
+                "type": "template",
+                "altText": link["label"],
+                "template": {
+                    "type": "buttons",
+                    "text": link["label"],
+                    "actions": [
+                        {"type": "uri", "label": link["label"][:20], "uri": full_url}
+                    ]
+                }
             }])
 
     return {"status": "ok"}
