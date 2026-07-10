@@ -183,12 +183,17 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
     if name == "create_timelapse":
         if not args.get("confirmed"):
             return {"result": f"請確認：為相機 {args['camera_id']} 生成 {args['start_date']} 至 {args['end_date']} 的縮時影片？回覆「確認」後我會送出任務。"}
-        async with httpx.AsyncClient(timeout=15) as c:
-            cr = await c.get(f"{AUTH_SERVICE_URL}/cameras/{args['camera_id']}", headers=h)
-        if not cr.is_success: return {"result": "找不到相機"}
+        cam_url = f"{AUTH_SERVICE_URL}/cameras/{args['camera_id']}"
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                cr = await c.get(cam_url, headers=h)
+        except Exception as e:
+            return {"result": f"[DEBUG] 連線失敗 url={cam_url} error={type(e).__name__}: {e}"}
+        if not cr.is_success:
+            return {"result": f"[DEBUG] 相機查詢失敗 url={cam_url} status={cr.status_code} body={cr.text[:200]}"}
         cd = cr.json(); serial = cd.get("basic_info", cd).get("device_serial_id")
         cam_name = cd.get("basic_info", cd).get("name", f"相機 {args['camera_id']}")
-        if not serial: return {"result": "找不到相機序號"}
+        if not serial: return {"result": f"[DEBUG] 找不到序號 raw_response={json.dumps(cd)[:300]}"}
         async with httpx.AsyncClient(timeout=30) as c:
             sr = await c.post("https://user.symotus.com/spark/jobs/nas",
                 headers={"Content-Type":"application/json","x-api-key": SPARK_API_KEY},
