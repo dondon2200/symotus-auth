@@ -214,15 +214,20 @@ async def execute_tool(name: str, args: dict, auth_token: str, line_user_id: str
             except Exception as e:
                 return {"result": f"[DEBUG] 抽片連線失敗 error={type(e).__name__}: {e}"}
 
-        async with httpx.AsyncClient(timeout=30) as c:
-            sr = await c.post("https://user.symotus.com/spark/jobs/nas",
-                headers={"Content-Type":"application/json","x-api-key": SPARK_API_KEY},
-                json={"nas_path": nas_path, "callback_url": f"{os.getenv('FRONTEND_URL', 'https://user.symotus.com')}/api/spark-callback",
+        spark_body = {"nas_path": nas_path, "callback_url": f"{os.getenv('FRONTEND_URL', 'https://user.symotus.com')}/api/spark-callback",
                       "fps": 30, "resolution": "1920x1080",
                       "rain_fog_detection": True, "darkness_detection": True,
                       "image_recovery": False, "stabilization": False,
-                      **({"start_date": args["start_date"], "end_date": args["end_date"]} if target_secs <= 0 else {})})
-        if not sr.is_success: return {"result": f"Spark 失敗：{sr.status_code}"}
+                      **({"start_date": args["start_date"], "end_date": args["end_date"]} if target_secs <= 0 else {})}
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                sr = await c.post("https://user.symotus.com/spark/jobs/nas",
+                    headers={"Content-Type":"application/json","x-api-key": SPARK_API_KEY},
+                    json=spark_body)
+        except Exception as e:
+            return {"result": f"[DEBUG] Spark 連線失敗 error={type(e).__name__}: {e} body={json.dumps(spark_body, ensure_ascii=False)}"}
+        if not sr.is_success:
+            return {"result": f"[DEBUG] Spark 失敗 status={sr.status_code} body={sr.text[:300]} sent={json.dumps(spark_body, ensure_ascii=False)}"}
         job_id = sr.json().get("job_id")
         async with httpx.AsyncClient(timeout=10) as c:
             await c.post(f"{AUTH_SERVICE_URL}/jobs", headers={**h, "Content-Type":"application/json"},
