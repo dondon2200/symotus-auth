@@ -56,9 +56,21 @@ def camera_access_by_user(
     db: Session = Depends(get_db),
     _=Depends(require_role("symotus_admin")),
 ):
-    """列出某用戶所有 camera_access 的相機（F-6：改用 symotus_admin JWT，移除前端明碼 service-key）"""
+    """列出某用戶所有 camera_access 的相機（F-6：改用 symotus_admin JWT，移除前端明碼 service-key）
+    保留 id/name/ip_address/online_status 舊欄位（舊 /admin/users 頁相容），另附授權明細。"""
     accesses = db.query(CameraAccess).filter(CameraAccess.user_id == user_id).all()
-    return [{"id": a.camera_id, "name": None, "ip_address": None, "online_status": False} for a in accesses]
+    granter_ids = {a.granted_by for a in accesses if a.granted_by}
+    granters = {u.id: u.username for u in db.query(User).filter(User.id.in_(granter_ids)).all()} if granter_ids else {}
+    return [{
+        "id": a.camera_id, "name": None, "ip_address": None, "online_status": False,
+        "access_id": a.id,
+        "camera_id": a.camera_id,
+        "permission_level": a.permission_level or "photos_stream",
+        "granted_by": a.granted_by,
+        "granter_username": granters.get(a.granted_by),
+        "notify_on_online": a.notify_on_online,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+    } for a in accesses]
 
 
 @router.get("/support/grants", response_model=list[TechSupportGrantResponse])
@@ -80,10 +92,11 @@ def remove_camera_access(
     camera_id: int,
     user_id: int,
     x_service_key: str = Header(None),
+    authorization: str = Header(None),
     db: Session = Depends(get_db),
 ):
-    """用 service key 刪除特定用戶對特定相機的存取權"""
-    if x_service_key != CAMERA_SERVICE_KEY:
+    """刪除特定用戶對特定相機的存取權（service key 或 symotus_admin JWT 保護）"""
+    if not _is_admin(x_service_key, authorization):
         raise HTTPException(status_code=403, detail="Invalid service key")
     deleted = db.query(CameraAccess).filter(
         CameraAccess.camera_id == camera_id,
@@ -91,6 +104,32 @@ def remove_camera_access(
     ).delete()
     db.commit()
     return {"deleted": deleted, "camera_id": camera_id, "user_id": user_id}
+
+
+@router.patch("/camera-access/{access_id}")
+def update_camera_access(
+    access_id: int,
+    body: dict,
+    x_service_key: str = Header(None),
+    authorization: str = Header(None),
+    db: Session = Depends(get_db),
+):
+    """更新單筆授權：permission_level / notify_on_online（service key 或 symotus_admin JWT 保護）"""
+    if not _is_admin(x_service_key, authorization):
+        raise HTTPException(status_code=403, detail="Invalid service key")
+    access = db.query(CameraAccess).filter(CameraAccess.id == access_id).first()
+    if not access:
+        raise HTTPException(status_code=404, detail="camera_access not found")
+    if "permission_level" in body:
+        if body["permission_level"] not in ("full", "photos_stream", "stream_only"):
+            raise HTTPException(status_code=400, detail="permission_level 僅能是 full/photos_stream/stream_only")
+        access.permission_level = body["permission_level"]
+    if "notify_on_online" in body:
+        access.notify_on_online = bool(body["notify_on_online"])
+    db.commit()
+    db.refresh(access)
+    return {"id": access.id, "camera_id": access.camera_id, "user_id": access.user_id,
+            "permission_level": access.permission_level, "notify_on_online": access.notify_on_online}
 
 @router.get("/camera-access/{camera_id}")
 def get_camera_access(
@@ -122,7 +161,28 @@ def list_all_users(
     users = db.query(User).all()
     return [{"id": u.id, "username": u.username, "email": u.email,
              "role": u.role, "line_id": u.line_id, "camera_email": u.camera_email,
-             "is_active": u.is_active} for u in users]
+             "is_active": u.is_active,
+             "full_name": u.full_name, "reseller_id": u.reseller_id,
+             "has_google": bool(u.google_id), "has_password": bool(u.hashed_password),
+             "created_at": u.created_at.isoformat() if u.created_at else None} for u in users]
+
+
+@router.get("/camera-access-all")
+def list_all_camera_access(
+    db: Session = Depends(get_db),
+    _=Depends(require_role("symotus_admin")),
+):
+    """全部 camera_access 授權列（帳號總覽的授權數與授權矩陣共用資料源）"""
+    rows = db.query(CameraAccess).all()
+    usernames = {u.id: u.username for u in db.query(User).all()}
+    return [{
+        "access_id": a.id, "camera_id": a.camera_id,
+        "user_id": a.user_id, "username": usernames.get(a.user_id),
+        "granted_by": a.granted_by, "granter_username": usernames.get(a.granted_by),
+        "permission_level": a.permission_level or "photos_stream",
+        "notify_on_online": a.notify_on_online,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+    } for a in rows]
 
 @router.put("/users/{user_id}")
 def update_user_admin(
@@ -143,13 +203,18 @@ def update_user_admin(
     if "camera_user_id" in body:
         user.camera_user_id = body["camera_user_id"]
     if "role" in body:
+        if body["role"] not in ("symotus_admin", "reseller", "end_user"):
+            raise HTTPException(status_code=400, detail="role 僅能是 symotus_admin/reseller/end_user")
         user.role = body["role"]
     if "is_active" in body:
         user.is_active = body["is_active"]
+    if "reseller_id" in body:
+        user.reseller_id = body["reseller_id"]  # 可為 null（解除從屬）
     db.commit()
     return {"id": user.id, "username": user.username, "email": user.email,
             "role": user.role, "camera_email": user.camera_email,
-            "camera_user_id": user.camera_user_id, "is_active": user.is_active}
+            "camera_user_id": user.camera_user_id, "is_active": user.is_active,
+            "reseller_id": user.reseller_id}
 
 
 @router.post("/camera-access")

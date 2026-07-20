@@ -98,5 +98,8 @@ def revoke_camera_access(
     ).first()
     if not access:
         raise HTTPException(404, "存取權限不存在")
+    # ownership：只有原授權者或平台管理員可撤銷，防止任意 reseller 撤他人授權
+    if current_user.role != "symotus_admin" and access.granted_by != current_user.id:
+        raise HTTPException(403, "只有原授權者可撤銷此存取權限")
     db.delete(access); db.commit()
     return {"message": "已撤銷存取權限"}

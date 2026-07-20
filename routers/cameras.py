@@ -1052,7 +1052,11 @@ async def proxy_camera_api(
     allow_fallback = (access is not None) or current_user.role == "symotus_admin"
 
     # F-5：寫入類操作（改設定/排程/PTZ/重啟等）需「完整(full)權限」。
-    if request.method not in ("GET", "HEAD") and access and access.permission_level != "full":
+    # symotus_admin 豁免：admin 對相機另持有非 full 的 camera_access（如自我配對的
+    # stream_only 列）時不應反被降權（正式庫 tester 即因此寫入被 403）。
+    if (request.method not in ("GET", "HEAD") and access
+            and access.permission_level != "full"
+            and current_user.role != "symotus_admin"):
         raise HTTPException(403, "此操作需要完整(full)權限")
 
     cam_token = await get_camera_backend_token(current_user)
