@@ -12,6 +12,7 @@ from typing import Optional
 from database import get_db
 from models import User, CameraInvitation, CameraAccess
 from auth import get_current_user, require_role
+from audit import log_action
 from config import settings
 from schemas import utc_iso
 
@@ -166,6 +167,11 @@ def accept_invitation(
     inv.status = "accepted"
     inv.invitee_id = current_user.id
     inv.responded_at = datetime.utcnow()
+    # 從屬樹回填：end_user 首次接受某 reseller/admin 的分享 → 掛到該邀請者旗下
+    if current_user.role == "end_user" and not current_user.reseller_id and inv.inviter_id:
+        inviter = db.query(User).filter(User.id == inv.inviter_id).first()
+        if inviter and inviter.role in ("reseller", "symotus_admin"):
+            current_user.reseller_id = inviter.id
     db.commit()
 
     return {"message": f"已接受！相機「{inv.camera_name}」已加入您的儀表板", "camera_id": inv.camera_id}
@@ -240,5 +246,8 @@ def cancel_invitation(
             CameraAccess.user_id == inv.invitee_id,
             CameraAccess.granted_by == inv.inviter_id,
         ).delete()
-    inv.status = "revoked"; db.commit()
+    inv.status = "revoked"
+    log_action(db, current_user, "revoke_invitation", "invitation", inv.id,
+               f"camera={inv.camera_id} inviter={inv.inviter_id} invitee={inv.invitee_id}")
+    db.commit()
     return {"message": "已停止分享"}

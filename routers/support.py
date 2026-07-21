@@ -5,6 +5,7 @@ from database import get_db
 from models import User, TechSupportGrant
 from schemas import TechSupportGrantCreate, TechSupportGrantResponse
 from auth import get_current_user, require_role
+from audit import log_action
 
 router = APIRouter(prefix="/support", tags=["support"])
 
@@ -20,7 +21,10 @@ def create_grant(
         camera_ids=body.camera_ids,
         expires_at=datetime.utcnow() + timedelta(hours=body.duration_hours),
     )
-    db.add(grant); db.commit(); db.refresh(grant)
+    db.add(grant)
+    log_action(db, current_user, "create_support_grant", "support_grant", None,
+               f"cameras={body.camera_ids or 'all'} hours={body.duration_hours}")
+    db.commit(); db.refresh(grant)
     return grant
 
 @router.get("/grants", response_model=list[TechSupportGrantResponse])
@@ -53,7 +57,9 @@ def revoke_grant(
     ).first()
     if not grant:
         raise HTTPException(404, "授權不存在")
-    grant.revoked_at = datetime.utcnow(); db.commit()
+    grant.revoked_at = datetime.utcnow()
+    log_action(db, current_user, "revoke_support_grant", "support_grant", grant.id, None)
+    db.commit()
     return {"message": "授權已撤銷"}
 
 
@@ -66,5 +72,7 @@ def admin_revoke_grant(
     grant = db.query(TechSupportGrant).filter(TechSupportGrant.id == grant_id).first()
     if not grant:
         raise HTTPException(404, "授權不存在")
-    grant.revoked_at = datetime.utcnow(); db.commit()
+    grant.revoked_at = datetime.utcnow()
+    log_action(db, current_user, "revoke_support_grant", "support_grant", grant.id, "by admin")
+    db.commit()
     return {"message": "授權已撤銷"}

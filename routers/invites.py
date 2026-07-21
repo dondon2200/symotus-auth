@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 from database import get_db
 from models import User, InviteToken
+from audit import log_action
 from schemas import InviteCreate, InviteResponse, InvitePreview
 from auth import get_current_user, require_role
 from config import settings
@@ -74,7 +75,10 @@ def revoke_invite(
     invite = q.first()
     if not invite:
         raise HTTPException(404, "邀請不存在或已無法撤銷")
-    invite.status = "revoked"; db.commit()
+    invite.status = "revoked"
+    log_action(db, current_user, "revoke_invite_token", "invite_token", invite.id,
+               f"email={invite.email} intended_role={invite.intended_role}")
+    db.commit()
     return {"message": "邀請已撤銷"}
 
 @router.get("/preview/{token}", response_model=InvitePreview)

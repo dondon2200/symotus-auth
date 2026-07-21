@@ -4,6 +4,7 @@ from database import get_db
 from models import User, CameraAccess
 from schemas import UserResponse, UserUpdate
 from auth import get_current_user, require_role
+from audit import log_action
 
 router = APIRouter(prefix="/reseller", tags=["reseller"])
 
@@ -82,6 +83,8 @@ def grant_camera_access(
     if existing:
         return {"message": "已有存取權限"}
     db.add(CameraAccess(camera_id=camera_id, user_id=user_id, granted_by=current_user.id))
+    log_action(db, current_user, "grant_access", "camera_access", None,
+               f"camera={camera_id} user={user_id}")
     db.commit()
     return {"message": "已分配相機存取權"}
 
@@ -101,5 +104,8 @@ def revoke_camera_access(
     # ownership：只有原授權者或平台管理員可撤銷，防止任意 reseller 撤他人授權
     if current_user.role != "symotus_admin" and access.granted_by != current_user.id:
         raise HTTPException(403, "只有原授權者可撤銷此存取權限")
-    db.delete(access); db.commit()
+    db.delete(access)
+    log_action(db, current_user, "revoke_access", "camera_access", access.id,
+               f"camera={camera_id} user={user_id}")
+    db.commit()
     return {"message": "已撤銷存取權限"}

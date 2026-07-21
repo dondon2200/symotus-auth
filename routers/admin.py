@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, CameraAccess, TechSupportGrant, CameraInvitation, InviteToken
+from models import User, CameraAccess, TechSupportGrant, CameraInvitation, InviteToken, AuditLog
 from schemas import UserResponse, TechSupportGrantResponse
 from auth import require_role, decode_token
+from audit import log_action
 from config import settings
 from datetime import datetime
 
@@ -19,6 +20,17 @@ def _is_admin(x_service_key: str, authorization: str) -> bool:
         except Exception:
             pass
     return False
+
+
+def _actor_user(authorization: str, db: Session):
+    """從 Bearer JWT 解出操作者 User（稽核用）；service key 操作回 None。"""
+    if authorization:
+        try:
+            payload = decode_token(authorization.replace("Bearer ", ""))
+            return db.query(User).filter(User.id == payload.sub).first()
+        except Exception:
+            pass
+    return None
 
 @router.get("/resellers")
 def list_resellers(
@@ -103,6 +115,8 @@ def remove_camera_access(
         CameraAccess.camera_id == camera_id,
         CameraAccess.user_id == user_id,
     ).delete()
+    log_action(db, _actor_user(authorization, db), "revoke_access", "camera_access", None,
+               f"camera={camera_id} user={user_id}")
     db.commit()
     return {"deleted": deleted, "camera_id": camera_id, "user_id": user_id}
 
@@ -127,6 +141,8 @@ def update_camera_access(
         access.permission_level = body["permission_level"]
     if "notify_on_online" in body:
         access.notify_on_online = bool(body["notify_on_online"])
+    log_action(db, _actor_user(authorization, db), "update_access", "camera_access", access.id,
+               f"camera={access.camera_id} user={access.user_id} -> {body}")
     db.commit()
     db.refresh(access)
     return {"id": access.id, "camera_id": access.camera_id, "user_id": access.user_id,
@@ -199,6 +215,7 @@ def update_user_admin(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    changes = {k: body[k] for k in ("camera_email", "camera_user_id", "role", "is_active", "reseller_id") if k in body}
     if "camera_email" in body:
         user.camera_email = body["camera_email"]
     if "camera_user_id" in body:
@@ -211,6 +228,8 @@ def update_user_admin(
         user.is_active = body["is_active"]
     if "reseller_id" in body:
         user.reseller_id = body["reseller_id"]  # 可為 null（解除從屬）
+    log_action(db, _actor_user(authorization, db), "update_user", "user", user.id,
+               f"{user.username} -> {changes}")
     db.commit()
     return {"id": user.id, "username": user.username, "email": user.email,
             "role": user.role, "camera_email": user.camera_email,
@@ -247,9 +266,56 @@ def add_camera_access(
         permission_level=permission_level,
     )
     db.add(access)
+    log_action(db, _actor_user(authorization, db), "grant_access", "camera_access", None,
+               f"camera={camera_id} user={user_id} level={permission_level}")
     db.commit()
     db.refresh(access)
     return {"status": "created", "id": access.id, "camera_id": camera_id, "user_id": user_id}
+
+@router.get("/audit-logs")
+def list_audit_logs(
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    _=Depends(require_role("symotus_admin")),
+):
+    """管理操作稽核記錄（新→舊）"""
+    rows = db.query(AuditLog).order_by(AuditLog.id.desc()).limit(min(limit, 500)).all()
+    return [{
+        "id": r.id, "actor_id": r.actor_id, "actor_username": r.actor_username,
+        "action": r.action, "target_type": r.target_type, "target_id": r.target_id,
+        "detail": r.detail,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]
+
+
+@router.get("/support-grants")
+def list_support_grants(
+    db: Session = Depends(get_db),
+    _=Depends(require_role("symotus_admin")),
+):
+    """技術支援授權完整列表（含已過期/已撤銷，附 reseller 名稱與有效狀態）。
+    注意：此機制目前僅為記錄，不影響存取判斷（admin 本就全通行）。"""
+    now = datetime.utcnow()
+    usernames = {u.id: (u.full_name or u.username) for u in db.query(User).all()}
+    grants = db.query(TechSupportGrant).order_by(TechSupportGrant.id.desc()).all()
+    result = []
+    for g in grants:
+        if g.revoked_at:
+            status = "revoked"
+        elif g.expires_at and g.expires_at < now:
+            status = "expired"
+        else:
+            status = "active"
+        result.append({
+            "id": g.id, "reseller_id": g.reseller_id,
+            "reseller_name": usernames.get(g.reseller_id),
+            "camera_ids": g.camera_ids, "status": status,
+            "expires_at": g.expires_at.isoformat() if g.expires_at else None,
+            "revoked_at": g.revoked_at.isoformat() if g.revoked_at else None,
+            "created_at": g.created_at.isoformat() if g.created_at else None,
+        })
+    return result
+
 
 @router.get("/invitations")
 def list_all_invitations(

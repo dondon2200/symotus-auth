@@ -153,6 +153,20 @@ class GDriveJob(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class AuditLog(Base):
+    """帳號/授權管理操作稽核（誰、何時、對誰做了什麼）"""
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    actor_id = Column(Integer, nullable=True)          # 操作者 user id；service key 操作為 None
+    actor_username = Column(String, nullable=True)     # 快照，避免帳號改名/刪除後無法追溯
+    action = Column(String, nullable=False, index=True)  # e.g. update_user / grant_access / revoke_invitation
+    target_type = Column(String, nullable=True)        # user / camera_access / invitation / invite_token / support_grant
+    target_id = Column(Integer, nullable=True)
+    detail = Column(String, nullable=True)             # 精簡描述（變更欄位、相機 id 等）
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class CameraInvitation(Base):
     """相機存取邀請（連結式，點連結接受）"""
     __tablename__ = "camera_invitations"
