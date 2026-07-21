@@ -64,11 +64,14 @@ def revoke_invite(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("reseller", "symotus_admin"))
 ):
-    invite = db.query(InviteToken).filter(
+    q = db.query(InviteToken).filter(
         InviteToken.token == token,
-        InviteToken.reseller_id == current_user.id,
         InviteToken.status == "pending",
-    ).first()
+    )
+    # symotus_admin 可代撤任何人發的邀請；其他角色僅能撤自己發的
+    if current_user.role != "symotus_admin":
+        q = q.filter(InviteToken.reseller_id == current_user.id)
+    invite = q.first()
     if not invite:
         raise HTTPException(404, "邀請不存在或已無法撤銷")
     invite.status = "revoked"; db.commit()

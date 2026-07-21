@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, CameraAccess, TechSupportGrant
+from models import User, CameraAccess, TechSupportGrant, CameraInvitation, InviteToken
 from schemas import UserResponse, TechSupportGrantResponse
 from auth import require_role, decode_token
+from config import settings
 from datetime import datetime
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -249,6 +250,47 @@ def add_camera_access(
     db.commit()
     db.refresh(access)
     return {"status": "created", "id": access.id, "camera_id": camera_id, "user_id": user_id}
+
+@router.get("/invitations")
+def list_all_invitations(
+    db: Session = Depends(get_db),
+    _=Depends(require_role("symotus_admin")),
+):
+    """全部邀請合併檢視：相機分享邀請（camera_invitations）＋帳號註冊邀請（invite_tokens）。
+    effective_status 對 pending 且已過期者標記 expired（資料庫 status 不動）。"""
+    now = datetime.utcnow()
+    usernames = {u.id: (u.full_name or u.username) for u in db.query(User).all()}
+
+    def eff(status, expires_at):
+        if status == "pending" and expires_at and expires_at < now:
+            return "expired"
+        return status
+
+    cam_invs = db.query(CameraInvitation).order_by(CameraInvitation.created_at.desc()).all()
+    tokens = db.query(InviteToken).order_by(InviteToken.created_at.desc()).all()
+    return {
+        "camera_invitations": [{
+            "id": i.id, "token": i.token, "camera_id": i.camera_id, "camera_name": i.camera_name,
+            "inviter_id": i.inviter_id, "inviter_name": usernames.get(i.inviter_id),
+            "invitee_id": i.invitee_id, "invitee_name": usernames.get(i.invitee_id),
+            "permission_level": i.permission_level, "is_public": i.is_public,
+            "status": i.status, "effective_status": eff(i.status, i.expires_at),
+            "invite_url": f"{settings.FRONTEND_URL}/camera-invite/{i.token}",
+            "expires_at": i.expires_at.isoformat() if i.expires_at else None,
+            "created_at": i.created_at.isoformat() if i.created_at else None,
+        } for i in cam_invs],
+        "invite_tokens": [{
+            "id": t.id, "token": t.token,
+            "inviter_id": t.reseller_id, "inviter_name": usernames.get(t.reseller_id),
+            "email": t.email, "intended_role": t.intended_role, "camera_ids": t.camera_ids,
+            "status": t.status, "effective_status": eff(t.status, t.expires_at),
+            "accepted_by": t.accepted_by, "accepted_by_name": usernames.get(t.accepted_by),
+            "invite_url": f"{settings.FRONTEND_URL}/invite/{t.token}",
+            "expires_at": t.expires_at.isoformat() if t.expires_at else None,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        } for t in tokens],
+    }
+
 
 @router.post("/migrate/add-camera-user-id")
 def migrate_add_camera_user_id(

@@ -224,18 +224,21 @@ def cancel_invitation(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("reseller", "symotus_admin")),
 ):
-    inv = db.query(CameraInvitation).filter(
+    q = db.query(CameraInvitation).filter(
         CameraInvitation.id == inv_id,
-        CameraInvitation.inviter_id == current_user.id,
         CameraInvitation.status.in_(["pending", "accepted"]),
-    ).first()
+    )
+    # symotus_admin 可代撤任何人發的邀請；其他角色僅能撤自己發的
+    if current_user.role != "symotus_admin":
+        q = q.filter(CameraInvitation.inviter_id == current_user.id)
+    inv = q.first()
     if not inv:
         raise HTTPException(404, "邀請不存在或無法撤銷")
     if inv.status == "accepted" and inv.invitee_id:
         db.query(CameraAccess).filter(
             CameraAccess.camera_id == inv.camera_id,
             CameraAccess.user_id == inv.invitee_id,
-            CameraAccess.granted_by == current_user.id,
+            CameraAccess.granted_by == inv.inviter_id,
         ).delete()
     inv.status = "revoked"; db.commit()
     return {"message": "已停止分享"}
