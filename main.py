@@ -146,6 +146,14 @@ async def startup():
                         conn.rollback()
 
             logger.info("DB connected and tables created!")
+            # 種子功能權限政策（缺列才補，不覆蓋既有調整）
+            try:
+                from database import SessionLocal
+                from policies import seed_policies
+                with SessionLocal() as _s:
+                    seed_policies(_s)
+            except Exception as e:
+                logger.warning(f"seed_policies: {e}")
             # 啟動相機開機 LINE 推播背景工作
             from services.camera_notifier import start_camera_notifier
             asyncio.create_task(start_camera_notifier())
@@ -186,6 +194,22 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "symotus-auth"}
+
+
+from fastapi import Depends
+from sqlalchemy.orm import Session as _Session
+from database import get_db
+from auth import get_current_user
+
+
+@app.get("/policies")
+def public_policies(db: _Session = Depends(get_db), _user=Depends(get_current_user)):
+    """功能權限政策（任何登入者可讀，供前端 UI gating；安全判斷仍在後端各 gate）"""
+    from policies import get_policies, FEATURE_DEFAULTS
+    pols = get_policies(db)
+    order = [k for k, _, _ in FEATURE_DEFAULTS]
+    return [{"feature_key": k, "min_level": pols[k]["min_level"], "enabled": pols[k]["enabled"]}
+            for k in order if k in pols]
 
 
 @app.get("/version")

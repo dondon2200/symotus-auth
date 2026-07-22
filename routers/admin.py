@@ -272,6 +272,84 @@ def add_camera_access(
     db.refresh(access)
     return {"status": "created", "id": access.id, "camera_id": camera_id, "user_id": user_id}
 
+@router.get("/policies")
+def list_feature_policies(
+    db: Session = Depends(get_db),
+    _=Depends(require_role("symotus_admin")),
+):
+    """功能權限政策列表（順序依目錄定義）"""
+    from models import FeaturePolicy
+    from policies import FEATURE_DEFAULTS
+    defaults = {k: lv for k, lv, _ in FEATURE_DEFAULTS}
+    rows = {p.feature_key: p for p in db.query(FeaturePolicy).all()}
+    order = [k for k, _, _ in FEATURE_DEFAULTS]
+    result = []
+    for key in order + [k for k in rows if k not in order]:
+        p = rows.get(key)
+        if not p:
+            continue
+        result.append({
+            "feature_key": p.feature_key, "min_level": p.min_level,
+            "enabled": p.enabled, "description": p.description,
+            "default_level": defaults.get(p.feature_key),
+            "is_default": p.enabled and p.min_level == defaults.get(p.feature_key),
+            "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+        })
+    return result
+
+
+@router.put("/policies/{feature_key}")
+def update_feature_policy(
+    feature_key: str,
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("symotus_admin")),
+):
+    """更新單一功能政策：min_level / enabled（寫稽核；cache 60 秒內生效）"""
+    from models import FeaturePolicy
+    from policies import LEVEL_ORDER, invalidate_cache
+    p = db.query(FeaturePolicy).filter(FeaturePolicy.feature_key == feature_key).first()
+    if not p:
+        raise HTTPException(404, "policy not found")
+    changes = {}
+    if "min_level" in body:
+        if body["min_level"] not in LEVEL_ORDER:
+            raise HTTPException(400, f"min_level 僅能是 {'/'.join(LEVEL_ORDER)}")
+        changes["min_level"] = body["min_level"]
+        p.min_level = body["min_level"]
+    if "enabled" in body:
+        changes["enabled"] = bool(body["enabled"])
+        p.enabled = bool(body["enabled"])
+    if not changes:
+        raise HTTPException(400, "沒有可更新的欄位（min_level / enabled）")
+    p.updated_by = current_user.id
+    log_action(db, current_user, "update_policy", "feature_policy", p.id,
+               f"{feature_key} -> {changes}")
+    db.commit()
+    invalidate_cache()
+    return {"feature_key": p.feature_key, "min_level": p.min_level, "enabled": p.enabled}
+
+
+@router.post("/policies/reset")
+def reset_feature_policies(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("symotus_admin")),
+):
+    """一鍵還原全部政策為種子預設（防止改壞把功能鎖死）"""
+    from models import FeaturePolicy
+    from policies import FEATURE_DEFAULTS, invalidate_cache
+    for key, level, desc in FEATURE_DEFAULTS:
+        p = db.query(FeaturePolicy).filter(FeaturePolicy.feature_key == key).first()
+        if p:
+            p.min_level = level; p.enabled = True; p.updated_by = current_user.id
+        else:
+            db.add(FeaturePolicy(feature_key=key, min_level=level, description=desc, enabled=True))
+    log_action(db, current_user, "reset_policies", "feature_policy", None, "restore all defaults")
+    db.commit()
+    invalidate_cache()
+    return {"ok": True}
+
+
 @router.get("/audit-logs")
 def list_audit_logs(
     limit: int = 200,

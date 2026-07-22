@@ -153,6 +153,21 @@ class GDriveJob(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class FeaturePolicy(Base):
+    """功能權限政策：被分享者（camera_access）依授權等級可用的功能。
+    單一事實來源；種子預設 = 原硬編碼行為。admin 角色不受政策限制。"""
+    __tablename__ = "feature_policies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    feature_key = Column(String, unique=True, nullable=False, index=True)  # 例 camera.control
+    # 最低需求等級：stream_only < photos_stream < full < owner_only（owner_only=被分享者一律不可）
+    min_level = Column(String, nullable=False, default="full")
+    enabled = Column(Boolean, nullable=False, default=True)  # false = 功能對被分享者全面停用
+    description = Column(String, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(Integer, nullable=True)
+
+
 class AuditLog(Base):
     """帳號/授權管理操作稽核（誰、何時、對誰做了什麼）"""
     __tablename__ = "audit_logs"

@@ -14,6 +14,7 @@ import httpx
 from database import get_db
 from models import User, CameraAccess
 from auth import get_current_user, to_backend_role
+from policies import level_allows, feature_for_write
 
 router = APIRouter(prefix="/cameras", tags=["cameras"])
 
@@ -769,6 +770,12 @@ async def nas_images(
         ).first()
     allow_fallback = (access is not None) or current_user.role == "symotus_admin"
 
+    # photos.view 政策：被分享者（非自我配對）等級不足 → 後端直接擋（不再只靠 UI 藏按鈕）
+    if (access and access.granted_by != current_user.id
+            and current_user.role != "symotus_admin"
+            and not level_allows(db, "photos.view", access.permission_level)):
+        raise HTTPException(403, "此操作需要更高的授權等級（photos.view）")
+
     # 沒有自己的 token（分享用戶）→ 用 granter 的 token
     if not cam_token and access and access.granted_by:
         owner = db.query(User).filter(User.id == access.granted_by).first()
@@ -972,14 +979,22 @@ async def nas_image(
     cam_token = await get_camera_backend_token(current_user)
     # 分享用戶沒有自己的 token → 嘗試用 granter token
     if not cam_token:
-        path_param = request.query_params.get("path", "")
         # 路徑格式：/homes/firmness/{serial}/... 無法直接得知 camera_id
-        # 改為查該用戶所有 camera_access，取第一個 granter token
-        access = db.query(CameraAccess).filter(CameraAccess.user_id == current_user.id).first()
-        if access and access.granted_by:
-            owner = db.query(User).filter(User.id == access.granted_by).first()
-            if owner:
-                cam_token = await get_camera_backend_token(owner)
+        # 查該用戶所有 camera_access，只用「photos.view 等級足夠」的 grant 換 token
+        # （stream_only-only 的被分享者在此直接 403，不再能借 granter token 看照片）
+        accesses = db.query(CameraAccess).filter(CameraAccess.user_id == current_user.id).all()
+        viewable = [a for a in accesses
+                    if a.granted_by == current_user.id
+                    or level_allows(db, "photos.view", a.permission_level)]
+        if accesses and not viewable and current_user.role != "symotus_admin":
+            raise HTTPException(403, "此操作需要更高的授權等級（photos.view）")
+        for a in viewable:
+            if a.granted_by and a.granted_by != current_user.id:
+                owner = db.query(User).filter(User.id == a.granted_by).first()
+                if owner:
+                    cam_token = await get_camera_backend_token(owner)
+                    if cam_token:
+                        break
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token")
     from fastapi.responses import StreamingResponse
@@ -1051,13 +1066,16 @@ async def proxy_camera_api(
     ).first()
     allow_fallback = (access is not None) or current_user.role == "symotus_admin"
 
-    # F-5：寫入類操作（改設定/排程/PTZ/重啟等）需「完整(full)權限」。
-    # symotus_admin 豁免：admin 對相機另持有非 full 的 camera_access（如自我配對的
-    # stream_only 列）時不應反被降權（正式庫 tester 即因此寫入被 403）。
+    # F-5：寫入類操作依 FeaturePolicy 政策檢查（預設＝原「需 full」行為）。
+    # 只約束「真正的被分享者」：自我配對列（granted_by==自己，如訂閱通知時自動建立的
+    # stream_only 列）視同擁有者，不降權；symotus_admin 一律豁免。
+    # 路徑分流：ptz/reboot/autofocus→camera.control、空路徑→camera.rename、其餘→camera.settings。
     if (request.method not in ("GET", "HEAD") and access
-            and access.permission_level != "full"
+            and access.granted_by != current_user.id
             and current_user.role != "symotus_admin"):
-        raise HTTPException(403, "此操作需要完整(full)權限")
+        feature = feature_for_write(path)
+        if not level_allows(db, feature, access.permission_level):
+            raise HTTPException(403, f"此操作需要更高的授權等級（{feature}）")
 
     cam_token = await get_camera_backend_token(current_user)
     # 若沒有自己的 token，嘗試用 camera_access granter 的 token
