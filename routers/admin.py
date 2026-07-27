@@ -352,18 +352,46 @@ def reset_feature_policies(
 
 @router.get("/audit-logs")
 def list_audit_logs(
-    limit: int = 200,
+    limit: int = 100,
+    offset: int = 0,
+    action: str = None,
+    actor: str = None,
+    target_type: str = None,
+    since: str = None,
+    until: str = None,
     db: Session = Depends(get_db),
     _=Depends(require_role("symotus_admin")),
 ):
-    """管理操作稽核記錄（新→舊）"""
-    rows = db.query(AuditLog).order_by(AuditLog.id.desc()).limit(min(limit, 500)).all()
-    return [{
-        "id": r.id, "actor_id": r.actor_id, "actor_username": r.actor_username,
-        "action": r.action, "target_type": r.target_type, "target_id": r.target_id,
-        "detail": r.detail,
-        "created_at": r.created_at.isoformat() if r.created_at else None,
-    } for r in rows]
+    """管理操作稽核記錄（新→舊）。篩選：action / actor（username 前綴）/ target_type /
+    since / until（YYYY-MM-DD）；offset+limit 分頁；回傳含 total 供「載入更多」判斷。"""
+    q = db.query(AuditLog)
+    if action:
+        q = q.filter(AuditLog.action == action)
+    if actor:
+        q = q.filter(AuditLog.actor_username.ilike(f"{actor}%"))
+    if target_type:
+        q = q.filter(AuditLog.target_type == target_type)
+    try:
+        if since:
+            q = q.filter(AuditLog.created_at >= datetime.fromisoformat(since))
+        if until:
+            # until 含當日：加一天做開區間
+            from datetime import timedelta
+            q = q.filter(AuditLog.created_at < datetime.fromisoformat(until) + timedelta(days=1))
+    except ValueError:
+        raise HTTPException(400, "since/until 需為 YYYY-MM-DD")
+    total = q.count()
+    rows = q.order_by(AuditLog.id.desc()).offset(max(offset, 0)).limit(min(max(limit, 1), 500)).all()
+    return {
+        "total": total,
+        "offset": max(offset, 0),
+        "items": [{
+            "id": r.id, "actor_id": r.actor_id, "actor_username": r.actor_username,
+            "action": r.action, "target_type": r.target_type, "target_id": r.target_id,
+            "detail": r.detail,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        } for r in rows],
+    }
 
 
 @router.get("/support-grants")
@@ -434,6 +462,28 @@ def list_all_invitations(
             "created_at": t.created_at.isoformat() if t.created_at else None,
         } for t in tokens],
     }
+
+
+@router.post("/invitations/cleanup")
+def cleanup_expired_invitations(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("symotus_admin")),
+):
+    """把 pending 但已過期的邀請（兩種）狀態寫回 expired（效果同 effective_status，寫實 DB）"""
+    now = datetime.utcnow()
+    n_tokens = db.query(InviteToken).filter(
+        InviteToken.status == "pending",
+        InviteToken.expires_at < now,
+    ).update({"status": "expired"})
+    n_invs = db.query(CameraInvitation).filter(
+        CameraInvitation.status == "pending",
+        CameraInvitation.expires_at != None,  # noqa: E711
+        CameraInvitation.expires_at < now,
+    ).update({"status": "expired"})
+    log_action(db, current_user, "cleanup_invitations", "invitation", None,
+               f"invite_tokens={n_tokens} camera_invitations={n_invs}")
+    db.commit()
+    return {"invite_tokens_expired": n_tokens, "camera_invitations_expired": n_invs}
 
 
 @router.post("/migrate/add-camera-user-id")

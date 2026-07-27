@@ -535,6 +535,15 @@ async def subscribe_online_notification(
     if allowed_ids is not None and camera_id not in allowed_ids:
         raise HTTPException(403, "無此相機的存取權限")
 
+    # notify.subscribe 政策：被分享者（非自我配對）等級不足或功能停用 → 拒訂（退訂不受限）
+    _acc = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == camera_id, CameraAccess.user_id == current_user.id,
+    ).first()
+    if (_acc and _acc.granted_by != current_user.id
+            and current_user.role != "symotus_admin"
+            and not level_allows(db, "notify.subscribe", _acc.permission_level)):
+        raise HTTPException(403, "此操作需要更高的授權等級（notify.subscribe）")
+
     if not current_user.line_id:
         return {"subscribed": False, "needs_line": True, "is_following": False,
                 "message": "請先綁定 LINE 帳號"}
@@ -609,6 +618,14 @@ async def notify_bulk(
             return {"needs_line": True, "message": "請先綁定 LINE 帳號"}
         if not await _is_following_oa(current_user.line_id):
             return {"needs_line": True, "message": "請先加入官方 LINE 帳號以接收通知"}
+        # notify.subscribe 政策：略過等級不足的被分享相機（退訂不受限）
+        if current_user.role != "symotus_admin":
+            shared = {a.camera_id: a for a in db.query(CameraAccess).filter(
+                CameraAccess.user_id == current_user.id,
+                CameraAccess.granted_by != current_user.id,
+            ).all()}
+            camera_ids = [c for c in camera_ids
+                          if c not in shared or level_allows(db, "notify.subscribe", shared[c].permission_level)]
 
     for cam_id in camera_ids:
         _set_notify(db, cam_id, current_user, subscribe)
