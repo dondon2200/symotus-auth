@@ -21,25 +21,36 @@ FEATURE_DEFAULTS = [
     ("camera.rename",    "full",          "相機改名"),
     ("camera.share",     "full",          "發相機分享邀請"),
     ("camera.unbind",    "full",          "解除綁定"),
-    ("camera.delete",    "owner_only",    "刪除相機/裝置更換"),
+    ("camera.delete",    "owner_only",    "刪除相機"),
+    ("device.replace",   "owner_only",    "裝置更換（換機/撤下裝置）"),
     ("notify.subscribe", "stream_only",   "LINE 開機通知訂閱"),
 ]
 
 # 通用 proxy 寫入路徑 → feature_key（首段比對）
 _CONTROL_PREFIXES = ("ptz", "reboot", "restart", "autofocus", "focus")
 _TIMELAPSE_PREFIXES = ("timelapse-jobs", "prepare-timelapse")
+_DEVICE_PREFIXES = ("replace-device", "release-device")
 
 
 def seed_policies(db: Session):
-    """補齊缺少的政策列（不覆蓋既有調整值）。"""
-    existing = {p.feature_key for p in db.query(FeaturePolicy).all()}
-    added = False
+    """補齊缺少的政策列（不覆蓋既有 min_level/enabled 調整值）。
+
+    description 為目錄文案（管理端不可編輯），目錄改字時就地同步——例如
+    camera.delete 由「刪除相機/裝置更換」拆分後只剩「刪除相機」。
+    """
+    rows = {p.feature_key: p for p in db.query(FeaturePolicy).all()}
+    dirty = False
     for key, level, desc in FEATURE_DEFAULTS:
-        if key not in existing:
+        p = rows.get(key)
+        if p is None:
             db.add(FeaturePolicy(feature_key=key, min_level=level, description=desc, enabled=True))
-            added = True
-    if added:
+            dirty = True
+        elif p.description != desc:
+            p.description = desc
+            dirty = True
+    if dirty:
         db.commit()
+        invalidate_cache()
 
 
 # ── 60 秒 in-memory cache（每請求零額外 DB 查詢）─────────────────
@@ -87,6 +98,9 @@ def feature_for_write(path: str) -> str:
         return "camera.rename"
     if first.startswith(_CONTROL_PREFIXES):
         return "camera.control"
+    if first.startswith(_DEVICE_PREFIXES):
+        # 換機/撤下裝置：與「刪除相機」拆開獨立控管（原先落在 camera.settings）
+        return "device.replace"
     if first.startswith(_TIMELAPSE_PREFIXES):
         # 產縮時屬「使用照片」而非「改設定」：photos_stream 即可（原 F-5 一律要 full，
         # 與 UI 開放 photos_stream 產縮時矛盾——政策化後在此修正）
