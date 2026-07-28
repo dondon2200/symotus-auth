@@ -6,7 +6,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, CameraAccess, TechSupportGrant
+from models import User, CameraAccess
 from schemas import TokenPayload
 from config import settings
 import secrets
@@ -114,25 +114,6 @@ def require_role(*roles: str):
         return current_user
     return checker
 
-def verify_camera_access(camera_id: int, user: User, db: Session) -> bool:
-    """驗證 user 是否有權存取某台相機"""
-    if user.role == "symotus_admin":
-        # 檢查有沒有有效的 tech support grant
-        grant = db.query(TechSupportGrant).filter(
-            TechSupportGrant.expires_at > datetime.utcnow(),
-            TechSupportGrant.revoked_at == None,
-        ).first()
-        return grant is not None
-
-    if user.role == "reseller":
-        # reseller 可存取自己擁有的相機（向現有後端查詢）
-        return True  # 讓現有後端的 owner_id 驗證
-
-    if user.role == "end_user":
-        access = db.query(CameraAccess).filter(
-            CameraAccess.camera_id == camera_id,
-            CameraAccess.user_id == user.id,
-        ).first()
-        return access is not None
-
-    return False
+# （已移除死碼 verify_camera_access：從未被呼叫，且其 admin 分支語意與
+#   2026-07-27 決策「admin 不受 TechSupportGrant 限制」不符。實際權限判斷
+#   在 routers/cameras.py 的 get_allowed_camera_ids 與各 gate。）

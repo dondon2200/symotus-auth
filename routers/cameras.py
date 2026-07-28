@@ -11,9 +11,11 @@ import asyncio
 import logging
 import httpx
 
+from datetime import datetime
 from database import get_db
-from models import User, CameraAccess
+from models import User, CameraAccess, TechSupportGrant
 from auth import get_current_user, to_backend_role
+from audit import log_action
 from policies import level_allows, feature_for_write
 
 router = APIRouter(prefix="/cameras", tags=["cameras"])
@@ -1093,6 +1095,21 @@ async def proxy_camera_api(
         feature = feature_for_write(path)
         if not level_allows(db, feature, access.permission_level):
             raise HTTPException(403, f"此操作需要更高的授權等級（{feature}）")
+
+    # A3 決策（2026-07-27）：admin 不受 TechSupportGrant 限制——它是「同意記錄」而非閘門。
+    # 落地方式：admin 的寫入操作若未被任何有效支援授權涵蓋，寫一筆稽核（不阻擋），
+    # 讓「未經同意動了誰的相機」永遠可追溯。有涵蓋（明列相機或全相機授權）則視為已同意、不記。
+    if request.method not in ("GET", "HEAD") and current_user.role == "symotus_admin":
+        now = datetime.utcnow()
+        grants = db.query(TechSupportGrant).filter(
+            TechSupportGrant.expires_at > now,
+            TechSupportGrant.revoked_at == None,  # noqa: E711
+        ).all()
+        covered = any(g.camera_ids is None or camera_id in (g.camera_ids or []) for g in grants)
+        if not covered:
+            log_action(db, current_user, "admin_write_no_grant", "camera", camera_id,
+                       f"path={path or '(rename)'} method={request.method}")
+            db.commit()
 
     cam_token = await get_camera_backend_token(current_user)
     # 若沒有自己的 token，嘗試用 camera_access granter 的 token
