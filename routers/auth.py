@@ -12,6 +12,7 @@ from auth import (hash_password, verify_password, create_access_token,
                   create_refresh_token, decode_token, get_current_user,
                   to_backend_role, create_line_bind_token, decode_line_bind_token)
 from config import settings
+from audit import log_action
 
 
 CAMERA_BACKEND_URL = "https://user.symotus.com"
@@ -146,16 +147,37 @@ def logout(body: RefreshRequest, db: Session = Depends(get_db)):
         db.commit()
     return {"message": "Logged out"}
 
+def _me_payload(user: User) -> dict:
+    """/auth/me 系列端點共用的使用者序列化。"""
+    return {"id": user.id, "username": user.username,
+            "email": user.email, "full_name": user.full_name,
+            "role": user.role, "reseller_id": user.reseller_id,
+            "is_active": user.is_active,
+            "has_password": user.hashed_password is not None,
+            "google_linked": user.google_id is not None,
+            "line_linked": user.line_id is not None,
+            "created_at": user.created_at.isoformat() if user.created_at else None}
+
+
 @router.get("/me")
 def me(current_user: User = Depends(get_current_user)):
-    return {"id": current_user.id, "username": current_user.username,
-            "email": current_user.email, "full_name": current_user.full_name,
-            "role": current_user.role, "reseller_id": current_user.reseller_id,
-            "is_active": current_user.is_active,
-            "has_password": current_user.hashed_password is not None,
-            "google_linked": current_user.google_id is not None,
-            "line_linked": current_user.line_id is not None,
-            "created_at": current_user.created_at.isoformat() if current_user.created_at else None}
+    return _me_payload(current_user)
+
+
+class UpdateMeRequest(BaseModel):
+    full_name: Optional[str] = None
+
+
+@router.put("/me")
+def update_me(body: UpdateMeRequest, db: Session = Depends(get_db),
+              current_user: User = Depends(get_current_user)):
+    """self-service 更新。刻意只收 full_name：username/email/role 不開放自助修改，
+    且本端點不接受 user_id，結構上就不可能改到別人。"""
+    current_user.full_name = (body.full_name or "").strip() or None
+    log_action(db, current_user, "self_update_profile", "user", current_user.id, "full_name")
+    db.commit()
+    db.refresh(current_user)
+    return _me_payload(current_user)
 
 
 class ExchangeRequest(BaseModel):
