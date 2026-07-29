@@ -178,3 +178,10 @@ def test_unlink_unknown_provider_rejected(client, make_user, auth_headers):
     user = make_user("tina", "tina@example.com", password="oldpassword", google_id="g-t")
     r = client.post("/auth/me/unlink/facebook", headers=auth_headers(user))
     assert r.status_code == 400
+
+
+def test_unlink_unlinked_provider_rejected(client, make_user, auth_headers):
+    user = make_user("uuid", "uuid@example.com", password="oldpassword")
+    r = client.post("/auth/me/unlink/google", headers=auth_headers(user))
+    assert r.status_code == 400
+    assert "尚未綁定該登入方式" in r.json()["detail"]

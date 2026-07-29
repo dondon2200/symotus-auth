@@ -243,6 +243,12 @@ def unlink_provider(provider: str, db: Session = Depends(get_db),
     if provider not in ("google", "line"):
         raise HTTPException(400, "不支援的登入方式")
 
+    # 檢查目標 provider 是否已綁定
+    if provider == "google" and current_user.google_id is None:
+        raise HTTPException(400, "尚未綁定該登入方式")
+    elif provider == "line" and current_user.line_id is None:
+        raise HTTPException(400, "尚未綁定該登入方式")
+
     remaining = [
         current_user.hashed_password is not None,
         current_user.google_id is not None and provider != "google",
