@@ -180,6 +180,46 @@ def update_me(body: UpdateMeRequest, db: Session = Depends(get_db),
     return _me_payload(current_user)
 
 
+MIN_PASSWORD_LENGTH = 8
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: Optional[str] = None
+    new_password: str
+    keep_refresh_token: Optional[str] = None
+
+
+@router.post("/me/password")
+def change_my_password(body: ChangePasswordRequest, db: Session = Depends(get_db),
+                       current_user: User = Depends(get_current_user)):
+    """設定或變更自己的密碼。
+
+    OAuth-only 帳號（hashed_password 為 None）免帶舊密碼——持有有效 access token
+    即已完成身分驗證，要求一個不存在的舊密碼會讓這些帳號永遠設不了密碼。
+    """
+    if len(body.new_password or "") < MIN_PASSWORD_LENGTH:
+        raise HTTPException(400, f"新密碼至少需要 {MIN_PASSWORD_LENGTH} 個字元")
+
+    if current_user.hashed_password is not None:
+        if not body.current_password or not verify_password(
+                body.current_password, current_user.hashed_password):
+            raise HTTPException(401, "目前密碼不正確")
+
+    current_user.hashed_password = hash_password(body.new_password)
+
+    # 密碼換了，其他裝置上的 session 一律作廢；呼叫端自己那一枚由 keep_refresh_token 指定保留
+    q = db.query(RefreshToken).filter(RefreshToken.user_id == current_user.id,
+                                      RefreshToken.revoked == False)
+    if body.keep_refresh_token:
+        q = q.filter(RefreshToken.token != body.keep_refresh_token)
+    for token in q.all():
+        token.revoked = True
+
+    log_action(db, current_user, "self_change_password", "user", current_user.id, "hashed_password")
+    db.commit()
+    return {"message": "密碼已更新"}
+
+
 class ExchangeRequest(BaseModel):
     code: str
 
