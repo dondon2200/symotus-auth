@@ -185,3 +185,42 @@ def test_unlink_unlinked_provider_rejected(client, make_user, auth_headers):
     r = client.post("/auth/me/unlink/google", headers=auth_headers(user))
     assert r.status_code == 400
     assert "尚未綁定該登入方式" in r.json()["detail"]
+
+
+def test_google_bind_url_contains_bind_ticket(client, make_user, auth_headers):
+    user = make_user("ulla", "ulla@example.com", password="oldpassword")
+    r = client.get("/auth/google/bind-url", headers=auth_headers(user))
+    assert r.status_code == 200
+    assert ":gbind:" in r.json()["state"]
+
+
+def test_link_google_writes_google_id(client, make_user, auth_headers, db, monkeypatch):
+    import routers.auth as auth_router_mod
+    user = make_user("vera", "vera@example.com", password="oldpassword")
+
+    async def fake_profile(code, state):
+        return {"sub": "g-vera", "email": "vera@gmail.com"}
+    monkeypatch.setattr(auth_router_mod, "_fetch_google_profile", fake_profile)
+
+    r = client.post("/auth/me/link/google", headers=auth_headers(user),
+                    json={"code": "c", "state": "s"})
+    assert r.status_code == 200
+    assert r.json()["google_linked"] is True
+    db.refresh(user)
+    assert user.google_id == "g-vera"
+
+
+def test_link_google_rejects_id_owned_by_someone_else(client, make_user, auth_headers, db, monkeypatch):
+    import routers.auth as auth_router_mod
+    make_user("wendy", "wendy@example.com", google_id="g-taken")
+    user = make_user("xavier", "xavier@example.com", password="oldpassword")
+
+    async def fake_profile(code, state):
+        return {"sub": "g-taken", "email": "taken@gmail.com"}
+    monkeypatch.setattr(auth_router_mod, "_fetch_google_profile", fake_profile)
+
+    r = client.post("/auth/me/link/google", headers=auth_headers(user),
+                    json={"code": "c", "state": "s"})
+    assert r.status_code == 409
+    db.refresh(user)
+    assert user.google_id is None

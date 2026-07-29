@@ -10,7 +10,8 @@ from models import User, RefreshToken, InviteToken, CameraAccess
 from schemas import LoginRequest, TokenResponse, RefreshRequest, OAuthCallbackRequest
 from auth import (hash_password, verify_password, create_access_token,
                   create_refresh_token, decode_token, get_current_user,
-                  to_backend_role, create_line_bind_token, decode_line_bind_token)
+                  to_backend_role, create_line_bind_token, decode_line_bind_token,
+                  create_google_bind_token, decode_google_bind_token)
 from config import settings
 from audit import log_action
 
@@ -308,6 +309,54 @@ async def google_token(body: OAuthCallbackRequest, request: Request, db: Session
         ui = r2.json()
     return _oauth_finish(db, "google_id", ui["sub"], ui.get("email"), ui.get("name"),
                          invite_token_str, host=_get_host(request))
+
+async def _fetch_google_profile(code: str, state: str) -> dict:
+    """以授權碼向 Google 換取 userinfo。抽成模組層函式以便測試 monkeypatch。"""
+    async with httpx.AsyncClient() as client:
+        r = await client.post("https://oauth2.googleapis.com/token", data={
+            "code": code, "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code"})
+        td = r.json()
+        if "access_token" not in td:
+            raise HTTPException(400, "Google 授權失敗，請重新嘗試")
+        r2 = await client.get("https://www.googleapis.com/oauth2/v3/userinfo",
+                              headers={"Authorization": f"Bearer {td['access_token']}"})
+        return r2.json()
+
+
+@router.get("/google/bind-url")
+def google_bind_url(current_user: User = Depends(get_current_user)):
+    """綁定用授權 URL。沿用登入的 redirect URI，靠 state 內的 ticket 區分綁定與登入，
+    因此不必到 Google Console 另外登記網址。"""
+    ticket = create_google_bind_token(current_user.id)
+    state = f"{secrets.token_urlsafe(16)}:gbind:{ticket}"
+    params = (f"client_id={settings.GOOGLE_CLIENT_ID}"
+              f"&redirect_uri={settings.GOOGLE_REDIRECT_URI}"
+              f"&response_type=code&scope=openid email profile&state={state}")
+    return {"auth_url": f"https://accounts.google.com/o/oauth2/v2/auth?{params}", "state": state}
+
+
+@router.post("/me/link/google")
+async def link_google(body: OAuthCallbackRequest, db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)):
+    ui = await _fetch_google_profile(body.code, body.state or "")
+    google_id = ui.get("sub")
+    if not google_id:
+        raise HTTPException(400, "無法取得 Google 帳號資訊")
+
+    taken = db.query(User).filter(User.google_id == google_id,
+                                  User.id != current_user.id).first()
+    if taken:
+        raise HTTPException(409, "此 Google 帳號已綁定其他使用者")
+
+    current_user.google_id = google_id
+    log_action(db, current_user, "self_link_google", "user", current_user.id, "google_id")
+    db.commit()
+    db.refresh(current_user)
+    return _me_payload(current_user)
+
 
 async def _line_email(client: httpx.AsyncClient, td: dict) -> Optional[str]:
     """從 LINE token 回應取 email。
