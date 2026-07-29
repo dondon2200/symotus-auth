@@ -196,14 +196,16 @@ def test_google_bind_url_contains_bind_ticket(client, make_user, auth_headers):
 
 def test_link_google_writes_google_id(client, make_user, auth_headers, db, monkeypatch):
     import routers.auth as auth_router_mod
+    import auth
     user = make_user("vera", "vera@example.com", password="oldpassword")
 
     async def fake_profile(code, state):
         return {"sub": "g-vera", "email": "vera@gmail.com"}
     monkeypatch.setattr(auth_router_mod, "_fetch_google_profile", fake_profile)
 
+    state = f"r:gbind:{auth.create_google_bind_token(user.id)}"
     r = client.post("/auth/me/link/google", headers=auth_headers(user),
-                    json={"code": "c", "state": "s"})
+                    json={"code": "c", "state": state})
     assert r.status_code == 200
     assert r.json()["google_linked"] is True
     db.refresh(user)
@@ -212,6 +214,7 @@ def test_link_google_writes_google_id(client, make_user, auth_headers, db, monke
 
 def test_link_google_rejects_id_owned_by_someone_else(client, make_user, auth_headers, db, monkeypatch):
     import routers.auth as auth_router_mod
+    import auth
     make_user("wendy", "wendy@example.com", google_id="g-taken")
     user = make_user("xavier", "xavier@example.com", password="oldpassword")
 
@@ -219,8 +222,45 @@ def test_link_google_rejects_id_owned_by_someone_else(client, make_user, auth_he
         return {"sub": "g-taken", "email": "taken@gmail.com"}
     monkeypatch.setattr(auth_router_mod, "_fetch_google_profile", fake_profile)
 
+    state = f"r:gbind:{auth.create_google_bind_token(user.id)}"
     r = client.post("/auth/me/link/google", headers=auth_headers(user),
-                    json={"code": "c", "state": "s"})
+                    json={"code": "c", "state": state})
     assert r.status_code == 409
+    db.refresh(user)
+    assert user.google_id is None
+
+
+def test_link_google_rejects_state_without_gbind_marker(client, make_user, auth_headers, db, monkeypatch):
+    import routers.auth as auth_router_mod
+    user = make_user("yara", "yara@example.com", password="oldpassword")
+
+    async def fake_profile(code, state):
+        return {"sub": "g-yara", "email": "yara@gmail.com"}
+    monkeypatch.setattr(auth_router_mod, "_fetch_google_profile", fake_profile)
+
+    r = client.post("/auth/me/link/google", headers=auth_headers(user),
+                    json={"code": "c", "state": "just-some-random-state"})
+    assert r.status_code == 400
+    db.refresh(user)
+    assert user.google_id is None
+
+
+def test_link_google_rejects_ticket_owned_by_another_user(client, make_user, auth_headers, db, monkeypatch):
+    import routers.auth as auth_router_mod
+    import auth
+    other = make_user("zack", "zack@example.com", password="oldpassword")
+    user = make_user("amelia", "amelia@example.com", password="oldpassword")
+
+    async def fake_profile(code, state):
+        return {"sub": "g-amelia", "email": "amelia@gmail.com"}
+    monkeypatch.setattr(auth_router_mod, "_fetch_google_profile", fake_profile)
+
+    # ticket 是為 other 簽發的，但拿去打 user 的 access token
+    state = f"r:gbind:{auth.create_google_bind_token(other.id)}"
+    r = client.post("/auth/me/link/google", headers=auth_headers(user),
+                    json={"code": "c", "state": state})
+    assert r.status_code == 400
+    db.refresh(other)
+    assert other.google_id is None
     db.refresh(user)
     assert user.google_id is None

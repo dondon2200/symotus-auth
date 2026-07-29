@@ -341,6 +341,14 @@ def google_bind_url(current_user: User = Depends(get_current_user)):
 @router.post("/me/link/google")
 async def link_google(body: OAuthCallbackRequest, db: Session = Depends(get_db),
                       current_user: User = Depends(get_current_user)):
+    state = body.state or ""
+    if ":gbind:" not in state:
+        raise HTTPException(400, "綁定連結無效或已過期，請重新操作")
+    ticket = state.split(":gbind:", 1)[1]
+    bind_user_id = decode_google_bind_token(ticket)
+    if bind_user_id is None or bind_user_id != current_user.id:
+        raise HTTPException(400, "綁定連結無效或已過期，請重新操作")
+
     ui = await _fetch_google_profile(body.code, body.state or "")
     google_id = ui.get("sub")
     if not google_id:
