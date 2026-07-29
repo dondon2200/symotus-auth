@@ -236,6 +236,32 @@ def logout_all_devices(db: Session = Depends(get_db),
     return {"message": "已登出所有裝置"}
 
 
+@router.post("/me/unlink/{provider}")
+def unlink_provider(provider: str, db: Session = Depends(get_db),
+                    current_user: User = Depends(get_current_user)):
+    """解除 OAuth 綁定。解完必須至少還剩一種登入方式，否則使用者會鎖在門外。"""
+    if provider not in ("google", "line"):
+        raise HTTPException(400, "不支援的登入方式")
+
+    remaining = [
+        current_user.hashed_password is not None,
+        current_user.google_id is not None and provider != "google",
+        current_user.line_id is not None and provider != "line",
+    ]
+    if not any(remaining):
+        raise HTTPException(400, "解除後將無法登入，請先設定密碼")
+
+    if provider == "google":
+        current_user.google_id = None
+    else:
+        current_user.line_id = None
+
+    log_action(db, current_user, f"self_unlink_{provider}", "user", current_user.id, provider)
+    db.commit()
+    db.refresh(current_user)
+    return _me_payload(current_user)
+
+
 class ExchangeRequest(BaseModel):
     code: str
 

@@ -147,3 +147,34 @@ def test_revoked_refresh_token_cannot_refresh(client, make_user, auth_headers, d
     client.post("/auth/me/logout-all", headers=auth_headers(user))
     r = client.post("/auth/refresh", json={"refresh_token": "device-c"})
     assert r.status_code == 401
+
+
+def test_unlink_google_when_password_exists(client, make_user, auth_headers, db):
+    user = make_user("quinn", "quinn@example.com", password="oldpassword", google_id="g-q")
+    r = client.post("/auth/me/unlink/google", headers=auth_headers(user))
+    assert r.status_code == 200
+    assert r.json()["google_linked"] is False
+    db.refresh(user)
+    assert user.google_id is None
+
+
+def test_unlink_line_when_google_still_linked(client, make_user, auth_headers, db):
+    user = make_user("rita", "rita@example.com", google_id="g-r", line_id="l-r")
+    r = client.post("/auth/me/unlink/line", headers=auth_headers(user))
+    assert r.status_code == 200
+    db.refresh(user)
+    assert user.line_id is None
+
+
+def test_unlink_last_login_method_rejected(client, make_user, auth_headers, db):
+    user = make_user("sam", "sam@example.com", google_id="g-s")
+    r = client.post("/auth/me/unlink/google", headers=auth_headers(user))
+    assert r.status_code == 400
+    db.refresh(user)
+    assert user.google_id == "g-s"
+
+
+def test_unlink_unknown_provider_rejected(client, make_user, auth_headers):
+    user = make_user("tina", "tina@example.com", password="oldpassword", google_id="g-t")
+    r = client.post("/auth/me/unlink/facebook", headers=auth_headers(user))
+    assert r.status_code == 400

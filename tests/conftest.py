@@ -13,6 +13,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 TEST_DB = pathlib.Path(__file__).resolve().parent / "test_auth.db"
 os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB}"
 os.environ["JWT_SECRET"] = "test-secret-for-pytest-only"
+TEST_DB.unlink(missing_ok=True)
 
 import pytest
 from fastapi import FastAPI
