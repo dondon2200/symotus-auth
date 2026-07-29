@@ -264,3 +264,21 @@ def test_link_google_rejects_ticket_owned_by_another_user(client, make_user, aut
     assert other.google_id is None
     db.refresh(user)
     assert user.google_id is None
+
+
+def test_line_bind_token_round_trips_next_path():
+    from auth import create_line_bind_token, decode_line_bind_token
+    ticket = create_line_bind_token(42, "/profile")
+    assert decode_line_bind_token(ticket) == (42, "/profile")
+
+
+def test_line_bind_token_defaults_to_notifications():
+    from auth import create_line_bind_token, decode_line_bind_token
+    ticket = create_line_bind_token(42)
+    assert decode_line_bind_token(ticket) == (42, "/notifications")
+
+
+def test_line_bind_token_rejects_external_next():
+    from auth import create_line_bind_token, decode_line_bind_token
+    ticket = create_line_bind_token(42, "https://evil.example.com")
+    assert decode_line_bind_token(ticket) == (42, "/notifications")

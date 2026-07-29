@@ -398,10 +398,11 @@ def line_url(response: Response, invite_token: str = None):
     return {"auth_url": f"https://access.line.me/oauth2/v2.1/authorize?{params}", "state": state}
 
 @router.get("/line/bind-url")
-def line_bind_url(response: Response, current_user: User = Depends(get_current_user)):
+def line_bind_url(response: Response, next: str = "/notifications",
+                  current_user: User = Depends(get_current_user)):
     """A：已登入用戶取得「綁定 LINE」授權連結。state 夾帶簽章 ticket 標識當前用戶，
     /line/callback 依 ticket 把 LINE 綁到「這個帳號」，而非以 email 比對或另開新帳號。"""
-    ticket = create_line_bind_token(current_user.id)
+    ticket = create_line_bind_token(current_user.id, next)
     state = f"{secrets.token_urlsafe(16)}:bind:{ticket}"
     response.set_cookie("line_oauth_state", state, max_age=600,
                         httponly=True, secure=True, samesite="lax", path="/")
@@ -597,9 +598,12 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
     try:
         invite_token_str = None
         bind_user_id = None
+        bind_next = "/notifications"
         # A：state 夾帶 bind ticket → 綁定流程（把 LINE 綁到當前登入用戶，而非登入/建帳）
         if state and ":bind:" in state:
-            bind_user_id = decode_line_bind_token(state.split(":bind:", 1)[1])
+            decoded = decode_line_bind_token(state.split(":bind:", 1)[1])
+            if decoded:
+                bind_user_id, bind_next = decoded
         elif state and ":" in state:
             _, invite_token_str = state.split(":", 1)
 
@@ -625,13 +629,13 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
             target = db.query(User).filter(User.id == bind_user_id).first()
             existing = db.query(User).filter(User.line_id == line_uid).first()
             if not target:
-                resp = RedirectResponse(f"{frontend}/notifications?line_bind=error")
+                resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=error")
             elif existing and existing.id != target.id:
-                resp = RedirectResponse(f"{frontend}/notifications?line_bind=conflict")
+                resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=conflict")
             else:
                 target.line_id = line_uid
                 db.commit()
-                resp = RedirectResponse(f"{frontend}/notifications?line_bind=ok")
+                resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=ok")
             resp.delete_cookie("line_oauth_state", path="/")
             return resp
 
