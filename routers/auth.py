@@ -173,11 +173,15 @@ class UpdateMeRequest(BaseModel):
 def update_me(body: UpdateMeRequest, db: Session = Depends(get_db),
               current_user: User = Depends(get_current_user)):
     """self-service 更新。刻意只收 full_name：username/email/role 不開放自助修改，
-    且本端點不接受 user_id，結構上就不可能改到別人。"""
-    current_user.full_name = (body.full_name or "").strip() or None
-    log_action(db, current_user, "self_update_profile", "user", current_user.id, "full_name")
-    db.commit()
-    db.refresh(current_user)
+    且本端點不接受 user_id，結構上就不可能改到別人。
+
+    PATCH 語意：body 完全未帶 full_name 欄位時視為「不修改」，而非清空——
+    用 model_fields_set 區分「欄位不存在」與「明確傳 null」。"""
+    if "full_name" in body.model_fields_set:
+        current_user.full_name = (body.full_name or "").strip() or None
+        log_action(db, current_user, "self_update_profile", "user", current_user.id, "full_name")
+        db.commit()
+        db.refresh(current_user)
     return _me_payload(current_user)
 
 
@@ -348,6 +352,9 @@ async def link_google(body: OAuthCallbackRequest, db: Session = Depends(get_db),
     bind_user_id = decode_google_bind_token(ticket)
     if bind_user_id is None or bind_user_id != current_user.id:
         raise HTTPException(400, "綁定連結無效或已過期，請重新操作")
+
+    if current_user.google_id is not None:
+        raise HTTPException(400, "已綁定 Google 帳號，請先解除後再重新綁定")
 
     ui = await _fetch_google_profile(body.code, body.state or "")
     google_id = ui.get("sub")
@@ -634,6 +641,7 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
                 resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=conflict")
             else:
                 target.line_id = line_uid
+                log_action(db, target, "self_link_line", "user", target.id, "line_id")
                 db.commit()
                 resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=ok")
             resp.delete_cookie("line_oauth_state", path="/")

@@ -68,6 +68,17 @@ def test_update_me_writes_audit_log(client, make_user, auth_headers, db):
     assert log.actor_id == user.id
 
 
+def test_update_me_without_full_name_field_keeps_existing_name(client, make_user, auth_headers, db):
+    user = make_user("felix", "felix@example.com", password="oldpassword")
+    user.full_name = "菲力克斯"
+    db.commit()
+    r = client.put("/auth/me", headers=auth_headers(user), json={})
+    assert r.status_code == 200
+    assert r.json()["full_name"] == "菲力克斯"
+    db.refresh(user)
+    assert user.full_name == "菲力克斯"
+
+
 def test_change_password_with_correct_current(client, make_user, auth_headers, db):
     from auth import verify_password
     user = make_user("gina", "gina@example.com", password="oldpassword")
@@ -264,6 +275,18 @@ def test_link_google_rejects_ticket_owned_by_another_user(client, make_user, aut
     assert other.google_id is None
     db.refresh(user)
     assert user.google_id is None
+
+
+def test_link_google_rejects_when_already_linked(client, make_user, auth_headers, db):
+    import auth
+    user = make_user("bianca", "bianca@example.com", password="oldpassword", google_id="g-existing")
+
+    state = f"r:gbind:{auth.create_google_bind_token(user.id)}"
+    r = client.post("/auth/me/link/google", headers=auth_headers(user),
+                    json={"code": "c", "state": state})
+    assert r.status_code == 400
+    db.refresh(user)
+    assert user.google_id == "g-existing"
 
 
 def test_line_bind_token_round_trips_next_path():
