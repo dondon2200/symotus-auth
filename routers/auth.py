@@ -151,7 +151,11 @@ def me(current_user: User = Depends(get_current_user)):
     return {"id": current_user.id, "username": current_user.username,
             "email": current_user.email, "full_name": current_user.full_name,
             "role": current_user.role, "reseller_id": current_user.reseller_id,
-            "is_active": current_user.is_active}
+            "is_active": current_user.is_active,
+            "has_password": current_user.hashed_password is not None,
+            "google_linked": current_user.google_id is not None,
+            "line_linked": current_user.line_id is not None,
+            "created_at": current_user.created_at.isoformat() if current_user.created_at else None}
 
 
 class ExchangeRequest(BaseModel):

@@ -23,6 +23,7 @@ ENV/
 # ── 本機資料庫備份 ──
 *.sql
 backup_*.sql
+tests/*.db
 
 # ── 編輯器 / OS ──
 .vscode/
