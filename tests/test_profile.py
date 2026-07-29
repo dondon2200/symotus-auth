@@ -305,3 +305,60 @@ def test_line_bind_token_rejects_external_next():
     from auth import create_line_bind_token, decode_line_bind_token
     ticket = create_line_bind_token(42, "https://evil.example.com")
     assert decode_line_bind_token(ticket) == (42, "/notifications")
+
+
+class _FakeLineResponse:
+    def __init__(self, data, is_success=True):
+        self._data = data
+        self.is_success = is_success
+
+    def json(self):
+        return self._data
+
+
+class _FakeLineAsyncClient:
+    """最小假 httpx.AsyncClient：只回應 line_callback 綁定分支需要的兩個呼叫。"""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, url, **kwargs):
+        assert "api.line.me/oauth2/v2.1/token" in url
+        return _FakeLineResponse({"access_token": "fake-line-token"})
+
+    async def get(self, url, **kwargs):
+        assert "api.line.me/v2/profile" in url
+        return _FakeLineResponse({"userId": "line-uid-audit-1", "displayName": "Audit Tester"})
+
+
+def test_line_callback_bind_writes_audit_log(client, make_user, db, monkeypatch):
+    """N-2: line_callback 的 bind_user_id 分支綁定 LINE 後必須寫入 self_link_line 稽核紀錄。"""
+    import secrets as secrets_mod
+    import httpx
+    from models import AuditLog
+    import auth as auth_mod
+
+    user = make_user("linebind", "linebind@example.com", password="oldpassword")
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: _FakeLineAsyncClient())
+
+    ticket = auth_mod.create_line_bind_token(user.id, "/notifications")
+    state = f"{secrets_mod.token_urlsafe(16)}:bind:{ticket}"
+
+    r = client.get(
+        f"/auth/line/callback?code=fakecode&state={state}",
+        cookies={"line_oauth_state": state},
+        follow_redirects=False,
+    )
+    assert r.status_code in (302, 307)
+    assert "line_bind=ok" in r.headers["location"]
+
+    db.refresh(user)
+    assert user.line_id == "line-uid-audit-1"
+
+    log = db.query(AuditLog).filter(AuditLog.action == "self_link_line").first()
+    assert log is not None
+    assert log.actor_id == user.id
+    assert log.target_id == user.id
