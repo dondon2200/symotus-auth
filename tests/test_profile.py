@@ -1,3 +1,14 @@
+import datetime
+
+from models import RefreshToken
+
+
+def _add_refresh(db, user, token):
+    db.add(RefreshToken(user_id=user.id, token=token, revoked=False,
+                        expires_at=datetime.datetime.utcnow() + datetime.timedelta(days=30)))
+    db.commit()
+
+
 def test_me_returns_current_user(client, make_user, auth_headers):
     user = make_user("alice", "alice@example.com", password="oldpassword")
     r = client.get("/auth/me", headers=auth_headers(user))
@@ -57,17 +68,6 @@ def test_update_me_writes_audit_log(client, make_user, auth_headers, db):
     assert log.actor_id == user.id
 
 
-import datetime
-
-from models import RefreshToken
-
-
-def _add_refresh(db, user, token):
-    db.add(RefreshToken(user_id=user.id, token=token, revoked=False,
-                        expires_at=datetime.datetime.utcnow() + datetime.timedelta(days=30)))
-    db.commit()
-
-
 def test_change_password_with_correct_current(client, make_user, auth_headers, db):
     from auth import verify_password
     user = make_user("gina", "gina@example.com", password="oldpassword")
@@ -119,3 +119,31 @@ def test_change_password_revokes_other_refresh_tokens(client, make_user, auth_he
     killed = db.query(RefreshToken).filter(RefreshToken.token == "kill-me").first()
     assert kept.revoked is False
     assert killed.revoked is True
+
+
+def test_logout_all_revokes_every_refresh_token(client, make_user, auth_headers, db):
+    user = make_user("mia", "mia@example.com", password="oldpassword")
+    _add_refresh(db, user, "device-a")
+    _add_refresh(db, user, "device-b")
+    r = client.post("/auth/me/logout-all", headers=auth_headers(user))
+    assert r.status_code == 200
+    tokens = db.query(RefreshToken).filter(RefreshToken.user_id == user.id).all()
+    assert all(t.revoked for t in tokens)
+
+
+def test_logout_all_does_not_touch_other_users(client, make_user, auth_headers, db):
+    mine = make_user("nina", "nina@example.com", password="oldpassword")
+    other = make_user("oscar", "oscar@example.com", password="oldpassword")
+    _add_refresh(db, mine, "mine-1")
+    _add_refresh(db, other, "other-1")
+    client.post("/auth/me/logout-all", headers=auth_headers(mine))
+    kept = db.query(RefreshToken).filter(RefreshToken.token == "other-1").first()
+    assert kept.revoked is False
+
+
+def test_revoked_refresh_token_cannot_refresh(client, make_user, auth_headers, db):
+    user = make_user("paul", "paul@example.com", password="oldpassword")
+    _add_refresh(db, user, "device-c")
+    client.post("/auth/me/logout-all", headers=auth_headers(user))
+    r = client.post("/auth/refresh", json={"refresh_token": "device-c"})
+    assert r.status_code == 401

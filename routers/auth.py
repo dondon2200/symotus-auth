@@ -220,6 +220,22 @@ def change_my_password(body: ChangePasswordRequest, db: Session = Depends(get_db
     return {"message": "密碼已更新"}
 
 
+@router.post("/me/logout-all")
+def logout_all_devices(db: Session = Depends(get_db),
+                       current_user: User = Depends(get_current_user)):
+    """撤銷本帳號所有 refresh token（含呼叫端自己），前端隨後導回登入頁。"""
+    count = 0
+    for token in db.query(RefreshToken).filter(
+            RefreshToken.user_id == current_user.id,
+            RefreshToken.revoked == False).all():
+        token.revoked = True
+        count += 1
+    log_action(db, current_user, "self_logout_all", "user", current_user.id,
+               f"revoked={count}")
+    db.commit()
+    return {"message": "已登出所有裝置"}
+
+
 class ExchangeRequest(BaseModel):
     code: str
 
