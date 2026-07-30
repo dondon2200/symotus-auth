@@ -74,13 +74,23 @@ def create_job(
 
 
 @router.get("", response_model=list[JobResponse])
-def list_jobs(
+async def list_jobs(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return db.query(TimelapsJob).filter(
+    """列出相機縮時 jobs，並順手把未結束的 job 與 Spark 對齊。
+
+    相機縮時的進度原本只有前端浮動卡片會回寫（TimelapsFloatingCard 輪詢 Spark
+    後 PUT /jobs/{id}），使用者一關分頁就永遠定格——Spark 明明做完了，DB 還是
+    processing/29%，也拿不到下載鈕。Spark 不會回呼 /jobs/internal（任務是相機
+    後端提交的，callback_url 不指向本服務），所以在此比照 GET /jobs/gdrive/{id}
+    的做法，於查詢時主動同步。Spark 查不到或逾時就沿用 DB 原值，不影響列表回應。
+    """
+    jobs = db.query(TimelapsJob).filter(
         TimelapsJob.user_id == current_user.id
     ).order_by(TimelapsJob.created_at.desc()).all()
+    await _sync_jobs_with_spark(db, jobs)
+    return jobs
 
 
 @router.put("/{job_id}", response_model=JobResponse)
@@ -175,8 +185,83 @@ logger = logging.getLogger(__name__)
 SPARK_API_URL = settings.SPARK_API_URL
 SPARK_API_KEY = settings.SPARK_API_KEY
 GDRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+# 相機縮時 job 查詢時同步 Spark 的上限：單筆逾時短、並發受限，避免列表 API 被拖慢
+SPARK_SYNC_TIMEOUT = 6
+SPARK_SYNC_CONCURRENCY = 4
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 DOWNLOAD_CONCURRENCY = 12  # Drive API alt=media 並發路數（§3：8~16）
+
+
+# ── 相機縮時：查詢時與 Spark 對齊（供 list_jobs 用）─────────────────────────
+# 定義在此是因為需要上方的 SPARK_API_URL/KEY 與 httpx；list_jobs 在呼叫時才解析
+# 這個名稱，所以檔案前段的 endpoint 可以正常使用。
+
+def _spark_status_to_local(raw: Optional[str]) -> Optional[str]:
+    s = (raw or "").lower()
+    if s in ("completed", "done", "success"):
+        return "completed"
+    if s in ("failed", "error"):
+        return "failed"
+    if s:
+        return "processing"
+    return None
+
+
+async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
+    """把未結束的相機縮時 job 與 Spark 現況對齊並寫回 DB（就地更新傳入的 ORM 物件）。
+
+    只碰 status 尚未終結的 job。任何 Spark 錯誤／逾時都靜默略過並保留 DB 原值，
+    列表 API 不因外部服務不穩而失敗。
+    """
+    active = [j for j in jobs if (j.status or "").lower() not in ("completed", "failed")]
+    if not active:
+        return
+
+    sem = asyncio.Semaphore(SPARK_SYNC_CONCURRENCY)
+
+    async def fetch(job):
+        async with sem:
+            try:
+                async with httpx.AsyncClient(timeout=SPARK_SYNC_TIMEOUT) as client:
+                    r = await client.get(f"{SPARK_API_URL}/jobs/{job.job_id}",
+                                         headers={"x-api-key": SPARK_API_KEY})
+                if r.status_code == 200:
+                    return job, r.json()
+            except Exception:
+                logger.debug("Spark 同步失敗（沿用 DB 值）: job_id=%s", job.job_id, exc_info=True)
+            return job, None
+
+    results = await asyncio.gather(*[fetch(j) for j in active])
+
+    changed_any = False
+    for job, data in results:
+        if not data:
+            continue
+        status = _spark_status_to_local(data.get("status"))
+        percent = data.get("percent_complete")
+        changed = False
+        if status and status != job.status:
+            job.status = status
+            changed = True
+        # 完成時補滿 100%，其餘採 Spark 回報值（只在數字有前進時才寫，避免倒退）
+        if status == "completed":
+            if job.percent_complete != 100:
+                job.percent_complete = 100
+                changed = True
+        elif isinstance(percent, int) and percent > (job.percent_complete or 0):
+            job.percent_complete = percent
+            changed = True
+        for field, value in (("image_count", data.get("image_count")),
+                             ("error_message", data.get("error"))):
+            if value is not None and getattr(job, field) != value:
+                setattr(job, field, value)
+                changed = True
+        if changed:
+            job.updated_at = datetime.utcnow()
+            changed_any = True
+
+    if changed_any:
+        db.commit()
 
 
 # ── OAuth：用消費者授權碼換 token、refresh token 續期 ──────────────────────────
