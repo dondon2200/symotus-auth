@@ -266,18 +266,19 @@ async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
 
 # ── OAuth：用消費者授權碼換 token、refresh token 續期 ──────────────────────────
 
-async def _exchange_auth_code(auth_code: str) -> dict:
-    """用前端 GIS code client（ux_mode=popup）拿到的授權碼換 access + refresh token。
+async def _exchange_auth_code(auth_code: str, redirect_uri: str = "postmessage") -> dict:
+    """用授權碼換 access + refresh token。
 
-    重點：popup 模式的授權碼必須以 redirect_uri='postmessage' 交換（GIS 慣例），
-    不是 web OAuth 的 GOOGLE_REDIRECT_URI。
+    redirect_uri 必須與取得授權碼時所用的一致：
+    - GIS popup（舊路徑）：'postmessage'（GIS 慣例，不是 web OAuth 的 redirect URI）
+    - 整頁 redirect（新路徑）：settings.GDRIVE_REDIRECT_URI
     """
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(GOOGLE_TOKEN_URL, data={
             "code": auth_code,
             "client_id": settings.GOOGLE_CLIENT_ID,
             "client_secret": settings.GOOGLE_CLIENT_SECRET,
-            "redirect_uri": "postmessage",
+            "redirect_uri": redirect_uri,
             "grant_type": "authorization_code",
         })
     if r.status_code != 200:

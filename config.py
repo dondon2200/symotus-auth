@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
     GOOGLE_REDIRECT_URI: Optional[str] = None
+    # Drive 整頁 redirect 授權的 callback（須在 Google Console 註冊）
+    GDRIVE_REDIRECT_URI: str = "https://user.symotus.com/auth-api/jobs/gdrive/oauth/callback"
 
     # LINE OAuth - 讀取 LINE_CHANNEL_ID / LINE_CHANNEL_SECRET
     LINE_CHANNEL_ID: Optional[str] = None
