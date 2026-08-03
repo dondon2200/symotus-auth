@@ -3,6 +3,7 @@
 conftest.py 的 db fixture 只建四張表，這裡自行補上本功能需要的兩張，
 並自組一個只掛 jobs router 的 app（conftest 的 app fixture 只掛 auth router）。
 """
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -10,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from jose import jwt
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session as OrmSession
 
 from database import SessionLocal, engine
 from models import GoogleDriveCredential, GDriveJob
@@ -212,11 +214,15 @@ def test_callback_exchange_failure(gdrive_client, gdrive_db, make_user, auth_hea
 
 
 def _cookie_deletion_present(response) -> bool:
-    """檢查 set-cookie 標頭裡有沒有清除 gdrive_oauth_state 的那一筆。"""
+    """檢查 set-cookie 標頭裡有沒有清除 gdrive_oauth_state 的那一筆，且保留原本的安全旗標。"""
     for value in response.headers.get_list("set-cookie"):
-        if value.startswith("gdrive_oauth_state=") and (
-            "Max-Age=0" in value or 'expires=Thu, 01 Jan 1970' in value.replace("Expires", "expires")
-        ):
+        if not value.startswith("gdrive_oauth_state="):
+            continue
+        expired = "Max-Age=0" in value or 'expires=Thu, 01 Jan 1970' in value.replace("Expires", "expires")
+        if not expired:
+            continue
+        lowered = value.lower()
+        if "httponly" in lowered and "secure" in lowered and "samesite=lax" in lowered:
             return True
     return False
 
@@ -302,4 +308,74 @@ def test_callback_store_failure_redirects_to_reason_store(gdrive_client, gdrive_
                           follow_redirects=False)
     assert r.headers["location"] == f"{settings.FRONTEND_URL}/gdrive?gdrive=error&reason=store"
     assert _cookie_deletion_present(r)
+    assert gdrive_db.query(GoogleDriveCredential).count() == 0
+
+
+def test_callback_exchange_non_json_body_redirects_to_reason_exchange(
+    gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch,
+):
+    """_exchange_auth_code 對 200 但非 JSON 的 body 會拋 json.JSONDecodeError（ValueError 的子類）；
+    這不該外洩成裸 500，要跟其他交換失敗一樣走 reason=exchange。"""
+    user = make_user("u5k", "u5k@example.com", password="pw")
+    state = _consent_url_state(gdrive_client, user, auth_headers, monkeypatch)
+
+    async def bad_json(code, redirect_uri="postmessage"):
+        raise json.JSONDecodeError("Expecting value", "<html>captive portal</html>", 0)
+
+    monkeypatch.setattr(jobs_module, "_exchange_auth_code", bad_json)
+
+    r = gdrive_client.get(f"/jobs/gdrive/oauth/callback?code=c&state={state}",
+                          follow_redirects=False)
+    assert r.headers["location"] == f"{settings.FRONTEND_URL}/gdrive?gdrive=error&reason=exchange"
+    assert gdrive_db.query(GoogleDriveCredential).count() == 0
+
+
+def test_callback_exchange_non_dict_body_redirects_to_reason_exchange(
+    gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch,
+):
+    """_exchange_auth_code 若拿到合法 JSON 但不是物件（例如陣列），
+    td.get(...) 會炸 AttributeError；同樣要當成交換失敗處理。"""
+    user = make_user("u5l", "u5l@example.com", password="pw")
+    state = _consent_url_state(gdrive_client, user, auth_headers, monkeypatch)
+
+    async def returns_list(code, redirect_uri="postmessage"):
+        return ["unexpected", "list"]
+
+    monkeypatch.setattr(jobs_module, "_exchange_auth_code", returns_list)
+
+    r = gdrive_client.get(f"/jobs/gdrive/oauth/callback?code=c&state={state}",
+                          follow_redirects=False)
+    assert r.headers["location"] == f"{settings.FRONTEND_URL}/gdrive?gdrive=error&reason=exchange"
+    assert gdrive_db.query(GoogleDriveCredential).count() == 0
+
+
+def test_callback_store_failure_rolls_back_pending_insert(
+    gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch,
+):
+    """先前的測試在 db.add() 之前就丟例外，count()==0 不論 rollback 有沒有跑都成立。
+    這裡改成走真正的 _upsert_drive_credential（真的 db.add()），只在 commit 時失敗，
+    確保失敗當下有一筆 pending insert，藉此驗證 db.rollback() 真的有作用。"""
+    user = make_user("u5m", "u5m@example.com", password="pw")
+    state = _consent_url_state(gdrive_client, user, auth_headers, monkeypatch)
+
+    async def fake_exchange(code, redirect_uri="postmessage"):
+        return {"access_token": "at-1", "refresh_token": "rt-1", "scope": DRIVE_SCOPE}
+
+    async def fake_email(access_token):
+        return None
+
+    monkeypatch.setattr(jobs_module, "_exchange_auth_code", fake_exchange)
+    monkeypatch.setattr(jobs_module, "_fetch_google_email", fake_email)
+
+    def failing_commit(self):
+        raise IntegrityError("insert", {}, Exception("unique(user_id)"))
+
+    monkeypatch.setattr(OrmSession, "commit", failing_commit)
+
+    r = gdrive_client.get(f"/jobs/gdrive/oauth/callback?code=c&state={state}",
+                          follow_redirects=False)
+
+    monkeypatch.undo()  # 儘早還原 Session.commit，後面才能正常查詢
+
+    assert r.headers["location"] == f"{settings.FRONTEND_URL}/gdrive?gdrive=error&reason=store"
     assert gdrive_db.query(GoogleDriveCredential).count() == 0

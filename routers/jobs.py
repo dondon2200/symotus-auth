@@ -682,7 +682,7 @@ async def gdrive_oauth_callback(
     def _redirect(query: str) -> RedirectResponse:
         resp = RedirectResponse(f"{frontend}/gdrive?{query}")
         resp.delete_cookie(GDRIVE_STATE_COOKIE, path="/",
-                          httponly=True, secure=True, samesite="lax")
+                           httponly=True, secure=True, samesite="lax")
         return resp
 
     if error:
@@ -704,8 +704,12 @@ async def gdrive_oauth_callback(
 
     try:
         td = await _exchange_auth_code(code, settings.GDRIVE_REDIRECT_URI)
-    except (HTTPException, httpx.HTTPError):
+    except (HTTPException, httpx.HTTPError, ValueError):
         logger.warning("GDrive redirect 授權碼交換失敗", exc_info=True)
+        return _redirect("gdrive=error&reason=exchange")
+
+    if not isinstance(td, dict):
+        logger.warning("GDrive redirect 授權碼交換回傳非預期格式（%r）", type(td))
         return _redirect("gdrive=error&reason=exchange")
 
     refresh_token = td.get("refresh_token")
