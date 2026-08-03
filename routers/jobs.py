@@ -675,13 +675,14 @@ async def gdrive_oauth_callback(
     """Google 授權完成後導回這裡（top-level GET，沒有 Authorization header）。
 
     身分來自 state 裡的簽章 ticket；防 CSRF 靠 state 與 cookie 的 round-trip 比對。
-    無論成敗都清掉 cookie，並 302 回前端 /gdrive 帶上結果。
+    無論成敗都清掉 cookie，並 307 回前端 /gdrive 帶上結果。
     """
     frontend = settings.FRONTEND_URL
 
     def _redirect(query: str) -> RedirectResponse:
         resp = RedirectResponse(f"{frontend}/gdrive?{query}")
-        resp.delete_cookie(GDRIVE_STATE_COOKIE, path="/")
+        resp.delete_cookie(GDRIVE_STATE_COOKIE, path="/",
+                          httponly=True, secure=True, samesite="lax")
         return resp
 
     if error:
@@ -689,7 +690,12 @@ async def gdrive_oauth_callback(
         return _redirect("gdrive=cancelled")
 
     saved_state = request.cookies.get(GDRIVE_STATE_COOKIE)
-    if not state or not saved_state or not secrets.compare_digest(state, saved_state):
+    try:
+        state_ok = bool(state) and bool(saved_state) and secrets.compare_digest(state, saved_state)
+    except (TypeError, ValueError):
+        # compare_digest 只接受 ASCII str/bytes；非 ASCII 的 state 視同不符
+        state_ok = False
+    if not state_ok:
         return _redirect("gdrive=error&reason=state")
 
     user_id = decode_gdrive_oauth_ticket(state)
@@ -698,7 +704,7 @@ async def gdrive_oauth_callback(
 
     try:
         td = await _exchange_auth_code(code, settings.GDRIVE_REDIRECT_URI)
-    except Exception:
+    except (HTTPException, httpx.HTTPError):
         logger.warning("GDrive redirect 授權碼交換失敗", exc_info=True)
         return _redirect("gdrive=error&reason=exchange")
 
@@ -710,7 +716,12 @@ async def gdrive_oauth_callback(
         return _redirect("gdrive=error&reason=no_refresh_token")
 
     email = await _fetch_google_email(access_token) if access_token else None
-    _upsert_drive_credential(db, user_id, refresh_token, email, td.get("scope"))
+    try:
+        _upsert_drive_credential(db, user_id, refresh_token, email, td.get("scope"))
+    except Exception:
+        logger.warning("GDrive 憑證寫入失敗（user_id=%s）", user_id, exc_info=True)
+        db.rollback()
+        return _redirect("gdrive=error&reason=store")
     return _redirect("gdrive=connected")
 
 
