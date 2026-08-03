@@ -1,4 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+import secrets
+from urllib.parse import urlencode
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import Optional
@@ -6,7 +9,7 @@ from pydantic import BaseModel
 
 from database import get_db
 from models import User, TimelapsJob
-from auth import get_current_user
+from auth import get_current_user, create_gdrive_oauth_ticket, decode_gdrive_oauth_ticket
 from schemas import UtcDatetime, utc_iso
 
 router = APIRouter(prefix="/jobs", tags=["timelapse_jobs"])
@@ -587,6 +590,41 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
 class FileRef(BaseModel):
     id: str
     name: Optional[str] = None
+
+
+# ── GDrive OAuth：整頁 redirect 授權 ──────────────────────────────────────────
+
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+GDRIVE_STATE_COOKIE = "gdrive_oauth_state"
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+
+
+@router.get("/gdrive/oauth/url")
+def gdrive_oauth_url(
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """回傳 Google 同意畫面網址，前端直接整頁導向過去（不開彈窗）。
+
+    state 同時做兩件事：夾帶簽章 ticket 讓 callback 認得使用者，
+    以及寫進 HttpOnly cookie 供 callback 做 round-trip 比對防 CSRF。
+    """
+    if not (settings.GOOGLE_CLIENT_ID and settings.GOOGLE_CLIENT_SECRET):
+        raise HTTPException(500, "伺服器未設定 Google OAuth 憑證（GOOGLE_CLIENT_ID/SECRET）")
+
+    state = create_gdrive_oauth_ticket(current_user.id)
+    response.set_cookie(GDRIVE_STATE_COOKIE, state, max_age=600,
+                        httponly=True, secure=True, samesite="lax", path="/")
+    params = urlencode({
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "redirect_uri": settings.GDRIVE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": DRIVE_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",   # 強制同意，確保每次都拿得到 refresh_token
+        "state": state,
+    })
+    return {"auth_url": f"{GOOGLE_AUTH_URL}?{params}"}
 
 
 class GDriveJobRequest(BaseModel):

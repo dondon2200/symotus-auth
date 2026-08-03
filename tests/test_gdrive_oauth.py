@@ -73,3 +73,44 @@ def test_ticket_rejects_expired():
 
 def test_ticket_rejects_garbage():
     assert decode_gdrive_oauth_ticket("not-a-jwt") is None
+
+
+import urllib.parse
+
+
+def _query(url: str) -> dict:
+    return dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+
+
+def test_oauth_url_requires_auth(gdrive_client):
+    assert gdrive_client.get("/jobs/gdrive/oauth/url").status_code == 403
+
+
+def test_oauth_url_returns_google_consent_url(gdrive_client, make_user, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "cid-1")
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_SECRET", "sec-1")
+    user = make_user("u4", "u4@example.com", password="pw")
+    r = gdrive_client.get("/jobs/gdrive/oauth/url", headers=auth_headers(user))
+    assert r.status_code == 200
+
+    url = r.json()["auth_url"]
+    assert url.startswith("https://accounts.google.com/o/oauth2/v2/auth?")
+    q = _query(url)
+    assert q["client_id"] == "cid-1"
+    assert q["redirect_uri"] == settings.GDRIVE_REDIRECT_URI
+    assert q["response_type"] == "code"
+    assert q["scope"] == "https://www.googleapis.com/auth/drive.readonly"
+    assert q["access_type"] == "offline"
+    assert q["prompt"] == "consent"
+
+    # state 必須同時回寫成 cookie，callback 才能做 round-trip 比對
+    assert gdrive_client.cookies.get("gdrive_oauth_state") == q["state"]
+    # state 裡夾帶的 ticket 要解得回同一個 user
+    assert decode_gdrive_oauth_ticket(q["state"]) == user.id
+
+
+def test_oauth_url_requires_server_credentials(gdrive_client, make_user, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", None)
+    user = make_user("u4b", "u4b@example.com", password="pw")
+    r = gdrive_client.get("/jobs/gdrive/oauth/url", headers=auth_headers(user))
+    assert r.status_code == 500
