@@ -312,6 +312,72 @@ def test_callback_store_failure_redirects_to_reason_store(gdrive_client, gdrive_
     assert gdrive_db.query(GoogleDriveCredential).count() == 0
 
 
+def _job_body(**over):
+    body = {"folder_ids": ["folder-1"], "selection_name": "1 個資料夾", "fps": 30}
+    body.update(over)
+    return body
+
+
+def test_create_job_without_credential_rejected(gdrive_client, make_user, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_SECRET", "sec")
+    user = make_user("u7", "u7@example.com", password="pw")
+    r = gdrive_client.post("/jobs/gdrive", headers=auth_headers(user), json=_job_body())
+    assert r.status_code == 400
+    assert "尚未連接" in r.json()["detail"]
+
+
+def test_create_job_uses_bound_credential(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_SECRET", "sec")
+    user = make_user("u7b", "u7b@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-7b"))
+    gdrive_db.commit()
+
+    async def fake_refresh(refresh_token):
+        assert refresh_token == "rt-7b"
+        return {"access_token": "at-7b", "expires_in": 3600}
+
+    started = {}
+
+    async def fake_pipeline(*a, **kw):
+        started["args"] = a
+
+    monkeypatch.setattr(jobs_module, "_refresh_access_token", fake_refresh)
+    monkeypatch.setattr(jobs_module, "_run_gdrive_nas_pipeline", fake_pipeline)
+
+    r = gdrive_client.post("/jobs/gdrive", headers=auth_headers(user), json=_job_body())
+    assert r.status_code == 200
+
+    job = gdrive_db.query(GDriveJob).filter_by(user_id=user.id).one()
+    assert job.google_refresh_token == "rt-7b"
+
+
+def test_create_job_still_accepts_auth_code(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    """雙軌相容：舊前端仍會送 auth_code，必須照舊路徑走。"""
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_SECRET", "sec")
+    user = make_user("u7c", "u7c@example.com", password="pw")
+
+    async def fake_exchange(code, redirect_uri="postmessage"):
+        assert code == "legacy-code"
+        assert redirect_uri == "postmessage"
+        return {"access_token": "at-7c", "refresh_token": "rt-7c", "expires_in": 3600}
+
+    async def fake_pipeline(*a, **kw):
+        pass
+
+    monkeypatch.setattr(jobs_module, "_exchange_auth_code", fake_exchange)
+    monkeypatch.setattr(jobs_module, "_run_gdrive_nas_pipeline", fake_pipeline)
+
+    r = gdrive_client.post("/jobs/gdrive", headers=auth_headers(user),
+                           json=_job_body(auth_code="legacy-code"))
+    assert r.status_code == 200
+
+    job = gdrive_db.query(GDriveJob).filter_by(user_id=user.id).one()
+    assert job.google_refresh_token == "rt-7c"
+
+
 def test_status_not_connected(gdrive_client, make_user, auth_headers):
     user = make_user("u6", "u6@example.com", password="pw")
     r = gdrive_client.get("/jobs/gdrive/oauth/status", headers=auth_headers(user))

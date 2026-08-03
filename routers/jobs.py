@@ -801,7 +801,7 @@ class GDriveJobRequest(BaseModel):
     folder_ids: Optional[list[str]] = None   # 多選：資料夾（後端列出內含照片）
     files: Optional[list[FileRef]] = None    # 多選：個別照片
     selection_name: Optional[str] = None     # 顯示用（如「2 個資料夾、30 張照片」）
-    auth_code: str
+    auth_code: Optional[str] = None   # 舊 popup 流程才會帶；redirect 流程改用綁定憑證
     fps: int = 30
     resolution: Optional[str] = "1920x1080"
     rain_fog_detection: bool = False
@@ -830,21 +830,37 @@ async def create_gdrive_job(
     picked_files = [{"id": f.id, "name": f.name} for f in (body.files or []) if f.id]
     if not folder_ids and not picked_files:
         raise HTTPException(400, "未選取任何資料夾或照片")
-    if not body.auth_code:
-        raise HTTPException(400, "缺少 Google 授權碼")
     if not (settings.GOOGLE_CLIENT_ID and settings.GOOGLE_CLIENT_SECRET):
         raise HTTPException(500, "伺服器未設定 Google OAuth 憑證（GOOGLE_CLIENT_ID/SECRET）")
 
-    # 用授權碼換 token（offline）。popup 模式以 redirect_uri='postmessage' 交換。
-    td = await _exchange_auth_code(body.auth_code)
-    access_token = td.get("access_token")
-    refresh_token = td.get("refresh_token")
-    if not access_token:
-        raise HTTPException(400, "Google 授權交換未取得 access token")
-    if not refresh_token:
-        # 用戶若先前已授權，Google 可能不再回 refresh token；短任務用 access token 仍可完成，
-        # 但超過 token 壽命的長任務無法續期。
-        logger.warning("GDrive auth_code 交換未取得 refresh_token（用戶可能已授權過）")
+    if body.auth_code:
+        # 舊路徑（GIS popup）：授權碼當場換 token，以 redirect_uri='postmessage' 交換
+        td = await _exchange_auth_code(body.auth_code)
+        access_token = td.get("access_token")
+        refresh_token = td.get("refresh_token")
+        expires_in = td.get("expires_in", 0)
+        if not access_token:
+            raise HTTPException(400, "Google 授權交換未取得 access token")
+        if not refresh_token:
+            # 用戶若先前已授權，Google 可能不再回 refresh token；短任務用 access token 仍可完成，
+            # 但超過 token 壽命的長任務無法續期。
+            logger.warning("GDrive auth_code 交換未取得 refresh_token（用戶可能已授權過）")
+    else:
+        # 新路徑（整頁 redirect）：用長期綁定的憑證換一份 access token
+        cred = _get_drive_credential(db, current_user.id)
+        if not cred:
+            raise HTTPException(400, "尚未連接 Google Drive，請先完成授權")
+        refresh_token = cred.refresh_token
+        try:
+            td = await _refresh_access_token(refresh_token)
+        except RuntimeError:
+            logger.warning("GDrive refresh token 失效（user_id=%s）", current_user.id, exc_info=True)
+            raise HTTPException(409, "Google 授權已失效，請重新連接 Google Drive")
+        except httpx.HTTPError:
+            logger.warning("GDrive refresh 暫時無法連上 Google（user_id=%s）", current_user.id, exc_info=True)
+            raise HTTPException(503, "暫時無法連上 Google，請稍後再試")
+        access_token = td.get("access_token")
+        expires_in = td.get("expires_in", 0)
 
     job = GDriveJob(
         user_id=current_user.id,
@@ -857,7 +873,7 @@ async def create_gdrive_job(
     asyncio.create_task(_run_gdrive_nas_pipeline(
         job.id, folder_ids, picked_files, refresh_token, body.fps, body.resolution,
         body.rain_fog_detection, body.darkness_detection, body.max_images,
-        access_token, td.get("expires_in", 0),
+        access_token, expires_in,
         duration_seconds=body.duration_seconds,
     ))
     return {"job_id": job.id, "status": "pending", "message": "已開始：用你的 Google 權限下載照片 → Spark 生成"}
