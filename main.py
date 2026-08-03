@@ -125,6 +125,15 @@ async def startup():
                     "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS folder_name VARCHAR",
                     "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS google_refresh_token VARCHAR",
                     "ALTER TABLE gdrive_jobs ALTER COLUMN folder_url DROP NOT NULL",
+                    """CREATE TABLE IF NOT EXISTS google_drive_credentials (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
+                        refresh_token VARCHAR NOT NULL,
+                        google_email VARCHAR,
+                        scope VARCHAR,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    )""",
                 ]:
                     try:
                         conn.execute(text(stmt))

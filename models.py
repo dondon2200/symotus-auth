@@ -153,6 +153,23 @@ class GDriveJob(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class GoogleDriveCredential(Base):
+    """使用者長期綁定的 Google Drive 憑證（redirect flow 用）。
+
+    一位使用者一組。refresh_token 讓後端能隨時換發 access token：
+    給 Picker 用、也給下載 pipeline 用，因此前端不必再自己跑 OAuth 彈窗。
+    """
+    __tablename__ = "google_drive_credentials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False, index=True)
+    refresh_token = Column(String, nullable=False)
+    google_email = Column(String, nullable=True)     # 顯示用：「已連接 xxx@gmail.com」
+    scope = Column(String, nullable=True)            # 實際取得的 scope
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class FeaturePolicy(Base):
     """功能權限政策：被分享者（camera_access）依授權等級可用的功能。
     單一事實來源；種子預設 = 原硬編碼行為。admin 角色不受政策限制。"""
