@@ -290,6 +290,15 @@ async def _exchange_auth_code(auth_code: str, redirect_uri: str = "postmessage")
     return r.json()
 
 
+class TransientGoogleError(RuntimeError):
+    """Google 暫時性錯誤（429/5xx）：不代表授權已死，呼叫端應回 503 而非 409。
+
+    刻意繼承 RuntimeError 是為了與既有的 `_TokenManager` 消費者相容（它們只認得
+    RuntimeError）；但任何同時攔截兩者的 try/except，`except TransientGoogleError`
+    必須排在 `except RuntimeError` 前面，否則永遠攔不到。
+    """
+
+
 async def _refresh_access_token(refresh_token: str) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(GOOGLE_TOKEN_URL, data={
@@ -298,7 +307,11 @@ async def _refresh_access_token(refresh_token: str) -> dict:
             "client_secret": settings.GOOGLE_CLIENT_SECRET,
             "grant_type": "refresh_token",
         })
+    if r.status_code == 429 or r.status_code >= 500:
+        # Google 端暫時不可用，不代表 refresh token 本身失效
+        raise TransientGoogleError(f"Google 暫時無法處理 refresh 請求（{r.status_code}）：{r.text[:200]}")
     if r.status_code != 200:
+        # 真正的拒絕（400 invalid_grant、401 等）：refresh token 已死，需要重新同意
         raise RuntimeError(f"refresh token 失效（{r.status_code}）：{r.text[:200]}")
     return r.json()
 
@@ -645,13 +658,24 @@ async def _fetch_google_email(access_token: str) -> Optional[str]:
     return None
 
 
-def _upsert_drive_credential(db: Session, user_id: int, refresh_token: str,
-                             google_email: Optional[str], scope: Optional[str]) -> None:
-    """一位使用者一組憑證：有就更新，沒有才新增。"""
+async def _upsert_drive_credential(db: Session, user_id: int, refresh_token: str,
+                                   google_email: Optional[str], scope: Optional[str]) -> None:
+    """一位使用者一組憑證：有就更新，沒有才新增。
+
+    再次同意（re-consent）時，若既有列已存了一組不同的 refresh_token，先嘗試向 Google
+    撤銷舊的那組，避免留下一個使用者自己都看不到、也管不到的孤兒授權（orphaned live
+    Google grant）。撤銷失敗不得擋住新憑證寫入——用 try/except 吞掉，只記 log。
+    """
     row = db.query(GoogleDriveCredential).filter(
         GoogleDriveCredential.user_id == user_id
     ).first()
     if row:
+        if row.refresh_token and row.refresh_token != refresh_token:
+            try:
+                await _revoke_google_token(row.refresh_token)
+            except Exception:
+                logger.warning("撤銷舊 GDrive refresh_token 失敗（user_id=%s，仍會寫入新憑證）",
+                               user_id, exc_info=True)
         row.refresh_token = refresh_token
         row.google_email = google_email
         row.scope = scope
@@ -721,7 +745,7 @@ async def gdrive_oauth_callback(
 
     email = await _fetch_google_email(access_token) if access_token else None
     try:
-        _upsert_drive_credential(db, user_id, refresh_token, email, td.get("scope"))
+        await _upsert_drive_credential(db, user_id, refresh_token, email, td.get("scope"))
     except Exception:
         logger.warning("GDrive 憑證寫入失敗（user_id=%s）", user_id, exc_info=True)
         db.rollback()
@@ -733,12 +757,16 @@ GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 
 
 async def _revoke_google_token(token: str) -> None:
-    """向 Google 撤銷授權。失敗不擋流程——本地紀錄還是要刪掉。"""
+    """向 Google 撤銷授權。失敗不擋流程——本地紀錄還是要刪掉。
+
+    log 等級用 warning：撤銷失敗代表舊授權可能仍活在 Google 端（隱私後果），
+    不該被 debug 等級悄悄吞掉。
+    """
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(GOOGLE_REVOKE_URL, data={"token": token})
     except Exception:
-        logger.debug("Google token revoke 失敗（仍會刪除本地憑證）", exc_info=True)
+        logger.warning("Google token revoke 失敗（仍會刪除本地憑證）", exc_info=True)
 
 
 def _get_drive_credential(db: Session, user_id: int) -> Optional[GoogleDriveCredential]:
@@ -771,6 +799,9 @@ async def gdrive_picker_token(
         raise HTTPException(404, "尚未連接 Google Drive")
     try:
         td = await _refresh_access_token(cred.refresh_token)
+    except TransientGoogleError:
+        logger.warning("GDrive refresh 暫時無法處理（user_id=%s）", current_user.id, exc_info=True)
+        raise HTTPException(503, "暫時無法連上 Google，請稍後再試")
     except RuntimeError:
         logger.warning("GDrive refresh token 失效（user_id=%s）", current_user.id, exc_info=True)
         raise HTTPException(409, "Google 授權已失效，請重新連接 Google Drive")
@@ -863,6 +894,9 @@ async def create_gdrive_job(
         refresh_token = cred.refresh_token
         try:
             td = await _refresh_access_token(refresh_token)
+        except TransientGoogleError:
+            logger.warning("GDrive refresh 暫時無法處理（user_id=%s）", current_user.id, exc_info=True)
+            raise HTTPException(503, "暫時無法連上 Google，請稍後再試")
         except RuntimeError:
             logger.warning("GDrive refresh token 失效（user_id=%s）", current_user.id, exc_info=True)
             raise HTTPException(409, "Google 授權已失效，請重新連接 Google Drive")

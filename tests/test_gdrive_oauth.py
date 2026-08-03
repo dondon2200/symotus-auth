@@ -57,6 +57,23 @@ def test_credential_table_roundtrip(gdrive_db, make_user):
     assert row.created_at is not None
 
 
+def test_credential_table_rejects_second_row_same_user(gdrive_db, make_user):
+    """一位使用者一組憑證是 DB 層的不變量（user_id unique）：直接 insert 第二筆必須失敗，
+    不能只靠應用層 _upsert_drive_credential 的邏輯把關。"""
+    user = make_user("cred2", "cred2@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(
+        user_id=user.id, refresh_token="rt-first", google_email="cred2@gmail.com",
+    ))
+    gdrive_db.commit()
+
+    gdrive_db.add(GoogleDriveCredential(
+        user_id=user.id, refresh_token="rt-second", google_email="cred2b@gmail.com",
+    ))
+    with pytest.raises(IntegrityError):
+        gdrive_db.commit()
+    gdrive_db.rollback()
+
+
 def test_ticket_roundtrip():
     token = create_gdrive_oauth_ticket(42)
     assert decode_gdrive_oauth_ticket(token) == 42
@@ -167,8 +184,14 @@ def test_callback_upserts_existing_credential(gdrive_client, gdrive_db, make_use
     async def fake_email(access_token):
         return None
 
+    revoked = {}
+
+    async def fake_revoke(token):
+        revoked["token"] = token
+
     monkeypatch.setattr(jobs_module, "_exchange_auth_code", fake_exchange)
     monkeypatch.setattr(jobs_module, "_fetch_google_email", fake_email)
+    monkeypatch.setattr(jobs_module, "_revoke_google_token", fake_revoke)
 
     gdrive_client.get(f"/jobs/gdrive/oauth/callback?code=c&state={state}", follow_redirects=False)
 
@@ -176,6 +199,8 @@ def test_callback_upserts_existing_credential(gdrive_client, gdrive_db, make_use
     assert len(rows) == 1          # upsert，不是新增第二筆
     gdrive_db.refresh(rows[0])
     assert rows[0].refresh_token == "new-rt"
+    # re-consent 覆蓋掉舊 refresh_token 前，應先嘗試撤銷舊的那組，避免孤兒授權
+    assert revoked["token"] == "old-rt"
 
 
 def test_callback_rejects_state_mismatch(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
@@ -310,6 +335,89 @@ def test_callback_store_failure_redirects_to_reason_store(gdrive_client, gdrive_
     assert r.headers["location"] == f"{settings.FRONTEND_URL}/gdrive?gdrive=error&reason=store"
     assert _cookie_deletion_present(r)
     assert gdrive_db.query(GoogleDriveCredential).count() == 0
+
+
+class _FakeGoogleResponse:
+    def __init__(self, status_code: int, text: str = ""):
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        return {"access_token": "at-fake", "expires_in": 3600}
+
+
+def _patch_google_token_status(monkeypatch, status_code: int, text: str = ""):
+    """讓 _refresh_access_token 內部呼叫 Google token endpoint 時，回傳指定的狀態碼，
+    藉此驗證真正的分類邏輯（而不是繞過它直接假造 _refresh_access_token 本身）。"""
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            return _FakeGoogleResponse(status_code, text)
+
+    monkeypatch.setattr(jobs_module.httpx, "AsyncClient", _FakeAsyncClient)
+
+
+@pytest.mark.parametrize("status_code", [400, 401])
+def test_refresh_access_token_rejection_raises_runtime_error(monkeypatch, status_code):
+    """400/401（如 invalid_grant）代表真正被拒絕：refresh token 已死。"""
+    _patch_google_token_status(monkeypatch, status_code, "invalid_grant")
+    import asyncio
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(jobs_module._refresh_access_token("rt-x"))
+    assert not isinstance(exc_info.value, jobs_module.TransientGoogleError)
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 502, 503])
+def test_refresh_access_token_transient_raises_transient_error(monkeypatch, status_code):
+    """429/5xx 是 Google 端暫時性問題，不代表授權已死。"""
+    _patch_google_token_status(monkeypatch, status_code, "server busy")
+    import asyncio
+    with pytest.raises(jobs_module.TransientGoogleError):
+        asyncio.run(jobs_module._refresh_access_token("rt-x"))
+
+
+@pytest.mark.parametrize("status_code,expected_http_status", [(400, 409), (429, 503), (500, 503)])
+def test_picker_token_endpoint_classifies_google_status(
+    gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch, status_code, expected_http_status,
+):
+    """picker-token endpoint：Google 400 -> 409（授權已死），429/500 -> 503（暫時不可達）。"""
+    user = make_user(f"pt{status_code}", f"pt{status_code}@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token=f"rt-pt-{status_code}"))
+    gdrive_db.commit()
+    _patch_google_token_status(monkeypatch, status_code)
+
+    r = gdrive_client.post("/jobs/gdrive/oauth/token", headers=auth_headers(user))
+    assert r.status_code == expected_http_status
+
+
+@pytest.mark.parametrize("status_code,expected_http_status", [(400, 409), (429, 503), (500, 503)])
+def test_create_job_bound_credential_classifies_google_status(
+    gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch, status_code, expected_http_status,
+):
+    """job 建立（綁定憑證路徑）：Google 400 -> 409（授權已死），429/500 -> 503（暫時不可達）。"""
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_SECRET", "sec")
+    user = make_user(f"cj{status_code}", f"cj{status_code}@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token=f"rt-cj-{status_code}"))
+    gdrive_db.commit()
+
+    async def fake_pipeline(*a, **kw):
+        pytest.fail("不該啟動 pipeline")
+
+    monkeypatch.setattr(jobs_module, "_run_gdrive_nas_pipeline", fake_pipeline)
+    _patch_google_token_status(monkeypatch, status_code)
+
+    r = gdrive_client.post("/jobs/gdrive", headers=auth_headers(user), json=_job_body())
+    assert r.status_code == expected_http_status
+    assert gdrive_db.query(GDriveJob).filter_by(user_id=user.id).count() == 0
 
 
 def _job_body(**over):
