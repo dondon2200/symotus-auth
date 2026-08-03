@@ -131,6 +131,31 @@ def decode_google_bind_token(token: str) -> Optional[int]:
         return None
 
 
+def create_gdrive_oauth_ticket(user_id: int) -> str:
+    """短效簽章 ticket：整頁 redirect 授權時，讓 Google callback 認得是哪個使用者。
+
+    callback 是 Google 直接打過來的 top-level GET，沒有 Authorization header，
+    所以身分只能靠 state 裡夾帶的這張 ticket 帶回來。10 分鐘有效。
+    """
+    payload = {
+        "sub": str(user_id),
+        "purpose": "gdrive_oauth",
+        "exp": datetime.utcnow() + timedelta(minutes=10),
+    }
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_gdrive_oauth_ticket(token: str) -> Optional[int]:
+    """驗證 ticket，回傳 user_id；無效／過期／用途不符回 None。"""
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        if payload.get("purpose") != "gdrive_oauth":
+            return None
+        return int(payload["sub"])
+    except Exception:
+        return None
+
+
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     db: Session = Depends(get_db),
