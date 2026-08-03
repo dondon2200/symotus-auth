@@ -2,6 +2,7 @@ import secrets
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import Optional
@@ -180,7 +181,7 @@ import os
 import time
 import logging
 import httpx
-from models import GDriveJob
+from models import GDriveJob, GoogleDriveCredential
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -625,6 +626,92 @@ def gdrive_oauth_url(
         "state": state,
     })
     return {"auth_url": f"{GOOGLE_AUTH_URL}?{params}"}
+
+
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+
+
+async def _fetch_google_email(access_token: str) -> Optional[str]:
+    """取 Google 帳號 email 純粹是為了在前端顯示「已連接 xxx@gmail.com」。
+    拿不到不影響授權，回 None 即可。"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(GOOGLE_USERINFO_URL,
+                                 headers={"Authorization": f"Bearer {access_token}"})
+        if r.status_code == 200:
+            return r.json().get("email")
+    except Exception:
+        logger.debug("取 Google userinfo 失敗（不影響授權）", exc_info=True)
+    return None
+
+
+def _upsert_drive_credential(db: Session, user_id: int, refresh_token: str,
+                             google_email: Optional[str], scope: Optional[str]) -> None:
+    """一位使用者一組憑證：有就更新，沒有才新增。"""
+    row = db.query(GoogleDriveCredential).filter(
+        GoogleDriveCredential.user_id == user_id
+    ).first()
+    if row:
+        row.refresh_token = refresh_token
+        row.google_email = google_email
+        row.scope = scope
+        row.updated_at = datetime.utcnow()
+    else:
+        db.add(GoogleDriveCredential(
+            user_id=user_id, refresh_token=refresh_token,
+            google_email=google_email, scope=scope,
+        ))
+    db.commit()
+
+
+@router.get("/gdrive/oauth/callback")
+async def gdrive_oauth_callback(
+    request: Request,
+    code: str = "",
+    state: str = "",
+    error: str = "",
+    db: Session = Depends(get_db),
+):
+    """Google 授權完成後導回這裡（top-level GET，沒有 Authorization header）。
+
+    身分來自 state 裡的簽章 ticket；防 CSRF 靠 state 與 cookie 的 round-trip 比對。
+    無論成敗都清掉 cookie，並 302 回前端 /gdrive 帶上結果。
+    """
+    frontend = settings.FRONTEND_URL
+
+    def _redirect(query: str) -> RedirectResponse:
+        resp = RedirectResponse(f"{frontend}/gdrive?{query}")
+        resp.delete_cookie(GDRIVE_STATE_COOKIE, path="/")
+        return resp
+
+    if error:
+        # 使用者在同意畫面按取消：不是錯誤，靜默返回
+        return _redirect("gdrive=cancelled")
+
+    saved_state = request.cookies.get(GDRIVE_STATE_COOKIE)
+    if not state or not saved_state or not secrets.compare_digest(state, saved_state):
+        return _redirect("gdrive=error&reason=state")
+
+    user_id = decode_gdrive_oauth_ticket(state)
+    if not user_id:
+        return _redirect("gdrive=error&reason=state")
+
+    try:
+        td = await _exchange_auth_code(code, settings.GDRIVE_REDIRECT_URI)
+    except Exception:
+        logger.warning("GDrive redirect 授權碼交換失敗", exc_info=True)
+        return _redirect("gdrive=error&reason=exchange")
+
+    refresh_token = td.get("refresh_token")
+    access_token = td.get("access_token")
+    if not refresh_token:
+        # 帶了 prompt=consent 仍拿不到，代表無法長期綁定，直接視為失敗
+        logger.warning("GDrive redirect 授權未取得 refresh_token（user_id=%s）", user_id)
+        return _redirect("gdrive=error&reason=no_refresh_token")
+
+    email = await _fetch_google_email(access_token) if access_token else None
+    _upsert_drive_credential(db, user_id, refresh_token, email, td.get("scope"))
+    return _redirect("gdrive=connected")
 
 
 class GDriveJobRequest(BaseModel):

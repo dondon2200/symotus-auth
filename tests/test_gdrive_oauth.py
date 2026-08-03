@@ -6,13 +6,14 @@ conftest.py 的 db fixture 只建四張表，這裡自行補上本功能需要�
 from datetime import datetime, timedelta
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from jose import jwt
 
 from database import SessionLocal, engine
 from models import GoogleDriveCredential, GDriveJob
-from routers.jobs import router as jobs_router
+import routers.jobs as jobs_module
+from routers.jobs import router as jobs_router, DRIVE_SCOPE
 from auth import create_gdrive_oauth_ticket, decode_gdrive_oauth_ticket, create_google_bind_token
 from config import settings
 
@@ -114,3 +115,96 @@ def test_oauth_url_requires_server_credentials(gdrive_client, make_user, auth_he
     user = make_user("u4b", "u4b@example.com", password="pw")
     r = gdrive_client.get("/jobs/gdrive/oauth/url", headers=auth_headers(user))
     assert r.status_code == 500
+
+
+def _consent_url_state(client, user, auth_headers, monkeypatch):
+    """跑一次 /oauth/url，取得 state 並讓 client 帶著對應 cookie。"""
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "cid-1")
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_SECRET", "sec-1")
+    r = client.get("/jobs/gdrive/oauth/url", headers=auth_headers(user))
+    return _query(r.json()["auth_url"])["state"]
+
+
+def test_callback_stores_credential(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    user = make_user("u5", "u5@example.com", password="pw")
+    state = _consent_url_state(gdrive_client, user, auth_headers, monkeypatch)
+
+    async def fake_exchange(code, redirect_uri="postmessage"):
+        assert code == "code-abc"
+        assert redirect_uri == settings.GDRIVE_REDIRECT_URI
+        return {"access_token": "at-1", "refresh_token": "rt-1",
+                "scope": DRIVE_SCOPE, "expires_in": 3600}
+
+    async def fake_email(access_token):
+        return "u5@gmail.com"
+
+    monkeypatch.setattr(jobs_module, "_exchange_auth_code", fake_exchange)
+    monkeypatch.setattr(jobs_module, "_fetch_google_email", fake_email)
+
+    r = gdrive_client.get(f"/jobs/gdrive/oauth/callback?code=code-abc&state={state}",
+                          follow_redirects=False)
+    assert r.status_code == 307
+    assert r.headers["location"] == f"{settings.FRONTEND_URL}/gdrive?gdrive=connected"
+
+    row = gdrive_db.query(GoogleDriveCredential).filter_by(user_id=user.id).one()
+    assert row.refresh_token == "rt-1"
+    assert row.google_email == "u5@gmail.com"
+
+
+def test_callback_upserts_existing_credential(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    user = make_user("u5b", "u5b@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="old-rt"))
+    gdrive_db.commit()
+    state = _consent_url_state(gdrive_client, user, auth_headers, monkeypatch)
+
+    async def fake_exchange(code, redirect_uri="postmessage"):
+        return {"access_token": "at-2", "refresh_token": "new-rt", "scope": DRIVE_SCOPE}
+
+    async def fake_email(access_token):
+        return None
+
+    monkeypatch.setattr(jobs_module, "_exchange_auth_code", fake_exchange)
+    monkeypatch.setattr(jobs_module, "_fetch_google_email", fake_email)
+
+    gdrive_client.get(f"/jobs/gdrive/oauth/callback?code=c&state={state}", follow_redirects=False)
+
+    rows = gdrive_db.query(GoogleDriveCredential).filter_by(user_id=user.id).all()
+    assert len(rows) == 1          # upsert，不是新增第二筆
+    gdrive_db.refresh(rows[0])
+    assert rows[0].refresh_token == "new-rt"
+
+
+def test_callback_rejects_state_mismatch(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    user = make_user("u5c", "u5c@example.com", password="pw")
+    _consent_url_state(gdrive_client, user, auth_headers, monkeypatch)
+    forged = create_gdrive_oauth_ticket(user.id)   # 合法簽章，但與 cookie 不同
+
+    r = gdrive_client.get(f"/jobs/gdrive/oauth/callback?code=c&state={forged}",
+                          follow_redirects=False)
+    assert r.headers["location"] == f"{settings.FRONTEND_URL}/gdrive?gdrive=error&reason=state"
+    assert gdrive_db.query(GoogleDriveCredential).count() == 0
+
+
+def test_callback_user_cancelled(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    user = make_user("u5d", "u5d@example.com", password="pw")
+    state = _consent_url_state(gdrive_client, user, auth_headers, monkeypatch)
+
+    r = gdrive_client.get(f"/jobs/gdrive/oauth/callback?error=access_denied&state={state}",
+                          follow_redirects=False)
+    assert r.headers["location"] == f"{settings.FRONTEND_URL}/gdrive?gdrive=cancelled"
+    assert gdrive_db.query(GoogleDriveCredential).count() == 0
+
+
+def test_callback_exchange_failure(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    user = make_user("u5e", "u5e@example.com", password="pw")
+    state = _consent_url_state(gdrive_client, user, auth_headers, monkeypatch)
+
+    async def boom(code, redirect_uri="postmessage"):
+        raise HTTPException(400, "Google 授權碼交換失敗（400）")
+
+    monkeypatch.setattr(jobs_module, "_exchange_auth_code", boom)
+
+    r = gdrive_client.get(f"/jobs/gdrive/oauth/callback?code=c&state={state}",
+                          follow_redirects=False)
+    assert r.headers["location"] == f"{settings.FRONTEND_URL}/gdrive?gdrive=error&reason=exchange"
+    assert gdrive_db.query(GoogleDriveCredential).count() == 0

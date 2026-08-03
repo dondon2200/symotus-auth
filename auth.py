@@ -140,6 +140,7 @@ def create_gdrive_oauth_ticket(user_id: int) -> str:
     payload = {
         "sub": str(user_id),
         "purpose": "gdrive_oauth",
+        "jti": secrets.token_urlsafe(16),  # 避免同一秒內連續簽發出現位元組完全相同的 token
         "exp": datetime.utcnow() + timedelta(minutes=10),
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
