@@ -771,9 +771,12 @@ async def gdrive_picker_token(
         raise HTTPException(404, "尚未連接 Google Drive")
     try:
         td = await _refresh_access_token(cred.refresh_token)
-    except Exception:
+    except RuntimeError:
         logger.warning("GDrive refresh token 失效（user_id=%s）", current_user.id, exc_info=True)
         raise HTTPException(409, "Google 授權已失效，請重新連接 Google Drive")
+    except httpx.HTTPError:
+        logger.warning("GDrive refresh 暫時無法連上 Google（user_id=%s）", current_user.id, exc_info=True)
+        raise HTTPException(503, "暫時無法連上 Google，請稍後再試")
     return {"access_token": td.get("access_token"), "expires_in": td.get("expires_in", 0)}
 
 

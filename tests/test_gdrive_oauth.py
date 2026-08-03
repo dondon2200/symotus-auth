@@ -6,6 +6,7 @@ conftest.py 的 db fixture 只建四張表，這裡自行補上本功能需要�
 import json
 from datetime import datetime, timedelta
 
+import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -360,6 +361,97 @@ def test_picker_token_revoked_refresh_token(gdrive_client, gdrive_db, make_user,
 
     r = gdrive_client.post("/jobs/gdrive/oauth/token", headers=auth_headers(user))
     assert r.status_code == 409
+    assert r.json()["detail"] == "Google 授權已失效，請重新連接 Google Drive"
+
+
+def test_picker_token_network_error_returns_503(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    """網路暫時連不上 Google（httpx 錯誤）不該被誤判成授權已失效，要回 503 而非 409。"""
+    user = make_user("u6h", "u6h@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-6h"))
+    gdrive_db.commit()
+
+    async def flaky_refresh(refresh_token):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(jobs_module, "_refresh_access_token", flaky_refresh)
+
+    r = gdrive_client.post("/jobs/gdrive/oauth/token", headers=auth_headers(user))
+    assert r.status_code == 503
+
+
+def test_picker_token_unexpected_error_propagates_as_500(
+    gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch,
+):
+    """既不是 RuntimeError 也不是 httpx 錯誤的例外，是真正的 bug，不該被偽裝成 409。"""
+    user = make_user("u6i", "u6i@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-6i"))
+    gdrive_db.commit()
+
+    async def buggy_refresh(refresh_token):
+        raise ValueError("unexpected bug")
+
+    monkeypatch.setattr(jobs_module, "_refresh_access_token", buggy_refresh)
+
+    # TestClient 預設會把伺服器端未攔截的例外重新拋出（而非包成 500 回應），
+    # 這正是我們要驗證的：非 RuntimeError/httpx 錯誤不能被吞掉偽裝成 409。
+    with pytest.raises(ValueError, match="unexpected bug"):
+        gdrive_client.post("/jobs/gdrive/oauth/token", headers=auth_headers(user))
+
+
+def test_status_cross_user_isolation(gdrive_client, gdrive_db, make_user, auth_headers):
+    user_a = make_user("u6j_a", "u6j_a@example.com", password="pw")
+    user_b = make_user("u6j_b", "u6j_b@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user_a.id, refresh_token="rt-a",
+                                        google_email="a@gmail.com"))
+    gdrive_db.commit()
+
+    body_b = gdrive_client.get("/jobs/gdrive/oauth/status", headers=auth_headers(user_b)).json()
+    assert body_b == {"connected": False, "google_email": None}
+
+    body_a = gdrive_client.get("/jobs/gdrive/oauth/status", headers=auth_headers(user_a)).json()
+    assert body_a == {"connected": True, "google_email": "a@gmail.com"}
+
+
+def test_picker_token_cross_user_isolation(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    user_a = make_user("u6k_a", "u6k_a@example.com", password="pw")
+    user_b = make_user("u6k_b", "u6k_b@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user_a.id, refresh_token="rt-a-token"))
+    gdrive_db.add(GoogleDriveCredential(user_id=user_b.id, refresh_token="rt-b-token"))
+    gdrive_db.commit()
+
+    seen_tokens = []
+
+    async def fake_refresh(refresh_token):
+        seen_tokens.append(refresh_token)
+        return {"access_token": f"at-for-{refresh_token}", "expires_in": 3600}
+
+    monkeypatch.setattr(jobs_module, "_refresh_access_token", fake_refresh)
+
+    body_b = gdrive_client.post("/jobs/gdrive/oauth/token", headers=auth_headers(user_b)).json()
+    assert seen_tokens == ["rt-b-token"]
+    assert body_b == {"access_token": "at-for-rt-b-token", "expires_in": 3600}
+
+
+def test_disconnect_cross_user_isolation(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    user_a = make_user("u6l_a", "u6l_a@example.com", password="pw")
+    user_b = make_user("u6l_b", "u6l_b@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user_a.id, refresh_token="rt-a-keep"))
+    gdrive_db.add(GoogleDriveCredential(user_id=user_b.id, refresh_token="rt-b-remove"))
+    gdrive_db.commit()
+
+    async def fake_revoke(token):
+        pass
+
+    monkeypatch.setattr(jobs_module, "_revoke_google_token", fake_revoke)
+
+    r = gdrive_client.delete("/jobs/gdrive/oauth", headers=auth_headers(user_b))
+    assert r.status_code == 200
+    assert r.json() == {"revoked": True}
+
+    assert gdrive_db.query(GoogleDriveCredential).filter_by(user_id=user_b.id).count() == 0
+    remaining = gdrive_db.query(GoogleDriveCredential).filter_by(user_id=user_a.id).first()
+    assert remaining is not None
+    assert remaining.refresh_token == "rt-a-keep"
 
 
 def test_disconnect_deletes_credential(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
