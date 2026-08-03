@@ -311,6 +311,80 @@ def test_callback_store_failure_redirects_to_reason_store(gdrive_client, gdrive_
     assert gdrive_db.query(GoogleDriveCredential).count() == 0
 
 
+def test_status_not_connected(gdrive_client, make_user, auth_headers):
+    user = make_user("u6", "u6@example.com", password="pw")
+    r = gdrive_client.get("/jobs/gdrive/oauth/status", headers=auth_headers(user))
+    assert r.status_code == 200
+    assert r.json() == {"connected": False, "google_email": None}
+
+
+def test_status_connected(gdrive_client, gdrive_db, make_user, auth_headers):
+    user = make_user("u6b", "u6b@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt",
+                                        google_email="u6b@gmail.com"))
+    gdrive_db.commit()
+    body = gdrive_client.get("/jobs/gdrive/oauth/status", headers=auth_headers(user)).json()
+    assert body == {"connected": True, "google_email": "u6b@gmail.com"}
+
+
+def test_picker_token_requires_credential(gdrive_client, make_user, auth_headers):
+    user = make_user("u6c", "u6c@example.com", password="pw")
+    r = gdrive_client.post("/jobs/gdrive/oauth/token", headers=auth_headers(user))
+    assert r.status_code == 404
+
+
+def test_picker_token_returns_access_token(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    user = make_user("u6d", "u6d@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-6d"))
+    gdrive_db.commit()
+
+    async def fake_refresh(refresh_token):
+        assert refresh_token == "rt-6d"
+        return {"access_token": "at-6d", "expires_in": 3599}
+
+    monkeypatch.setattr(jobs_module, "_refresh_access_token", fake_refresh)
+
+    body = gdrive_client.post("/jobs/gdrive/oauth/token", headers=auth_headers(user)).json()
+    assert body == {"access_token": "at-6d", "expires_in": 3599}
+
+
+def test_picker_token_revoked_refresh_token(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    user = make_user("u6e", "u6e@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="dead"))
+    gdrive_db.commit()
+
+    async def dead_refresh(refresh_token):
+        raise RuntimeError("refresh token 失效（400）")
+
+    monkeypatch.setattr(jobs_module, "_refresh_access_token", dead_refresh)
+
+    r = gdrive_client.post("/jobs/gdrive/oauth/token", headers=auth_headers(user))
+    assert r.status_code == 409
+
+
+def test_disconnect_deletes_credential(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    user = make_user("u6f", "u6f@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-6f"))
+    gdrive_db.commit()
+
+    called = {}
+
+    async def fake_revoke(token):
+        called["token"] = token
+
+    monkeypatch.setattr(jobs_module, "_revoke_google_token", fake_revoke)
+
+    r = gdrive_client.delete("/jobs/gdrive/oauth", headers=auth_headers(user))
+    assert r.status_code == 200
+    assert called["token"] == "rt-6f"
+    assert gdrive_db.query(GoogleDriveCredential).filter_by(user_id=user.id).count() == 0
+
+
+def test_disconnect_when_not_connected(gdrive_client, make_user, auth_headers):
+    user = make_user("u6g", "u6g@example.com", password="pw")
+    assert gdrive_client.delete("/jobs/gdrive/oauth", headers=auth_headers(user)).status_code == 200
+
+
 def test_callback_exchange_non_json_body_redirects_to_reason_exchange(
     gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch,
 ):

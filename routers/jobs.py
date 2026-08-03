@@ -729,6 +729,69 @@ async def gdrive_oauth_callback(
     return _redirect("gdrive=connected")
 
 
+GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+
+
+async def _revoke_google_token(token: str) -> None:
+    """向 Google 撤銷授權。失敗不擋流程——本地紀錄還是要刪掉。"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(GOOGLE_REVOKE_URL, data={"token": token})
+    except Exception:
+        logger.debug("Google token revoke 失敗（仍會刪除本地憑證）", exc_info=True)
+
+
+def _get_drive_credential(db: Session, user_id: int) -> Optional[GoogleDriveCredential]:
+    return db.query(GoogleDriveCredential).filter(
+        GoogleDriveCredential.user_id == user_id
+    ).first()
+
+
+@router.get("/gdrive/oauth/status")
+def gdrive_oauth_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """前端進 /gdrive 時先問這支，決定要顯示「連接」還是直接開 Picker。"""
+    cred = _get_drive_credential(db, current_user.id)
+    return {"connected": bool(cred), "google_email": cred.google_email if cred else None}
+
+
+@router.post("/gdrive/oauth/token")
+async def gdrive_picker_token(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """代發一份短效 access token 給 Google Picker 用。
+
+    前端因此不必自己跑 OAuth（那會開彈窗），只需要這一次 API 呼叫。
+    """
+    cred = _get_drive_credential(db, current_user.id)
+    if not cred:
+        raise HTTPException(404, "尚未連接 Google Drive")
+    try:
+        td = await _refresh_access_token(cred.refresh_token)
+    except Exception:
+        logger.warning("GDrive refresh token 失效（user_id=%s）", current_user.id, exc_info=True)
+        raise HTTPException(409, "Google 授權已失效，請重新連接 Google Drive")
+    return {"access_token": td.get("access_token"), "expires_in": td.get("expires_in", 0)}
+
+
+@router.delete("/gdrive/oauth")
+async def gdrive_oauth_disconnect(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """解除連接：向 Google 撤銷並刪掉本地憑證。未連接時視為已完成。"""
+    cred = _get_drive_credential(db, current_user.id)
+    if not cred:
+        return {"revoked": False}
+    await _revoke_google_token(cred.refresh_token)
+    db.delete(cred)
+    db.commit()
+    return {"revoked": True}
+
+
 class GDriveJobRequest(BaseModel):
     folder_id: Optional[str] = None          # 向後相容：單一資料夾
     folder_name: Optional[str] = None
