@@ -820,9 +820,19 @@ async def create_gdrive_job(
 ):
     """從 Google Drive 建立縮時影片 job（OAuth + Picker 流程，支援多選）。
 
-    消費者用 GIS code client 取得 offline 授權碼（auth_code），後端在此換 refresh + access
-    token，再用消費者自己的權限並發下載 Picker 選到的「照片與/或資料夾」→ NAS
-    （/homes/firmness/gdrive_<id>）→ 呼叫 Spark POST /jobs/nas。不再爬公開連結。
+    有兩條取得 token 的路徑，皆用消費者自己的權限並發下載 Picker 選到的「照片與/或
+    資料夾」→ NAS（/homes/firmness/gdrive_<id>）→ 呼叫 Spark POST /jobs/nas，不再爬
+    公開連結：
+
+    - 正常路徑（整頁 redirect）：用戶已透過 `/gdrive/oauth/url` 完成整頁授權並綁定
+      `GoogleDriveCredential`，本次呼叫直接用該長期 refresh token 換一份新的 access
+      token（`_refresh_access_token`）。refresh 失敗依錯誤型別分類：`RuntimeError`
+      （token 失效）回 409 請用戶重新連接；`httpx.HTTPError`（Google 暫時不可連）回
+      503；其餘例外視為真的伺服器錯誤，原樣往外拋成 500。
+    - 舊路徑（`auth_code`，GIS popup 相容）：舊前端仍會在請求帶上 GIS code client
+      取得的 offline 授權碼，後端當場用 `redirect_uri='postmessage'` 換 refresh +
+      access token。僅為 auth-service 與前端分階段部署期間保留的相容分支，前端全面
+      改用綁定憑證後可移除。
     """
     folder_ids = list(body.folder_ids or [])
     if body.folder_id:
@@ -861,6 +871,8 @@ async def create_gdrive_job(
             raise HTTPException(503, "暫時無法連上 Google，請稍後再試")
         access_token = td.get("access_token")
         expires_in = td.get("expires_in", 0)
+        if not access_token:
+            raise HTTPException(400, "Google 授權交換未取得 access token")
 
     job = GDriveJob(
         user_id=current_user.id,

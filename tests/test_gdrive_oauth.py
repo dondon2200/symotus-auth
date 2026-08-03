@@ -352,6 +352,14 @@ def test_create_job_uses_bound_credential(gdrive_client, gdrive_db, make_user, a
     job = gdrive_db.query(GDriveJob).filter_by(user_id=user.id).one()
     assert job.google_refresh_token == "rt-7b"
 
+    # _run_gdrive_nas_pipeline(job_id, folder_ids, picked_files, refresh_token, fps,
+    #                          resolution, rain_fog, darkness, max_images,
+    #                          initial_access_token, initial_expires_in, ...)
+    args = started["args"]
+    assert args[3] == "rt-7b"     # refresh_token：不能被 access_token 頂替
+    assert args[9] == "at-7b"     # initial_access_token：不能被 refresh_token 頂替
+    assert args[10] == 3600       # initial_expires_in：不能悄悄留 0
+
 
 def test_create_job_still_accepts_auth_code(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
     """雙軌相容：舊前端仍會送 auth_code，必須照舊路徑走。"""
@@ -364,8 +372,10 @@ def test_create_job_still_accepts_auth_code(gdrive_client, gdrive_db, make_user,
         assert redirect_uri == "postmessage"
         return {"access_token": "at-7c", "refresh_token": "rt-7c", "expires_in": 3600}
 
+    started = {}
+
     async def fake_pipeline(*a, **kw):
-        pass
+        started["args"] = a
 
     monkeypatch.setattr(jobs_module, "_exchange_auth_code", fake_exchange)
     monkeypatch.setattr(jobs_module, "_run_gdrive_nas_pipeline", fake_pipeline)
@@ -376,6 +386,83 @@ def test_create_job_still_accepts_auth_code(gdrive_client, gdrive_db, make_user,
 
     job = gdrive_db.query(GDriveJob).filter_by(user_id=user.id).one()
     assert job.google_refresh_token == "rt-7c"
+
+    args = started["args"]
+    assert args[3] == "rt-7c"
+    assert args[9] == "at-7c"
+    assert args[10] == 3600
+
+
+def test_create_job_new_path_refresh_token_dead_returns_409(
+    gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch,
+):
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_SECRET", "sec")
+    user = make_user("u7d", "u7d@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-7d"))
+    gdrive_db.commit()
+
+    async def dead_refresh(refresh_token):
+        raise RuntimeError("refresh token 失效（400）")
+
+    async def fake_pipeline(*a, **kw):
+        pytest.fail("不該啟動 pipeline")
+
+    monkeypatch.setattr(jobs_module, "_refresh_access_token", dead_refresh)
+    monkeypatch.setattr(jobs_module, "_run_gdrive_nas_pipeline", fake_pipeline)
+
+    r = gdrive_client.post("/jobs/gdrive", headers=auth_headers(user), json=_job_body())
+    assert r.status_code == 409
+    assert r.json()["detail"] == "Google 授權已失效，請重新連接 Google Drive"
+    assert gdrive_db.query(GDriveJob).filter_by(user_id=user.id).count() == 0
+
+
+def test_create_job_new_path_network_error_returns_503(
+    gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch,
+):
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_SECRET", "sec")
+    user = make_user("u7e", "u7e@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-7e"))
+    gdrive_db.commit()
+
+    async def flaky_refresh(refresh_token):
+        raise httpx.ConnectError("connection refused")
+
+    async def fake_pipeline(*a, **kw):
+        pytest.fail("不該啟動 pipeline")
+
+    monkeypatch.setattr(jobs_module, "_refresh_access_token", flaky_refresh)
+    monkeypatch.setattr(jobs_module, "_run_gdrive_nas_pipeline", fake_pipeline)
+
+    r = gdrive_client.post("/jobs/gdrive", headers=auth_headers(user), json=_job_body())
+    assert r.status_code == 503
+    assert gdrive_db.query(GDriveJob).filter_by(user_id=user.id).count() == 0
+
+
+def test_create_job_new_path_unexpected_error_propagates(
+    gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch,
+):
+    """既不是 RuntimeError 也不是 httpx 錯誤的例外，是真正的 bug，不該被偽裝成 409/503。"""
+    user = make_user("u7f", "u7f@example.com", password="pw")
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_SECRET", "sec")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-7f"))
+    gdrive_db.commit()
+
+    async def buggy_refresh(refresh_token):
+        raise ValueError("unexpected bug")
+
+    async def fake_pipeline(*a, **kw):
+        pytest.fail("不該啟動 pipeline")
+
+    monkeypatch.setattr(jobs_module, "_refresh_access_token", buggy_refresh)
+    monkeypatch.setattr(jobs_module, "_run_gdrive_nas_pipeline", fake_pipeline)
+
+    with pytest.raises(ValueError, match="unexpected bug"):
+        gdrive_client.post("/jobs/gdrive", headers=auth_headers(user), json=_job_body())
+
+    assert gdrive_db.query(GDriveJob).filter_by(user_id=user.id).count() == 0
 
 
 def test_status_not_connected(gdrive_client, make_user, auth_headers):
