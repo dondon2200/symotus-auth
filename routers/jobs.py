@@ -307,8 +307,8 @@ async def _refresh_access_token(refresh_token: str) -> dict:
             "client_secret": settings.GOOGLE_CLIENT_SECRET,
             "grant_type": "refresh_token",
         })
-    if r.status_code == 429 or r.status_code >= 500:
-        # Google 端暫時不可用，不代表 refresh token 本身失效
+    if r.status_code == 429 or r.status_code == 403 or r.status_code >= 500:
+        # Google 端暫時不可用（含 403 quota/使用者速率限制)，不代表 refresh token 本身失效
         raise TransientGoogleError(f"Google 暫時無法處理 refresh 請求（{r.status_code}）：{r.text[:200]}")
     if r.status_code != 200:
         # 真正的拒絕（400 invalid_grant、401 等）：refresh token 已死，需要重新同意
@@ -662,20 +662,17 @@ async def _upsert_drive_credential(db: Session, user_id: int, refresh_token: str
                                    google_email: Optional[str], scope: Optional[str]) -> None:
     """一位使用者一組憑證：有就更新，沒有才新增。
 
-    再次同意（re-consent）時，若既有列已存了一組不同的 refresh_token，先嘗試向 Google
-    撤銷舊的那組，避免留下一個使用者自己都看不到、也管不到的孤兒授權（orphaned live
-    Google grant）。撤銷失敗不得擋住新憑證寫入——用 try/except 吞掉，只記 log。
+    再次同意（re-consent）時刻意不撤銷既有的 refresh_token：Google 的 revoke 端點
+    撤的是整組 authorization grant，不是單一 token 字串。consent URL 帶了
+    prompt=consent，重新同意會核發「同一組 grant」下的新 refresh_token；若在覆寫前
+    撤銷舊 token，等於連新拿到的這組 grant 一起拆掉——新 token 寫進 DB 後首次拿
+    picker token 就會 invalid_grant → 409 → 前端清空綁定 → 使用者重連 → 無限迴圈。
+    只有 disconnect endpoint（使用者主動要求解除綁定）才應該呼叫 _revoke_google_token。
     """
     row = db.query(GoogleDriveCredential).filter(
         GoogleDriveCredential.user_id == user_id
     ).first()
     if row:
-        if row.refresh_token and row.refresh_token != refresh_token:
-            try:
-                await _revoke_google_token(row.refresh_token)
-            except Exception:
-                logger.warning("撤銷舊 GDrive refresh_token 失敗（user_id=%s，仍會寫入新憑證）",
-                               user_id, exc_info=True)
         row.refresh_token = refresh_token
         row.google_email = google_email
         row.scope = scope

@@ -184,14 +184,8 @@ def test_callback_upserts_existing_credential(gdrive_client, gdrive_db, make_use
     async def fake_email(access_token):
         return None
 
-    revoked = {}
-
-    async def fake_revoke(token):
-        revoked["token"] = token
-
     monkeypatch.setattr(jobs_module, "_exchange_auth_code", fake_exchange)
     monkeypatch.setattr(jobs_module, "_fetch_google_email", fake_email)
-    monkeypatch.setattr(jobs_module, "_revoke_google_token", fake_revoke)
 
     gdrive_client.get(f"/jobs/gdrive/oauth/callback?code=c&state={state}", follow_redirects=False)
 
@@ -199,8 +193,10 @@ def test_callback_upserts_existing_credential(gdrive_client, gdrive_db, make_use
     assert len(rows) == 1          # upsert，不是新增第二筆
     gdrive_db.refresh(rows[0])
     assert rows[0].refresh_token == "new-rt"
-    # re-consent 覆蓋掉舊 refresh_token 前，應先嘗試撤銷舊的那組，避免孤兒授權
-    assert revoked["token"] == "old-rt"
+    # re-consent 覆蓋舊 refresh_token 時「不應」撤銷：revoke 撤的是整組 grant，
+    # 撤了會讓剛拿到的新 token 一起失效（invalid_grant）。這裡沒有 monkeypatch
+    # _revoke_google_token，若 upsert 仍呼叫它就會打真的網路請求而在測試環境炸掉，
+    # 藉此保證 upsert 路徑不再發出撤銷呼叫。
 
 
 def test_callback_rejects_state_mismatch(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
@@ -323,7 +319,7 @@ def test_callback_store_failure_redirects_to_reason_store(gdrive_client, gdrive_
     async def fake_email(access_token):
         return None
 
-    def boom_upsert(db, user_id, refresh_token, google_email, scope):
+    async def boom_upsert(db, user_id, refresh_token, google_email, scope):
         raise IntegrityError("insert", {}, Exception("unique(user_id)"))
 
     monkeypatch.setattr(jobs_module, "_exchange_auth_code", fake_exchange)
@@ -375,9 +371,9 @@ def test_refresh_access_token_rejection_raises_runtime_error(monkeypatch, status
     assert not isinstance(exc_info.value, jobs_module.TransientGoogleError)
 
 
-@pytest.mark.parametrize("status_code", [429, 500, 502, 503])
+@pytest.mark.parametrize("status_code", [403, 429, 500, 502, 503])
 def test_refresh_access_token_transient_raises_transient_error(monkeypatch, status_code):
-    """429/5xx 是 Google 端暫時性問題，不代表授權已死。"""
+    """403（quota/使用者速率限制）/429/5xx 是 Google 端暫時性問題，不代表授權已死。"""
     _patch_google_token_status(monkeypatch, status_code, "server busy")
     import asyncio
     with pytest.raises(jobs_module.TransientGoogleError):
