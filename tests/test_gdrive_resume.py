@@ -5,6 +5,7 @@
 三件事：進程換掉後 job 會被收成 interrupted、續傳能從 job_params 重建、以及沒有
 job_params 的舊任務會被明確拒絕而不是假裝可以續傳。
 """
+import asyncio
 import json
 import pytest
 
@@ -169,3 +170,118 @@ def test_existing_sizes_skips_empty_and_dotfiles(tmp_path):
 def test_existing_sizes_on_missing_dir_is_empty(tmp_path):
     """第一次執行時目錄還不存在，不能炸掉。"""
     assert jobs_module._existing_sizes(str(tmp_path / "nope")) == {}
+
+
+# ── P1：縮圖下載 ─────────────────────────────────────────────────────────────
+
+def _jpeg(width: int, height: int = 100) -> bytes:
+    """最小可解析的 JPEG：SOI + SOF0(含尺寸) + EOI。"""
+    import struct
+    sof = b"\xff\xc0" + struct.pack(">HBHH", 17, 8, height, width) + b"\x00" * 8
+    return b"\xff\xd8" + sof + b"\xff\xd9" + b"\x00" * 2000
+
+
+def test_thumbnail_size_follows_output_resolution():
+    """縮圖尺寸必須 >= 輸出尺寸，否則等於拿上採樣的圖生成影片。"""
+    assert jobs_module._thumbnail_size_for("1920x1080") == 2560
+    assert jobs_module._thumbnail_size_for("3840x2160") == 4096
+    # 未知解析度不猜，退回原檔
+    assert jobs_module._thumbnail_size_for("1280x720") is None
+    assert jobs_module._thumbnail_size_for(None) is None
+    assert jobs_module._thumbnail_size_for("weird") is None
+
+
+def test_rewrite_thumbnail_url_replaces_size_suffix():
+    base = "https://lh3.googleusercontent.com/drive-storage/AbC-xyz"
+    assert jobs_module._rewrite_thumbnail_url(base + "=s220", 2560) == base + "=s2560"
+    assert jobs_module._rewrite_thumbnail_url(base + "=w200-h150-p", 4096) == base + "=s4096"
+    # 沒有 = 後綴時要補上，不能原樣送出（那會拿到 220px 的縮圖）
+    assert jobs_module._rewrite_thumbnail_url(base, 2560) == base + "=s2560"
+
+
+def test_jpeg_width_reads_sof():
+    assert jobs_module._jpeg_width(_jpeg(2560)) == 2560
+    assert jobs_module._jpeg_width(b"not a jpeg") is None
+
+
+class _FakeResp:
+    def __init__(self, status_code, content=b""):
+        self.status_code = status_code
+        self.content = content
+
+
+class _FakeSession:
+    """記錄每次 GET 的 url 與是否帶 Authorization。"""
+    def __init__(self, handler):
+        self.handler = handler
+        self.calls = []
+
+    async def get(self, url, **kw):
+        self.calls.append((url, "Authorization" in (kw.get("headers") or {})))
+        return self.handler(url, kw)
+
+
+def test_thumbnail_download_uses_signed_url_without_auth():
+    """縮圖走簽名 URL，不該帶 Authorization——這是能把並發拉到 48 的前提。"""
+    session = _FakeSession(lambda url, kw: _FakeResp(200, _jpeg(2560)))
+    item = {"id": "f1", "thumbnailLink": "https://lh3.example/x=s220"}
+
+    data = asyncio.run(jobs_module._download_thumbnail(session, None, item, 2560, 1920))
+
+    assert data is not None
+    url, had_auth = session.calls[0]
+    assert url.endswith("=s2560")
+    assert had_auth is False
+
+
+def test_thumbnail_too_small_falls_back_to_original():
+    """Google 給不到要求的尺寸時必須回 None，讓呼叫端改抓原檔。"""
+    session = _FakeSession(lambda url, kw: _FakeResp(200, _jpeg(800)))
+    item = {"id": "f1", "thumbnailLink": "https://lh3.example/x=s220"}
+
+    assert asyncio.run(jobs_module._download_thumbnail(session, None, item, 2560, 1920)) is None
+
+
+def test_expired_link_is_refreshed_once(monkeypatch):
+    """簽名過期（403）要自動換一條新連結重試，而不是整批失敗。"""
+    state = {"n": 0}
+
+    def handler(url, kw):
+        state["n"] += 1
+        if "old" in url:
+            return _FakeResp(403)
+        return _FakeResp(200, _jpeg(2560))
+
+    async def fake_fresh(session, token_mgr, file_id):
+        return "https://lh3.example/new=s220"
+
+    monkeypatch.setattr(jobs_module, "_fresh_thumbnail_link", fake_fresh)
+    session = _FakeSession(handler)
+    item = {"id": "f1", "thumbnailLink": "https://lh3.example/old=s220"}
+
+    data = asyncio.run(jobs_module._download_thumbnail(session, None, item, 2560, 1920))
+
+    assert data is not None
+    assert state["n"] == 2                       # 舊的失敗、新的成功
+    assert item["thumbnailLink"].startswith("https://lh3.example/new")  # 換過的連結要留下來
+
+
+def test_error_page_is_not_mistaken_for_image(monkeypatch):
+    """200 但內容過小（錯誤頁）不能當成照片寫進 NAS。"""
+    async def fake_fresh(session, token_mgr, file_id):
+        return None
+
+    monkeypatch.setattr(jobs_module, "_fresh_thumbnail_link", fake_fresh)
+    session = _FakeSession(lambda url, kw: _FakeResp(200, b"<html>nope</html>"))
+    item = {"id": "f1", "thumbnailLink": "https://lh3.example/x=s220"}
+
+    assert asyncio.run(jobs_module._download_thumbnail(session, None, item, 2560, 1920)) is None
+
+
+def test_pipeline_handles_unparsable_resolution(tmp_path, monkeypatch):
+    """resolution 不是 WxH 時不能炸掉——之前 re.match(...).group() 會 AttributeError。"""
+    for bad in (None, "", "weird", "4K"):
+        m = jobs_module.re.match(r"\s*(\d+)", bad or "")
+        out_width = int(m.group(1)) if m else 0
+        assert isinstance(out_width, int)
+        assert jobs_module._thumbnail_size_for(bad) is None

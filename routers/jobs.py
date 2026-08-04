@@ -178,8 +178,10 @@ def internal_update_job(
 
 import asyncio
 import os
+import re
 import time
 import json
+import struct
 import logging
 import httpx
 from models import GDriveJob, GoogleDriveCredential
@@ -194,7 +196,16 @@ GDRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 SPARK_SYNC_TIMEOUT = 6
 SPARK_SYNC_CONCURRENCY = 4
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-DOWNLOAD_CONCURRENCY = 12  # Drive API alt=media 並發路數（§3：8~16）
+# 並發路數。原檔（~11 MB/張）是頻寬受限，12 路就吃滿 ~42 MB/s；縮圖（~1 MB/張）
+# 是延遲受限（單線實測 1.0 張/s，與檔案大小無關），要 ~48 路才吃得滿同樣的頻寬。
+# 縮圖走簽名 URL，不吃 Drive API 配額也不爭用 token 鎖，拉高是安全的。
+DOWNLOAD_CONCURRENCY = int(os.getenv("GDRIVE_DOWNLOAD_CONCURRENCY", "48"))
+
+# 縮圖下載：Drive 的 thumbnailLink 由 Google 端縮好，省掉傳輸用不到的像素。
+# 實測 6000x4000（10.7 MB）的來源：=s2560 得 2560x1707（940 KB）、=s4096 得
+# 4096x2731（1884 KB）。輸出 1080p/4K 都仍是「降採樣」，不損畫質。
+THUMBNAIL_SIZES = {1920: 2560, 3840: 4096}   # 輸出寬 -> 要求的縮圖最長邊
+THUMBNAIL_MIN_BYTES = 1024                   # 小於此視為錯誤頁而非圖片
 
 # 下載階段（本服務進程自己擁有）的狀態：進程一沒，這些 job 就是孤兒，必須回收成 interrupted。
 # submitted/processing 不列入——那時工作已交給 Spark，重啟不影響它。
@@ -375,7 +386,8 @@ async def _list_drive_images(token_mgr: "_TokenManager", folder_id: str,
     FOLDER_MIME = "application/vnd.google-apps.folder"
     base_params = {
         "q": f"'{folder_id}' in parents and trashed=false",
-        "fields": "nextPageToken,files(id,name,mimeType,size,shortcutDetails)",
+        "fields": ("nextPageToken,files(id,name,mimeType,size,thumbnailLink,"
+                   "shortcutDetails)"),
         "pageSize": "1000",
         "orderBy": "name",
         "supportsAllDrives": "true",
@@ -417,13 +429,108 @@ async def _list_drive_images(token_mgr: "_TokenManager", folder_id: str,
                     sub = await _list_drive_images(token_mgr, fid, limit - len(images), _seen, _depth + 1)
                     images.extend(sub)
                 elif mime.startswith("image/"):
-                    images.append({"id": fid, "name": f["name"], "mimeType": mime})
+                    images.append({"id": fid, "name": f["name"], "mimeType": mime,
+                                   "thumbnailLink": f.get("thumbnailLink")})
 
             page_token = data.get("nextPageToken")
             if not page_token:
                 break
 
     return images[:limit]
+
+
+def _thumbnail_size_for(resolution: Optional[str]) -> Optional[int]:
+    """依輸出解析度決定要跟 Google 要多大的縮圖；無法判斷就回 None（走原檔）。
+
+    只有「縮圖尺寸 ≥ 輸出尺寸」才會啟用——否則等於拿上採樣的圖去生成影片，畫質會軟。
+    """
+    if not resolution:
+        return None
+    m = re.match(r"\s*(\d+)\s*[xX×]\s*(\d+)", resolution)
+    if not m:
+        return None
+    return THUMBNAIL_SIZES.get(int(m.group(1)))
+
+
+def _rewrite_thumbnail_url(link: str, size: int) -> str:
+    """把 thumbnailLink 尾端的 =s220 之類改寫成要求的尺寸。"""
+    if "=" in link.rsplit("/", 1)[-1]:
+        return re.sub(r"=[^/]*$", f"=s{size}", link)
+    return f"{link}=s{size}"
+
+
+def _jpeg_width(data: bytes) -> Optional[int]:
+    """從 JPEG 的 SOF 標頭讀出寬度，用來確認縮圖真的有要求的尺寸。
+
+    Google 對某些檔案可能給不到要求的大小（例如來源本身就小），那時必須退回原檔，
+    否則會拿上採樣的圖去輸出而使用者看不出原因。
+    """
+    try:
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            i += 2
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                continue
+            seg_len = struct.unpack(">H", data[i:i + 2])[0]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                          0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                return struct.unpack(">H", data[i + 5:i + 7])[0]
+            i += seg_len
+    except Exception:
+        pass
+    return None
+
+
+async def _fresh_thumbnail_link(session: httpx.AsyncClient, token_mgr: "_TokenManager",
+                                file_id: str) -> Optional[str]:
+    """重新取得單一檔案的 thumbnailLink。
+
+    thumbnailLink 是短效簽名 URL，列檔到下載完可能跨數十分鐘，過期後整批會 403。
+    與其猜它的壽命再分批 re-list，不如在失敗當下換一條新的——自癒且不必知道壽命。
+    """
+    try:
+        access = await token_mgr.get()
+        r = await session.get(f"{GDRIVE_FILES_URL}/{file_id}",
+                              params={"fields": "thumbnailLink", "supportsAllDrives": "true"},
+                              headers={"Authorization": f"Bearer {access}"})
+        if r.status_code == 200:
+            return r.json().get("thumbnailLink")
+    except Exception:
+        pass
+    return None
+
+
+async def _download_thumbnail(session: httpx.AsyncClient, token_mgr: "_TokenManager",
+                              item: dict, size: int, min_width: int) -> Optional[bytes]:
+    """下載指定尺寸的縮圖；任何不確定的情況都回 None 讓呼叫端退回原檔。
+
+    縮圖是簽名 URL，不需要（也不該）帶 Authorization——省掉 token 鎖的爭用，
+    這正是能把並發拉到 48 的原因。
+    """
+    link = item.get("thumbnailLink")
+    for attempt in range(2):
+        if not link:
+            link = await _fresh_thumbnail_link(session, token_mgr, item["id"])
+            if not link:
+                return None
+        try:
+            resp = await session.get(_rewrite_thumbnail_url(link, size), follow_redirects=True)
+        except Exception:
+            link = None
+            continue
+        if resp.status_code == 200 and len(resp.content) >= THUMBNAIL_MIN_BYTES:
+            width = _jpeg_width(resp.content)
+            if width is not None and width < min_width:
+                return None      # 尺寸不足：退回原檔，不能拿上採樣的圖充數
+            item["thumbnailLink"] = link
+            return resp.content
+        # 403/404/410 多半是簽名過期 → 換一條新的再試一次
+        link = None
+    return None
 
 
 def _write_file(path: str, data: bytes):
@@ -484,7 +591,6 @@ def _sample_by_day(nas_path: str, duration_seconds: int, fps: int):
     """下載完之後，按天平均抽取照片，確保每天都有幀出現在影片中。
     抽完的照片保留，其餘從 NAS 刪除，再送 Spark。
     """
-    import re
     from collections import defaultdict
 
     all_files = sorted([
@@ -538,7 +644,8 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
                                    refresh_token: Optional[str],
                                    body_fps: int, body_resolution, rain_fog: bool, darkness: bool,
                                    max_images=None, initial_access_token: Optional[str] = None,
-                                   initial_expires_in: int = 0, duration_seconds: Optional[int] = None):
+                                   initial_expires_in: int = 0, duration_seconds: Optional[int] = None,
+                                   image_recovery: bool = False):
     """背景任務：用消費者自己的 Drive 授權並發下載 → NAS → Spark /jobs/nas。
 
     下載清單 = 個別選取的照片（picked_files）+ 各選取資料夾遞迴展開的照片（drive.readonly，含
@@ -568,12 +675,15 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
         seen: set[str] = set()
         for it in picked_files:
             if it.get("id") and it["id"] not in seen:
-                seen.add(it["id"]); download.append({"id": it["id"], "name": it.get("name") or it["id"]})
+                # Picker 選的個別照片沒有 thumbnailLink，下載時再現取
+                seen.add(it["id"]); download.append({"id": it["id"], "name": it.get("name") or it["id"],
+                                                     "thumbnailLink": None})
         try:
             for folder_id in folder_ids:
                 for f in await _list_drive_images(token_mgr, folder_id, max_images):
                     if f["id"] not in seen:
-                        seen.add(f["id"]); download.append({"id": f["id"], "name": f["name"]})
+                        seen.add(f["id"]); download.append({"id": f["id"], "name": f["name"],
+                                                            "thumbnailLink": f.get("thumbnailLink")})
         except Exception as e:
             # 列檔失敗多半是暫時性的（Google 503／網路），已下載的檔案要留著給續傳用
             job.status = "interrupted"; job.error_message = f"無法讀取資料夾：{e}"; db.commit()
@@ -607,10 +717,35 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
         if skipped:
             logger.info("gdrive job %s 續傳：已有 %s 張，尚需下載 %s 張", job_id, skipped, len(todo))
 
-        async with httpx.AsyncClient(timeout=120) as session:
+        # 縮圖尺寸：只在「縮圖 ≥ 輸出」時啟用。AI 影像修復是生成式增強，輸入像素越多
+        # 越好，4K 搭配它時不冒這個險，一律走原檔。
+        thumb_size = _thumbnail_size_for(body_resolution)
+        _m = re.match(r"\s*(\d+)", body_resolution or "")
+        out_width = int(_m.group(1)) if _m else 0
+        if thumb_size and image_recovery and out_width >= 3840:
+            thumb_size = None
+            logger.info("gdrive job %s：4K + AI 影像修復 → 停用縮圖下載，改走原檔", job_id)
+        if thumb_size:
+            logger.info("gdrive job %s：啟用縮圖下載 =s%s（輸出 %s）", job_id, thumb_size, body_resolution)
+        stats = {"thumb": 0, "orig": 0, "bytes": 0}
+
+        limits = httpx.Limits(max_connections=DOWNLOAD_CONCURRENCY * 2,
+                              max_keepalive_connections=DOWNLOAD_CONCURRENCY * 2)
+        async with httpx.AsyncClient(timeout=120, limits=limits) as session:
             async def fetch_one(idx: int, item: dict):
                 async with sem:
-                    data = await _download_file_api(session, token_mgr, item["id"])
+                    data = None
+                    if thumb_size:
+                        data = await _download_thumbnail(session, token_mgr, item,
+                                                         thumb_size, out_width)
+                    if data is not None:
+                        stats["thumb"] += 1
+                    else:
+                        data = await _download_file_api(session, token_mgr, item["id"])
+                        if data is not None:
+                            stats["orig"] += 1
+                    if data:
+                        stats["bytes"] += len(data)
                 if data:
                     await asyncio.to_thread(_write_file, os.path.join(nas_path, _dest_name(idx, item)), data)
                 async with progress_lock:
@@ -618,7 +753,12 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
                     if progress["done"] % 25 == 0:
                         job.downloaded_count = progress["done"]
                         await asyncio.to_thread(db.commit)
+            t0 = time.monotonic()
             await asyncio.gather(*[fetch_one(i, it) for i, it in todo])
+            elapsed = max(time.monotonic() - t0, 0.001)
+            logger.info("gdrive job %s 下載完成：縮圖 %s／原檔 %s，%.1f GB，%.0fs（%.1f MB/s）",
+                        job_id, stats["thumb"], stats["orig"], stats["bytes"] / 1e9,
+                        elapsed, stats["bytes"] / 1e6 / elapsed)
 
         saved = len([x for x in os.listdir(nas_path) if not x.startswith(".")])
         job.downloaded_count = saved; db.commit()
@@ -1051,6 +1191,7 @@ async def create_gdrive_job(
         "resolution": body.resolution,
         "rain_fog_detection": body.rain_fog_detection,
         "darkness_detection": body.darkness_detection,
+        "image_recovery": body.image_recovery,
         "max_images": body.max_images,
         "duration_seconds": body.duration_seconds,
     }
@@ -1070,7 +1211,7 @@ async def create_gdrive_job(
         rain_fog=body.rain_fog_detection, darkness=body.darkness_detection,
         max_images=body.max_images,
         initial_access_token=access_token, initial_expires_in=expires_in,
-        duration_seconds=body.duration_seconds,
+        duration_seconds=body.duration_seconds, image_recovery=body.image_recovery,
     )
     return {"job_id": job.id, "status": "pending", "message": "已開始：用你的 Google 權限下載照片 → Spark 生成"}
 
@@ -1133,6 +1274,7 @@ async def resume_gdrive_job(
         initial_access_token=td.get("access_token"),
         initial_expires_in=td.get("expires_in", 0),
         duration_seconds=params.get("duration_seconds"),
+        image_recovery=bool(params.get("image_recovery")),
     )
     return {"job_id": job.id, "status": "pending", "message": "已續傳：跳過已下載的照片，只補齊缺的部分"}
 
