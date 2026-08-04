@@ -124,6 +124,7 @@ async def startup():
                     "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS folder_id VARCHAR",
                     "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS folder_name VARCHAR",
                     "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS google_refresh_token VARCHAR",
+                    "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS job_params TEXT",
                     "ALTER TABLE gdrive_jobs ALTER COLUMN folder_url DROP NOT NULL",
                     """CREATE TABLE IF NOT EXISTS google_drive_credentials (
                         id SERIAL PRIMARY KEY,
@@ -163,6 +164,13 @@ async def startup():
                     seed_policies(_s)
             except Exception as e:
                 logger.warning(f"seed_policies: {e}")
+            # 回收上一個進程留下的 GDrive 下載孤兒（部署／SIGKILL 會讓它們永遠停在
+            # downloading）。必須在開放流量前做，否則使用者會看到永遠不動的進度條。
+            try:
+                from routers.jobs import reap_orphaned_gdrive_jobs
+                reap_orphaned_gdrive_jobs()
+            except Exception as e:
+                logger.warning(f"reap_orphaned_gdrive_jobs: {e}")
             # 啟動相機開機 LINE 推播背景工作
             from services.camera_notifier import start_camera_notifier
             asyncio.create_task(start_camera_notifier())
@@ -174,6 +182,20 @@ async def startup():
             else:
                 logger.error("Failed to connect to DB after all retries")
                 raise
+
+@app.on_event("shutdown")
+async def shutdown():
+    """優雅關機：把進行中的 GDrive 下載標記為 interrupted，讓它們可被續傳。
+
+    Docker 送 SIGTERM 後預設有 10 秒寬限，足夠寫一筆 DB。走不到這裡的情況（SIGKILL、
+    斷電）由啟動時的 reap_orphaned_gdrive_jobs() 兜底。
+    """
+    try:
+        from routers.jobs import shutdown_gdrive_jobs
+        await shutdown_gdrive_jobs()
+    except Exception as e:
+        logger.warning(f"shutdown_gdrive_jobs: {e}")
+
 
 from routers import auth, invites, users, support, admin, jobs, cameras, line_webhook, invitations, public_camera
 app.include_router(auth.router)

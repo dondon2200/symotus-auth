@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, ARRAY, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, ARRAY, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
@@ -141,9 +141,12 @@ class GDriveJob(Base):
     folder_name = Column(String, nullable=True)             # 資料夾顯示名稱（Picker 回傳）
     google_refresh_token = Column(String, nullable=True)    # 消費者 Drive refresh token（長任務續期下載用）
     status = Column(String, nullable=False, default="pending")
-    # pending → downloading → uploading → processing → completed | failed
+    # pending → listing → downloading → submitted → processing → completed | failed
+    # 另有 interrupted：服務重啟／部署導致下載中斷，NAS 上的檔案仍在，可續傳
     total_images = Column(Integer, default=0)       # Drive 資料夾內圖片總數
     downloaded_count = Column(Integer, default=0)   # 已下載張數
+    # 續傳用：重建下載清單所需的原始參數（JSON），沒有它就無法在重啟後接續
+    job_params = Column(Text, nullable=True)
     spark_job_id = Column(String, nullable=True)    # Spark 回傳的 job_id
     fps = Column(Integer, default=30)
     resolution = Column(String, nullable=True)

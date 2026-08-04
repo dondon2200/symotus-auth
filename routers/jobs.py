@@ -179,6 +179,7 @@ def internal_update_job(
 import asyncio
 import os
 import time
+import json
 import logging
 import httpx
 from models import GDriveJob, GoogleDriveCredential
@@ -194,6 +195,15 @@ SPARK_SYNC_TIMEOUT = 6
 SPARK_SYNC_CONCURRENCY = 4
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 DOWNLOAD_CONCURRENCY = 12  # Drive API alt=media 並發路數（§3：8~16）
+
+# 下載階段（本服務進程自己擁有）的狀態：進程一沒，這些 job 就是孤兒，必須回收成 interrupted。
+# submitted/processing 不列入——那時工作已交給 Spark，重啟不影響它。
+GDRIVE_OWNED_STATUSES = ("pending", "listing", "downloading")
+
+# 正在跑的下載任務：job_id -> asyncio.Task。
+# 兩個用途：(1) 關機時知道有哪些 job 要標成 interrupted；(2) 持有 Task 強引用，避免
+# asyncio.create_task 的回傳值被 GC 回收導致任務中途消失。
+_RUNNING_GDRIVE_TASKS: dict[int, asyncio.Task] = {}
 
 
 # ── 相機縮時：查詢時與 Spark 對齊（供 list_jobs 用）─────────────────────────
@@ -421,6 +431,28 @@ def _write_file(path: str, data: bytes):
         fp.write(data)
 
 
+def _existing_sizes(nas_path: str) -> dict[str, int]:
+    """列出目錄內既有檔案的 name -> size，供續傳時跳過已下載的照片。
+
+    只認 size > 0 的檔案；大小為 0 的殘檔（上次被砍在寫入當下）會被重新下載覆蓋。
+    NFS 上 7 萬筆 scandir 約數秒，只在下載開始前做一次。
+    """
+    sizes: dict[str, int] = {}
+    try:
+        with os.scandir(nas_path) as it:
+            for e in it:
+                if e.name.startswith("."):
+                    continue
+                try:
+                    if e.is_file():
+                        sizes[e.name] = e.stat().st_size
+                except OSError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return sizes
+
+
 async def _download_file_api(session: httpx.AsyncClient, token_mgr: "_TokenManager", file_id: str) -> Optional[bytes]:
     """用消費者權限 + Drive API v3 files.get?alt=media 下載單張圖片（高配額、不限速、不跳病毒掃描頁）。"""
     url = f"{GDRIVE_FILES_URL}/{file_id}"
@@ -518,14 +550,16 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
     db = SessionLocal()
     nas_folder = f"gdrive_{job_id}"
     nas_path = f"/homes/firmness/{nas_folder}"
+    sampled_marker = os.path.join(nas_path, ".sampled")
     token_mgr = _TokenManager(refresh_token, initial_access_token, initial_expires_in)
     try:
         import shutil
         job = db.query(GDriveJob).filter(GDriveJob.id == job_id).first()
         if not job: return
 
-        if os.path.exists(nas_path):
-            shutil.rmtree(nas_path)
+        # 續傳：保留既有目錄，已下載的檔案在下面逐一比對後跳過。
+        # （舊行為是先 rmtree 整個目錄，任何中斷都要從 0 重來——7 萬張／790 GB 的任務
+        #   在一次部署面前必然歸零，這正是 job 40 卡住的根因。）
         os.makedirs(nas_path, exist_ok=True)
 
         # 1. 建下載清單：個別照片 + 各資料夾列出的照片（依 id 去重）
@@ -541,30 +575,50 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
                     if f["id"] not in seen:
                         seen.add(f["id"]); download.append({"id": f["id"], "name": f["name"]})
         except Exception as e:
-            job.status = "failed"; job.error_message = f"無法讀取資料夾：{e}"; db.commit()
-            shutil.rmtree(nas_path, ignore_errors=True); return
+            # 列檔失敗多半是暫時性的（Google 503／網路），已下載的檔案要留著給續傳用
+            job.status = "interrupted"; job.error_message = f"無法讀取資料夾：{e}"; db.commit()
+            return
         if not download:
             job.status = "failed"; job.error_message = "選取的項目中沒有找到圖片"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
         job.total_images = len(download); db.commit()
 
         # 2. 並發下載到 NAS（Drive API alt=media）。檔名加序號前綴：保序＋避免同名覆蓋。
+        #    續傳：同名且非空的檔案直接跳過，只補齊缺的部分。
         job.status = "downloading"; db.commit()
+        existing = await asyncio.to_thread(_existing_sizes, nas_path)
         sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
         progress = {"done": 0}
         progress_lock = asyncio.Lock()
+
+        def _dest_name(idx: int, item: dict) -> str:
+            safe = str(item["name"]).replace("/", "_").replace("\\", "_")
+            return f"{idx:06d}_{safe}"
+
+        # 已抽樣過的目錄不能再依清單補檔——被抽掉的照片是「刻意刪除」，不是「還沒下載」。
+        if os.path.exists(sampled_marker):
+            todo = []
+            logger.info("gdrive job %s 續傳：已完成下載與抽樣，直接重送 Spark", job_id)
+        else:
+            todo = [(i, it) for i, it in enumerate(download) if existing.get(_dest_name(i, it), 0) <= 0]
+        skipped = len(download) - len(todo)
+        progress["done"] = skipped
+        job.downloaded_count = skipped; db.commit()
+        if skipped:
+            logger.info("gdrive job %s 續傳：已有 %s 張，尚需下載 %s 張", job_id, skipped, len(todo))
+
         async with httpx.AsyncClient(timeout=120) as session:
             async def fetch_one(idx: int, item: dict):
                 async with sem:
                     data = await _download_file_api(session, token_mgr, item["id"])
                 if data:
-                    safe = str(item["name"]).replace("/", "_").replace("\\", "_")
-                    await asyncio.to_thread(_write_file, os.path.join(nas_path, f"{idx:06d}_{safe}"), data)
+                    await asyncio.to_thread(_write_file, os.path.join(nas_path, _dest_name(idx, item)), data)
                 async with progress_lock:
                     progress["done"] += 1
                     if progress["done"] % 25 == 0:
-                        job.downloaded_count = progress["done"]; db.commit()
-            await asyncio.gather(*[fetch_one(i, it) for i, it in enumerate(download)])
+                        job.downloaded_count = progress["done"]
+                        await asyncio.to_thread(db.commit)
+            await asyncio.gather(*[fetch_one(i, it) for i, it in todo])
 
         saved = len([x for x in os.listdir(nas_path) if not x.startswith(".")])
         job.downloaded_count = saved; db.commit()
@@ -573,8 +627,11 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
             shutil.rmtree(nas_path, ignore_errors=True); return
 
         # 2.5 按天抽取照片（確保每天都有、達到目標時長）
-        if duration_seconds and duration_seconds > 0:
+        # 抽樣是破壞性的（刪檔），所以只做一次並留下 marker：續傳時若已抽過就不能再抽，
+        # 否則會把上一輪留下的幀當成「全部」再抽一次，時長越續越短。
+        if duration_seconds and duration_seconds > 0 and not os.path.exists(sampled_marker):
             await asyncio.to_thread(_sample_by_day, nas_path, duration_seconds, body_fps)
+            await asyncio.to_thread(_write_file, sampled_marker, b"")
             saved = len([x for x in os.listdir(nas_path) if not x.startswith(".")])
             job.downloaded_count = saved; db.commit()
 
@@ -588,8 +645,10 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
                       "fps": body_fps, "resolution": body_resolution,
                       "rain_fog_detection": rain_fog, "darkness_detection": darkness})
         if sr.status_code not in (200, 202):
-            job.status = "failed"; job.error_message = f"Spark 錯誤（{sr.status_code}）：{sr.text[:200]}"; db.commit()
-            shutil.rmtree(nas_path, ignore_errors=True); return
+            # 照片留在 NAS：重下載可能是數百 GB／數小時，不能因為 Spark 一次抽風就丟掉。
+            # 標成 interrupted 讓使用者可直接續傳（下載階段會全數跳過，等於只重送 Spark）。
+            job.status = "interrupted"; job.error_message = f"Spark 錯誤（{sr.status_code}）：{sr.text[:200]}"; db.commit()
+            return
         job.spark_job_id = str(sr.json().get("job_id", ""))
         job.status = "processing"; db.commit()
     except Exception as e:
@@ -599,6 +658,84 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
         except Exception: pass
     finally:
         db.close()
+
+
+# ── 下載任務的生命週期管理（P0-b：孤兒回收 + 優雅關閉）──────────────────────────
+
+def _launch_gdrive_pipeline(job_id: int, **kwargs) -> None:
+    """啟動下載任務並登記到 _RUNNING_GDRIVE_TASKS。
+
+    一定要透過這個函式啟動，不要直接 asyncio.create_task：登記表同時負責持有 Task
+    的強引用（否則 event loop 只保留弱引用，任務可能被 GC 掉）與關機時的回收。
+    """
+    task = asyncio.create_task(_run_gdrive_nas_pipeline(job_id, **kwargs))
+    _RUNNING_GDRIVE_TASKS[job_id] = task
+    task.add_done_callback(lambda _t, jid=job_id: _RUNNING_GDRIVE_TASKS.pop(jid, None))
+
+
+def _mark_interrupted(db: Session, job_ids: Optional[list[int]] = None) -> int:
+    """把仍由本進程負責的下載階段 job 標成 interrupted（可續傳）。
+
+    job_ids 為 None 代表「這個 DB 裡所有處於下載階段的 job」——啟動時用，因為新進程
+    不可能擁有任何舊任務，它們必然是上一個進程留下的孤兒。
+    """
+    q = db.query(GDriveJob).filter(GDriveJob.status.in_(GDRIVE_OWNED_STATUSES))
+    if job_ids is not None:
+        if not job_ids:
+            return 0
+        q = q.filter(GDriveJob.id.in_(job_ids))
+    jobs = q.all()
+    for job in jobs:
+        job.status = "interrupted"
+        job.error_message = "服務重啟導致下載中斷，已下載的照片仍保留，可直接續傳"
+    if jobs:
+        db.commit()
+    return len(jobs)
+
+
+def reap_orphaned_gdrive_jobs() -> int:
+    """啟動時呼叫：回收上一個進程留下的孤兒下載任務。
+
+    下載任務是 asyncio.create_task 跑在 uvicorn 進程內、沒有佇列也沒有持久化的，
+    進程一被換掉（部署／SIGKILL）就無聲消失，job 會永遠停在 downloading。這裡把它們
+    收斂成 interrupted，使用者才看得到並能續傳。
+    """
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        n = _mark_interrupted(db)
+        if n:
+            logger.warning("回收 %s 個上次未完成的 GDrive 下載任務（標記為 interrupted）", n)
+        return n
+    except Exception:
+        logger.exception("回收孤兒 GDrive 任務失敗")
+        return 0
+    finally:
+        db.close()
+
+
+async def shutdown_gdrive_jobs() -> None:
+    """關機時呼叫：先把進行中的下載標成 interrupted 再讓進程結束。
+
+    Docker SIGTERM 預設有 10 秒寬限，寫一筆 DB 綽綽有餘。這是「正常關機」的快樂路徑；
+    SIGKILL 或斷電走不到這裡，由 reap_orphaned_gdrive_jobs() 在下次啟動時兜底。
+    """
+    job_ids = list(_RUNNING_GDRIVE_TASKS.keys())
+    if not job_ids:
+        return
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        n = await asyncio.to_thread(_mark_interrupted, db, job_ids)
+        logger.warning("關機：已將 %s 個進行中的 GDrive 下載標記為 interrupted", n)
+    except Exception:
+        logger.exception("關機標記 GDrive 任務失敗")
+    finally:
+        db.close()
+    for jid in job_ids:
+        task = _RUNNING_GDRIVE_TASKS.get(jid)
+        if task and not task.done():
+            task.cancel()
 
 
 class FileRef(BaseModel):
@@ -905,21 +1042,99 @@ async def create_gdrive_job(
         if not access_token:
             raise HTTPException(400, "Google 授權交換未取得 access token")
 
+    # 續傳所需的完整參數：folder_ids / picked_files / AI 選項都只存在於這次請求裡，
+    # 不落地的話重啟後就無法重建下載清單，續傳也就無從談起。
+    params = {
+        "folder_ids": folder_ids,
+        "picked_files": picked_files,
+        "fps": body.fps,
+        "resolution": body.resolution,
+        "rain_fog_detection": body.rain_fog_detection,
+        "darkness_detection": body.darkness_detection,
+        "max_images": body.max_images,
+        "duration_seconds": body.duration_seconds,
+    }
     job = GDriveJob(
         user_id=current_user.id,
         folder_id=(folder_ids[0] if folder_ids else None),
         folder_name=body.selection_name or body.folder_name,
         google_refresh_token=refresh_token,
         status="pending", fps=body.fps, resolution=body.resolution,
+        job_params=json.dumps(params, ensure_ascii=False),
     )
     db.add(job); db.commit(); db.refresh(job)
-    asyncio.create_task(_run_gdrive_nas_pipeline(
-        job.id, folder_ids, picked_files, refresh_token, body.fps, body.resolution,
-        body.rain_fog_detection, body.darkness_detection, body.max_images,
-        access_token, expires_in,
+    _launch_gdrive_pipeline(
+        job.id,
+        folder_ids=folder_ids, picked_files=picked_files, refresh_token=refresh_token,
+        body_fps=body.fps, body_resolution=body.resolution,
+        rain_fog=body.rain_fog_detection, darkness=body.darkness_detection,
+        max_images=body.max_images,
+        initial_access_token=access_token, initial_expires_in=expires_in,
         duration_seconds=body.duration_seconds,
-    ))
+    )
     return {"job_id": job.id, "status": "pending", "message": "已開始：用你的 Google 權限下載照片 → Spark 生成"}
+
+
+@router.post("/gdrive/{job_id}/resume")
+async def resume_gdrive_job(
+    job_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """續傳一個被中斷的 Google Drive 任務。
+
+    NAS 上已下載的照片會全部保留並跳過，只補齊缺的部分；若上次已完成下載與抽樣，
+    這裡等於只是重新送一次 Spark。需要 job_params（新版建立的任務才有）。
+    """
+    job = db.query(GDriveJob).filter(
+        GDriveJob.id == job_id,
+        GDriveJob.user_id == current_user.id,
+    ).first()
+    if not job:
+        raise HTTPException(404, "找不到此任務")
+    if job_id in _RUNNING_GDRIVE_TASKS:
+        return {"job_id": job.id, "status": job.status, "message": "此任務正在執行中"}
+    if (job.status or "") not in ("interrupted", "failed"):
+        raise HTTPException(409, f"目前狀態（{job.status}）不需要續傳")
+    if not job.job_params:
+        raise HTTPException(
+            409, "此任務是舊版建立的，沒有保存續傳所需的選取清單，請重新建立任務")
+    try:
+        params = json.loads(job.job_params)
+    except Exception:
+        raise HTTPException(500, "續傳參數毀損，請重新建立任務")
+
+    refresh_token = job.google_refresh_token
+    if not refresh_token:
+        cred = _get_drive_credential(db, current_user.id)
+        if not cred:
+            raise HTTPException(400, "尚未連接 Google Drive，請先完成授權")
+        refresh_token = cred.refresh_token
+    try:
+        td = await _refresh_access_token(refresh_token)
+    except TransientGoogleError:
+        raise HTTPException(503, "暫時無法連上 Google，請稍後再試")
+    except RuntimeError:
+        raise HTTPException(409, "Google 授權已失效，請重新連接 Google Drive")
+    except httpx.HTTPError:
+        raise HTTPException(503, "暫時無法連上 Google，請稍後再試")
+
+    job.status = "pending"; job.error_message = None; db.commit()
+    _launch_gdrive_pipeline(
+        job.id,
+        folder_ids=params.get("folder_ids") or [],
+        picked_files=params.get("picked_files") or [],
+        refresh_token=refresh_token,
+        body_fps=params.get("fps") or job.fps or 30,
+        body_resolution=params.get("resolution") or job.resolution,
+        rain_fog=bool(params.get("rain_fog_detection")),
+        darkness=bool(params.get("darkness_detection")),
+        max_images=params.get("max_images"),
+        initial_access_token=td.get("access_token"),
+        initial_expires_in=td.get("expires_in", 0),
+        duration_seconds=params.get("duration_seconds"),
+    )
+    return {"job_id": job.id, "status": "pending", "message": "已續傳：跳過已下載的照片，只補齊缺的部分"}
 
 
 
@@ -944,6 +1159,7 @@ async def list_gdrive_jobs(
             "downloaded_count": job.downloaded_count,
             "video_download_url": job.video_url,
             "error_message": job.error_message,
+            "resumable": job.status in ("interrupted", "failed") and bool(job.job_params),
             "created_at": utc_iso(job.created_at),
         }
         for job in jobs
@@ -972,9 +1188,10 @@ async def get_gdrive_job(
 
     # 階段一：尚未送 Spark → 回本地下載進度
     if not job.spark_job_id:
-        local_percent = {"pending": 2, "listing": 5, "downloading": 0, "submitted": 60, "failed": 0}
+        local_percent = {"pending": 2, "listing": 5, "downloading": 0, "submitted": 60,
+                         "failed": 0, "interrupted": 0}
         percent = local_percent.get(job.status, 2)
-        if job.status == "downloading" and total > 0:
+        if job.status in ("downloading", "interrupted") and total > 0:
             percent = max(5, int(downloaded / total * 55))  # 下載階段佔 5~60%
         stage_map = {
             "pending": "準備中",
@@ -982,6 +1199,7 @@ async def get_gdrive_job(
             "downloading": f"下載照片中（{downloaded}/{total}）",
             "submitted": "送出 Spark 生成中",
             "failed": "失敗",
+            "interrupted": f"已中斷（{downloaded}/{total}），可續傳",
         }
         return {
             "job_id": job.id,
@@ -992,6 +1210,8 @@ async def get_gdrive_job(
             "current_stage": stage_map.get(job.status, "處理中"),
             "video_download_url": job.video_url,
             "error_message": job.error_message,
+            # 前端據此顯示「繼續下載」；舊任務沒有 job_params 無法續傳
+            "resumable": job.status in ("interrupted", "failed") and bool(job.job_params),
         }
 
     # 階段二：已送 Spark → 直接問 Spark

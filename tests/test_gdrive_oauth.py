@@ -446,6 +446,7 @@ def test_create_job_uses_bound_credential(gdrive_client, gdrive_db, make_user, a
 
     async def fake_pipeline(*a, **kw):
         started["args"] = a
+        started["kwargs"] = kw
 
     monkeypatch.setattr(jobs_module, "_refresh_access_token", fake_refresh)
     monkeypatch.setattr(jobs_module, "_run_gdrive_nas_pipeline", fake_pipeline)
@@ -456,13 +457,11 @@ def test_create_job_uses_bound_credential(gdrive_client, gdrive_db, make_user, a
     job = gdrive_db.query(GDriveJob).filter_by(user_id=user.id).one()
     assert job.google_refresh_token == "rt-7b"
 
-    # _run_gdrive_nas_pipeline(job_id, folder_ids, picked_files, refresh_token, fps,
-    #                          resolution, rain_fog, darkness, max_images,
-    #                          initial_access_token, initial_expires_in, ...)
-    args = started["args"]
-    assert args[3] == "rt-7b"     # refresh_token：不能被 access_token 頂替
-    assert args[9] == "at-7b"     # initial_access_token：不能被 refresh_token 頂替
-    assert args[10] == 3600       # initial_expires_in：不能悄悄留 0
+    # 續傳改動後 _launch_gdrive_pipeline 一律以關鍵字傳參（只有 job_id 是位置參數）
+    kw = started["kwargs"]
+    assert kw["refresh_token"] == "rt-7b"          # 不能被 access_token 頂替
+    assert kw["initial_access_token"] == "at-7b"   # 不能被 refresh_token 頂替
+    assert kw["initial_expires_in"] == 3600        # 不能悄悄留 0
 
 
 def test_create_job_still_accepts_auth_code(gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
@@ -480,6 +479,7 @@ def test_create_job_still_accepts_auth_code(gdrive_client, gdrive_db, make_user,
 
     async def fake_pipeline(*a, **kw):
         started["args"] = a
+        started["kwargs"] = kw
 
     monkeypatch.setattr(jobs_module, "_exchange_auth_code", fake_exchange)
     monkeypatch.setattr(jobs_module, "_run_gdrive_nas_pipeline", fake_pipeline)
@@ -491,10 +491,10 @@ def test_create_job_still_accepts_auth_code(gdrive_client, gdrive_db, make_user,
     job = gdrive_db.query(GDriveJob).filter_by(user_id=user.id).one()
     assert job.google_refresh_token == "rt-7c"
 
-    args = started["args"]
-    assert args[3] == "rt-7c"
-    assert args[9] == "at-7c"
-    assert args[10] == 3600
+    kw = started["kwargs"]
+    assert kw["refresh_token"] == "rt-7c"
+    assert kw["initial_access_token"] == "at-7c"
+    assert kw["initial_expires_in"] == 3600
 
 
 def test_create_job_new_path_refresh_token_dead_returns_409(
