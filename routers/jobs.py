@@ -196,10 +196,17 @@ GDRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 SPARK_SYNC_TIMEOUT = 6
 SPARK_SYNC_CONCURRENCY = 4
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-# 並發路數。原檔（~11 MB/張）是頻寬受限，12 路就吃滿 ~42 MB/s；縮圖（~1 MB/張）
-# 是延遲受限（單線實測 1.0 張/s，與檔案大小無關），要 ~48 路才吃得滿同樣的頻寬。
+# 並發路數。sem 同時夾住下載與寫檔，所以它也是「同時有幾張圖佔著記憶體」的上限。
+#
+# 實測基準（job 41 完整一輪，65541 張縮圖）：
+#   48 路 → 11.9 張/s、11.7 MB/s，記憶體峰值 ~433 MiB
+# 同一台 NFS 在 12 路搭 11 MB 原檔時跑到 42.8 MB/s，可見瓶頸不是頻寬而是
+# 每檔的往返與 NFS metadata 開銷——那是靠並發數而非頻寬去攤平的，所以加倍。
+#
+# 記憶體成本：96 x ~1 MB ≈ 100 MB 在途緩衝，容器上限 2 GiB，有充裕餘裕。
 # 縮圖走簽名 URL，不吃 Drive API 配額也不爭用 token 鎖，拉高是安全的。
-DOWNLOAD_CONCURRENCY = int(os.getenv("GDRIVE_DOWNLOAD_CONCURRENCY", "48"))
+# 若出現大量 429 或記憶體逼近上限，用 GDRIVE_DOWNLOAD_CONCURRENCY 調回 48。
+DOWNLOAD_CONCURRENCY = int(os.getenv("GDRIVE_DOWNLOAD_CONCURRENCY", "96"))
 
 # 縮圖下載：Drive 的 thumbnailLink 由 Google 端縮好，省掉傳輸用不到的像素。
 # 實測 6000x4000（10.7 MB）的來源：=s2560 得 2560x1707（940 KB）、=s4096 得
@@ -517,7 +524,7 @@ async def _download_thumbnail(session: httpx.AsyncClient, token_mgr: "_TokenMana
     """下載指定尺寸的縮圖；任何不確定的情況都回 None 讓呼叫端退回原檔。
 
     縮圖是簽名 URL，不需要（也不該）帶 Authorization——省掉 token 鎖的爭用，
-    這正是能把並發拉到 48 的原因。
+    這正是能把並發拉到數十路的原因。
     """
     link = item.get("thumbnailLink")
     for attempt in range(2):
@@ -547,7 +554,7 @@ async def _fetch_and_store(session: httpx.AsyncClient, token_mgr: "_TokenManager
     """抓一張圖並寫進 NAS。下載與寫檔都在 sem 之內。
 
     sem 是「同時有幾張圖佔著記憶體」的唯一上限，所以寫檔不能移到 sem 之外——那樣
-    下載（快、48 路）會遠遠超前 NFS 寫入，每張未寫出的圖都以 bytes 留在 RAM。
+    下載（快、數十路）會遠遠超前 NFS 寫入，每張未寫出的圖都以 bytes 留在 RAM。
     """
     async with sem:
         data = None

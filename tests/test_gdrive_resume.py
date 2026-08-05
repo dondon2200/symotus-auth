@@ -223,7 +223,7 @@ class _FakeSession:
 
 
 def test_thumbnail_download_uses_signed_url_without_auth():
-    """縮圖走簽名 URL，不該帶 Authorization——這是能把並發拉到 48 的前提。"""
+    """縮圖走簽名 URL，不該帶 Authorization——這是能把並發拉到數十路的前提。"""
     session = _FakeSession(lambda url, kw: _FakeResp(200, _jpeg(2560)))
     item = {"id": "f1", "thumbnailLink": "https://lh3.example/x=s220"}
 
@@ -293,7 +293,7 @@ def test_pipeline_handles_unparsable_resolution(tmp_path, monkeypatch):
 def test_download_does_not_outrun_writes(monkeypatch):
     """已下載但尚未寫出的圖片數量必須被 sem 上限夾住。
 
-    回歸自 job 41：寫檔原本在 sem 之外，下載（48 路、~1 MB/張）遠遠超前 NFS 寫入，
+    回歸自 job 41：寫檔原本在 sem 之外，下載（數十路、~1 MB/張）遠遠超前 NFS 寫入，
     每張未寫出的圖都以 bytes 留在 RAM，30 分鐘內吃到 27 GB / 30 GB 幾乎 OOM。
     """
     CONC, TOTAL = 4, 60
@@ -372,3 +372,13 @@ def test_sample_spreads_across_days(tmp_path):
 def test_spark_max_images_default():
     """安全網的上限要與 Spark 實際限制一致（422: max is 50000）。"""
     assert jobs_module.SPARK_MAX_IMAGES == 50000
+
+
+def test_concurrency_memory_budget_fits_container_limit():
+    """sem 同時夾住下載與寫檔，所以並發數 x 單張大小就是在途緩衝的上限。
+
+    容器 mem_limit 是 2 GiB，這裡確保並發數不會被調到讓緩衝吃掉整個額度。
+    """
+    per_image_mib = 2          # 實測縮圖 ~1 MB，抓 2 倍餘裕
+    budget_mib = jobs_module.DOWNLOAD_CONCURRENCY * per_image_mib
+    assert budget_mib <= 512, f"在途緩衝上限 {budget_mib} MiB 過大（容器上限 2 GiB）"
