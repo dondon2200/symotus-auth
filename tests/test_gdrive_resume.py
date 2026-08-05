@@ -500,3 +500,81 @@ def test_video_ticket_purpose_is_isolated():
     from auth import create_video_ticket, decode_gdrive_oauth_ticket
     assert decode_video_ticket(create_gdrive_oauth_ticket(15)) is None
     assert decode_gdrive_oauth_ticket(create_video_ticket(15, 41)) is None
+
+
+# ── 續傳時覆寫設定 ───────────────────────────────────────────────────────────
+
+def _capture_launch(monkeypatch):
+    started = {}
+
+    async def fake_pipeline(*a, **kw):
+        started["kwargs"] = kw
+
+    monkeypatch.setattr(jobs_module, "_run_gdrive_nas_pipeline", fake_pipeline)
+    return started
+
+
+def test_resume_applies_overrides(gdrive_client, gdrive_db, make_user,
+                                  auth_headers, monkeypatch, _google_ok):
+    """Spark 端因設定失敗時（如 job 42 的 quality gate 刷光整批導致死鎖），
+    必須能換設定重送，否則只能原封重送再失敗一次，或重新下載數 GB。"""
+    user = make_user("ov1", "ov1@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "failed", PARAMS)
+    started = _capture_launch(monkeypatch)
+
+    r = gdrive_client.post(f"/jobs/gdrive/{job.id}/resume", headers=auth_headers(user),
+                           json={"darkness_detection": False, "duration_seconds": 60})
+    assert r.status_code == 200, r.text
+
+    kw = started["kwargs"]
+    assert kw["darkness"] is False                # 覆寫生效
+    assert kw["duration_seconds"] == 60
+    assert kw["rain_fog"] is True                 # 未指定的沿用原值
+    assert kw["folder_ids"] == PARAMS["folder_ids"]
+    assert set(r.json()["applied_overrides"]) == {"darkness_detection", "duration_seconds"}
+
+
+def test_resume_overrides_are_persisted(gdrive_client, gdrive_db, make_user,
+                                        auth_headers, monkeypatch, _google_ok):
+    """覆寫要寫回 job_params：之後再被中斷時該沿用新設定，不能退回舊的。"""
+    user = make_user("ov2", "ov2@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "failed", PARAMS)
+    _capture_launch(monkeypatch)
+
+    gdrive_client.post(f"/jobs/gdrive/{job.id}/resume", headers=auth_headers(user),
+                       json={"darkness_detection": False})
+
+    gdrive_db.expire_all()
+    saved = json.loads(gdrive_db.query(GDriveJob).get(job.id).job_params)
+    assert saved["darkness_detection"] is False
+    assert saved["rain_fog_detection"] is True    # 其餘不受影響
+
+
+def test_resume_without_body_keeps_original_params(gdrive_client, gdrive_db, make_user,
+                                                   auth_headers, monkeypatch, _google_ok):
+    """不帶 body 的續傳（前端目前的用法）行為必須完全不變。"""
+    user = make_user("ov3", "ov3@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "interrupted", PARAMS)
+    started = _capture_launch(monkeypatch)
+
+    r = gdrive_client.post(f"/jobs/gdrive/{job.id}/resume", headers=auth_headers(user))
+    assert r.status_code == 200
+
+    kw = started["kwargs"]
+    assert kw["darkness"] is False and kw["rain_fog"] is True   # 同 PARAMS
+    assert kw["duration_seconds"] == 60
+    assert r.json()["applied_overrides"] == {}
+
+
+def test_resume_cannot_override_resolution(gdrive_client, gdrive_db, make_user,
+                                           auth_headers, monkeypatch, _google_ok):
+    """resolution 不開放覆寫：照片是依當初解析度抓對應尺寸的縮圖，
+    事後改 4K 只會拿到不足尺寸的素材。"""
+    user = make_user("ov4", "ov4@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "failed", PARAMS)
+    started = _capture_launch(monkeypatch)
+
+    gdrive_client.post(f"/jobs/gdrive/{job.id}/resume", headers=auth_headers(user),
+                       json={"resolution": "3840x2160"})
+
+    assert started["kwargs"]["body_resolution"] == "1920x1080"   # 未被改動

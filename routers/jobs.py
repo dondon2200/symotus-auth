@@ -1331,16 +1331,34 @@ async def create_gdrive_job(
     return {"job_id": job.id, "status": "pending", "message": "已開始：用你的 Google 權限下載照片 → Spark 生成"}
 
 
+class GDriveResumeRequest(BaseModel):
+    """續傳時可覆寫的設定（未給的沿用原本的 job_params）。
+
+    只開放不會讓「已下載的照片作廢」的欄位：AI 選項與影片時長都只影響送 Spark
+    之後的處理。resolution / fps 刻意不開放——照片是依當初的解析度抓對應尺寸的
+    縮圖，事後改成 4K 只會拿到不足尺寸的素材。
+    """
+    rain_fog_detection: Optional[bool] = None
+    darkness_detection: Optional[bool] = None
+    image_recovery: Optional[bool] = None
+    duration_seconds: Optional[int] = None
+
+
 @router.post("/gdrive/{job_id}/resume")
 async def resume_gdrive_job(
     job_id: int,
+    body: Optional[GDriveResumeRequest] = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """續傳一個被中斷的 Google Drive 任務。
+    """續傳一個被中斷的 Google Drive 任務，可順便改設定。
 
     NAS 上已下載的照片會全部保留並跳過，只補齊缺的部分；若上次已完成下載與抽樣，
     這裡等於只是重新送一次 Spark。需要 job_params（新版建立的任務才有）。
+
+    可覆寫設定的用途：Spark 端因設定而失敗時（例如 job 42 的 quality gate 把
+    整批照片刷光導致 worker 死鎖），沒有覆寫就只能原封重送、必然再失敗一次，
+    否則得重新下載數 GB。
     """
     job = db.query(GDriveJob).filter(
         GDriveJob.id == job_id,
@@ -1375,6 +1393,13 @@ async def resume_gdrive_job(
     except httpx.HTTPError:
         raise HTTPException(503, "暫時無法連上 Google，請稍後再試")
 
+    # 套用覆寫並寫回 job_params：之後若再被中斷，續傳要沿用新設定而不是退回舊的
+    overrides = body.model_dump(exclude_none=True) if body else {}
+    if overrides:
+        params.update(overrides)
+        job.job_params = json.dumps(params, ensure_ascii=False)
+        logger.info("gdrive job %s 續傳並覆寫設定：%s", job_id, overrides)
+
     job.status = "pending"; job.error_message = None; db.commit()
     _launch_gdrive_pipeline(
         job.id,
@@ -1391,7 +1416,10 @@ async def resume_gdrive_job(
         duration_seconds=params.get("duration_seconds"),
         image_recovery=bool(params.get("image_recovery")),
     )
-    return {"job_id": job.id, "status": "pending", "message": "已續傳：跳過已下載的照片，只補齊缺的部分"}
+    msg = "已續傳：跳過已下載的照片，只補齊缺的部分"
+    if overrides:
+        msg += f"（已套用新設定：{', '.join(overrides)}）"
+    return {"job_id": job.id, "status": "pending", "message": msg, "applied_overrides": overrides}
 
 
 
