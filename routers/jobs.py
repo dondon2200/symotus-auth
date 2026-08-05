@@ -211,6 +211,10 @@ THUMBNAIL_MIN_BYTES = 1024                   # 小於此視為錯誤頁而非圖
 # 阻塞 event loop：71789 張以 25 為間隔要 2871 次。
 PROGRESS_COMMIT_EVERY = 200
 
+# Spark 單一資料夾的張數上限（超過回 422）。送件前一律抽樣到這個數以下，否則
+# 會像 job 41 那樣下載完 65541 張、花掉一小時才被擋下來。
+SPARK_MAX_IMAGES = int(os.getenv("SPARK_MAX_IMAGES", "50000"))
+
 # 下載階段（本服務進程自己擁有）的狀態：進程一沒，這些 job 就是孤兒，必須回收成 interrupted。
 # submitted/processing 不列入——那時工作已交給 Spark，重啟不影響它。
 GDRIVE_OWNED_STATUSES = ("pending", "listing", "downloading")
@@ -614,9 +618,12 @@ async def _download_file_api(session: httpx.AsyncClient, token_mgr: "_TokenManag
 
 
 
-def _sample_by_day(nas_path: str, duration_seconds: int, fps: int):
+def _sample_by_day(nas_path: str, frames_needed: int):
     """下載完之後，按天平均抽取照片，確保每天都有幀出現在影片中。
     抽完的照片保留，其餘從 NAS 刪除，再送 Spark。
+
+    frames_needed 是目標張數（時長 x fps，或 Spark 的硬上限）。已經不多於目標時
+    直接返回，所以重複呼叫是安全的（續傳會用到這個性質）。
     """
     from collections import defaultdict
 
@@ -625,7 +632,6 @@ def _sample_by_day(nas_path: str, duration_seconds: int, fps: int):
         if not f.startswith(".") and os.path.isfile(os.path.join(nas_path, f))
     ])
     total = len(all_files)
-    frames_needed = duration_seconds * fps
 
     if total <= frames_needed:
         return  # 不需要抽取
@@ -657,6 +663,14 @@ def _sample_by_day(nas_path: str, duration_seconds: int, fps: int):
             else:
                 step = n / frames_per_day
                 keep.update(day_files[int(i * step)] for i in range(frames_per_day))
+
+    # 按天分配保證「每天都有」，但不保證總數：天數比目標張數多時，每天各留一張
+    # 就已經超出目標。這裡再等間距壓一次，讓「不超過 frames_needed」成為硬保證——
+    # Spark 的張數上限靠這個函式把關，超出就是 422 白跑一趟。
+    if len(keep) > frames_needed:
+        ordered = sorted(keep)
+        step = len(ordered) / frames_needed
+        keep = set(ordered[int(i * step)] for i in range(frames_needed))
 
     # 刪除不在 keep 集合裡的檔案
     for f in all_files:
@@ -783,11 +797,18 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
             job.status = "failed"; job.error_message = f"只下載到 {saved} 張"; db.commit()
             shutil.rmtree(nas_path, ignore_errors=True); return
 
-        # 2.5 按天抽取照片（確保每天都有、達到目標時長）
-        # 抽樣是破壞性的（刪檔），所以只做一次並留下 marker：續傳時若已抽過就不能再抽，
-        # 否則會把上一輪留下的幀當成「全部」再抽一次，時長越續越短。
-        if duration_seconds and duration_seconds > 0 and not os.path.exists(sampled_marker):
-            await asyncio.to_thread(_sample_by_day, nas_path, duration_seconds, body_fps)
+        # 2.5 按天抽取照片。目標張數取兩個來源的較小值：
+        #   - 使用者指定的時長（duration_seconds x fps）
+        #   - Spark 的硬上限：超過就是 422，白下載一場（job 41 下載完 65541 張才被擋）
+        # 抽樣是破壞性的（刪檔），所以做完留下 marker：續傳時下載階段要靠它判斷
+        # 「檔案少是因為抽過」而不是「還沒下載完」，否則會把抽掉的照片全部重抓。
+        target = duration_seconds * body_fps if (duration_seconds and duration_seconds > 0) else None
+        if saved > SPARK_MAX_IMAGES:
+            target = min(target, SPARK_MAX_IMAGES) if target else SPARK_MAX_IMAGES
+            logger.info("gdrive job %s：%s 張超過 Spark 上限 %s，抽樣至 %s 張",
+                        job_id, saved, SPARK_MAX_IMAGES, target)
+        if target:
+            await asyncio.to_thread(_sample_by_day, nas_path, target)
             await asyncio.to_thread(_write_file, sampled_marker, b"")
             saved = len([x for x in os.listdir(nas_path) if not x.startswith(".")])
             job.downloaded_count = saved; db.commit()
@@ -802,9 +823,13 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
                       "fps": body_fps, "resolution": body_resolution,
                       "rain_fog_detection": rain_fog, "darkness_detection": darkness})
         if sr.status_code not in (200, 202):
-            # 照片留在 NAS：重下載可能是數百 GB／數小時，不能因為 Spark 一次抽風就丟掉。
-            # 標成 interrupted 讓使用者可直接續傳（下載階段會全數跳過，等於只重送 Spark）。
-            job.status = "interrupted"; job.error_message = f"Spark 錯誤（{sr.status_code}）：{sr.text[:200]}"; db.commit()
+            # 照片一律留在 NAS：重下載可能是數十 GB／數小時，不能因為送件失敗就丟掉。
+            # 但狀態要分流——4xx 是請求本身不合法（例如 422 張數超上限），原封重送
+            # 只會再失敗一次；把它標成 interrupted 等於請使用者按一個註定無效的按鈕。
+            transient = sr.status_code == 429 or sr.status_code >= 500
+            job.status = "interrupted" if transient else "failed"
+            job.error_message = f"Spark 錯誤（{sr.status_code}）：{sr.text[:200]}"
+            db.commit()
             return
         job.spark_job_id = str(sr.json().get("job_id", ""))
         job.status = "processing"; db.commit()

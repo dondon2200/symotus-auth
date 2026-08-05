@@ -332,3 +332,43 @@ def test_download_does_not_outrun_writes(monkeypatch):
 def test_progress_commit_interval_is_not_tiny():
     """commit 是同步的（持鎖時不能 await），間隔太小會頻繁阻塞 event loop。"""
     assert jobs_module.PROGRESS_COMMIT_EVERY >= 100
+
+
+# ── Spark 張數上限安全網 ─────────────────────────────────────────────────────
+
+def _mk_photos(d, n, day="20260101"):
+    for i in range(n):
+        (d / f"{i:06d}_{day}_p{i}.jpg").write_bytes(b"x")
+
+
+def test_sample_caps_at_target(tmp_path):
+    """抽樣後張數不得超過目標——這是不會再撞 Spark 422 的保證。"""
+    _mk_photos(tmp_path, 300)
+    jobs_module._sample_by_day(str(tmp_path), 100)
+    assert len(list(tmp_path.iterdir())) <= 100
+
+
+def test_sample_is_noop_when_already_under_target(tmp_path):
+    """已經不多於目標時不能再刪——續傳會重複呼叫，時長不可越續越短。"""
+    _mk_photos(tmp_path, 50)
+    jobs_module._sample_by_day(str(tmp_path), 100)
+    assert len(list(tmp_path.iterdir())) == 50
+    # 再跑一次仍不變
+    jobs_module._sample_by_day(str(tmp_path), 100)
+    assert len(list(tmp_path.iterdir())) == 50
+
+
+def test_sample_spreads_across_days(tmp_path):
+    """按天抽取：每天都要有幀入鏡，不能整段某天被吃掉。"""
+    for day in ("20260101", "20260102", "20260103"):
+        for i in range(100):
+            (tmp_path / f"{day}_{i:04d}.jpg").write_bytes(b"x")
+    jobs_module._sample_by_day(str(tmp_path), 30)
+    remaining = [p.name for p in tmp_path.iterdir()]
+    for day in ("20260101", "20260102", "20260103"):
+        assert any(n.startswith(day) for n in remaining), f"{day} 整天被抽光"
+
+
+def test_spark_max_images_default():
+    """安全網的上限要與 Spark 實際限制一致（422: max is 50000）。"""
+    assert jobs_module.SPARK_MAX_IMAGES == 50000
