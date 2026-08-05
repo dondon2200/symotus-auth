@@ -2,7 +2,7 @@ import secrets
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import Optional
@@ -10,7 +10,8 @@ from pydantic import BaseModel
 
 from database import get_db
 from models import User, TimelapsJob
-from auth import get_current_user, create_gdrive_oauth_ticket, decode_gdrive_oauth_ticket
+from auth import (get_current_user, create_gdrive_oauth_ticket, decode_gdrive_oauth_ticket,
+                  create_video_ticket, decode_video_ticket)
 from schemas import UtcDatetime, utc_iso
 
 router = APIRouter(prefix="/jobs", tags=["timelapse_jobs"])
@@ -1092,6 +1093,71 @@ async def _revoke_google_token(token: str) -> None:
         logger.warning("Google token revoke 失敗（仍會刪除本地憑證）", exc_info=True)
 
 
+def _video_download_url(job: GDriveJob) -> Optional[str]:
+    """產生不含祕鑰的影片下載連結。
+
+    絕對不要把 Spark 的 URL 直接交給瀏覽器：那個連結長成
+    `.../download?api_key=<SPARK_API_KEY>`，等於把 Spark 的完整 API 權限
+    交出去（分享連結、瀏覽器紀錄、Referer 都會外流）。改成指向本服務的代理
+    端點，由後端持 key 去取檔，前端只拿到一張綁 user+job 的短效 ticket。
+    """
+    if not job.spark_job_id:
+        return None
+    ticket = create_video_ticket(job.user_id, job.id)
+    return f"{settings.PUBLIC_BASE_URL}/jobs/gdrive/{job.id}/video?t={ticket}"
+
+
+@router.get("/gdrive/{job_id}/video")
+async def download_gdrive_video(job_id: int, t: str, db: Session = Depends(get_db)):
+    """代理下載已生成的影片，避免把 SPARK_API_KEY 曝露給瀏覽器。
+
+    身分靠 query string 的短效 ticket——瀏覽器的 top-level 下載導覽帶不了
+    Authorization header。ticket 同時綁定 user 與 job，所以不能拿別人的 ticket
+    換這支影片，也不能拿這支的 ticket 換別支。
+    """
+    claims = decode_video_ticket(t)
+    if not claims:
+        raise HTTPException(403, "下載連結已過期，請重新整理頁面")
+    user_id, ticket_job_id = claims
+    if ticket_job_id != job_id:
+        raise HTTPException(403, "下載連結與此任務不符")
+
+    job = db.query(GDriveJob).filter(
+        GDriveJob.id == job_id,
+        GDriveJob.user_id == user_id,
+    ).first()
+    if not job or not job.spark_job_id:
+        raise HTTPException(404, "找不到此任務的影片")
+
+    upstream = f"{SPARK_API_URL}/jobs/{job.spark_job_id}/download"
+    client = httpx.AsyncClient(timeout=None)
+    try:
+        req = client.build_request("GET", upstream, headers={"x-api-key": SPARK_API_KEY})
+        resp = await client.send(req, stream=True)
+    except Exception:
+        await client.aclose()
+        raise HTTPException(502, "暫時無法取得影片，請稍後再試")
+    if resp.status_code != 200:
+        await resp.aclose(); await client.aclose()
+        raise HTTPException(502, f"Spark 取檔失敗（{resp.status_code}）")
+
+    async def body():
+        # 串流轉送：影片可能數百 MB，不能整份讀進記憶體再回傳
+        try:
+            async for chunk in resp.aiter_bytes(1 << 16):
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    headers = {"Content-Disposition": f'attachment; filename="timelapse_{job_id}.mp4"'}
+    if resp.headers.get("content-length"):
+        headers["Content-Length"] = resp.headers["content-length"]
+    return StreamingResponse(body(),
+                             media_type=resp.headers.get("content-type", "video/mp4"),
+                             headers=headers)
+
+
 def _get_drive_credential(db: Session, user_id: int) -> Optional[GoogleDriveCredential]:
     return db.query(GoogleDriveCredential).filter(
         GoogleDriveCredential.user_id == user_id
@@ -1348,7 +1414,7 @@ async def list_gdrive_jobs(
             "resolution": job.resolution,
             "total_images": job.total_images,
             "downloaded_count": job.downloaded_count,
-            "video_download_url": job.video_url,
+            "video_download_url": _video_download_url(job),
             "error_message": job.error_message,
             "resumable": job.status in ("interrupted", "failed") and bool(job.job_params),
             "created_at": utc_iso(job.created_at),
@@ -1399,7 +1465,7 @@ async def get_gdrive_job(
             "image_count": total,
             "downloaded_count": downloaded,
             "current_stage": stage_map.get(job.status, "處理中"),
-            "video_download_url": job.video_url,
+            "video_download_url": _video_download_url(job),
             "error_message": job.error_message,
             # 前端據此顯示「繼續下載」；舊任務沒有 job_params 無法續傳
             "resumable": job.status in ("interrupted", "failed") and bool(job.job_params),
@@ -1432,15 +1498,11 @@ async def get_gdrive_job(
     image_count = spark.get("image_count") or total
     error = spark.get("error") or job.error_message
 
-    video_url = job.video_url
-    if status == "completed" and not video_url:
-        video_url = f"{SPARK_API_URL}/jobs/{job.spark_job_id}/download?api_key={SPARK_API_KEY}"
+    video_url = _video_download_url(job) if status == "completed" else None
 
     # 同步 DB 終態
     if status in ("completed", "failed") and job.status != status:
         job.status = status
-        if video_url:
-            job.video_url = video_url
         if error:
             job.error_message = error
         db.commit()
@@ -1461,6 +1523,12 @@ async def get_gdrive_job(
         "stage_detail": spark.get("stage_detail") or None,
         "estimated_time_remaining": spark.get("estimated_time_remaining") or None,
         "spark_status": spark.get("status") or None,
+        # 診斷用：spark_job_id 原本只存在 DB，任何 API 都不吐，導致「任務看似卡住」時
+        # 沒有任何辦法從外部直接去問 Spark。spark_stage 是 Spark 自己的階段字串（被上面
+        # 的中文標籤蓋掉了），quality_report 則原本整個被丟棄——品質關卡重跑時只有它看得出來。
+        "spark_job_id": job.spark_job_id or None,
+        "spark_stage": spark.get("current_stage") or None,
+        "quality_report": spark.get("quality_report") or None,
         "video_download_url": video_url,
         "error_message": error,
     }
@@ -1500,7 +1568,7 @@ async def gdrive_spark_callback(
         job.error_message = err
     if body.status == "completed":
         if job.spark_job_id:
-            job.video_url = f"{SPARK_API_URL}/jobs/{job.spark_job_id}/download?api_key={SPARK_API_KEY}"
+            job.video_url = None      # 連結改為查詢時即時產生（見 _video_download_url）
         elif body.video_url:
             job.video_url = body.video_url
     db.commit()

@@ -157,6 +157,34 @@ def decode_gdrive_oauth_ticket(token: str) -> Optional[int]:
         return None
 
 
+def create_video_ticket(user_id: int, job_id: int) -> str:
+    """短效簽章 ticket：讓瀏覽器能用一般 <a href> 下載影片。
+
+    下載是 top-level 導覽，帶不了 Authorization header（JWT 存在 localStorage
+    不是 cookie），所以身分只能夾在 query string。ticket 綁定 user + job，
+    30 分鐘有效——足夠點擊，又不至於外流後長期可用。
+    """
+    payload = {
+        "sub": str(user_id),
+        "job": int(job_id),
+        "purpose": "gdrive_video",
+        "jti": secrets.token_urlsafe(16),
+        "exp": datetime.utcnow() + timedelta(minutes=30),
+    }
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_video_ticket(token: str) -> Optional[tuple[int, int]]:
+    """驗證影片下載 ticket，回傳 (user_id, job_id)；無效／過期／用途不符回 None。"""
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        if payload.get("purpose") != "gdrive_video":
+            return None
+        return int(payload["sub"]), int(payload["job"])
+    except Exception:
+        return None
+
+
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     db: Session = Depends(get_db),

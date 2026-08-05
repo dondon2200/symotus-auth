@@ -428,3 +428,75 @@ def test_processing_stage_is_localised_and_keeps_spark_detail(
     assert d["estimated_time_remaining"] == "3h 27m"
     assert d["percent_complete"] == 8                          # 百分比仍以 Spark 為準
     assert d["spark_status"] == "quality_gate"
+
+
+# ── 影片下載不得曝露 SPARK_API_KEY ───────────────────────────────────────────
+
+def test_video_url_never_contains_spark_api_key(
+        gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    """下載連結交給瀏覽器，裡面絕不能有 Spark 的 API key。
+
+    回歸自 job 41：原本回傳 `{SPARK_API_URL}/jobs/{id}/download?api_key={KEY}`，
+    等於把 Spark 的完整 API 權限交給任何拿到連結的人（分享、瀏覽器紀錄、Referer）。
+    """
+    monkeypatch.setattr(jobs_module, "SPARK_API_KEY", "super-secret-key")
+    user = make_user("vid1", "vid1@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "processing", PARAMS, spark_job_id="spark-v")
+    monkeypatch.setattr(jobs_module.httpx, "AsyncClient", _FakeSparkClient)
+    monkeypatch.setattr(_FakeSparkClient, "payload", {"status": "completed", "percent_complete": 100})
+
+    detail = gdrive_client.get(f"/jobs/gdrive/{job.id}", headers=auth_headers(user)).json()
+    listing = gdrive_client.get("/jobs/gdrive", headers=auth_headers(user)).json()
+
+    url = detail["video_download_url"]
+    assert url and "super-secret-key" not in url and "api_key" not in url
+    assert f"/jobs/gdrive/{job.id}/video?t=" in url
+    for row in listing:
+        assert "super-secret-key" not in (row.get("video_download_url") or "")
+
+
+def test_video_url_not_leaked_from_stored_column(
+        gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    """舊資料的 video_url 欄位裡存著帶 key 的連結，不能再被吐出來。"""
+    monkeypatch.setattr(jobs_module, "SPARK_API_KEY", "super-secret-key")
+    user = make_user("vid2", "vid2@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "completed", PARAMS, spark_job_id="spark-old",
+                  video_url="https://spark.example/jobs/x/download?api_key=super-secret-key")
+
+    listing = gdrive_client.get("/jobs/gdrive", headers=auth_headers(user)).json()
+
+    assert all("super-secret-key" not in (r.get("video_download_url") or "") for r in listing)
+
+
+def test_video_download_requires_valid_ticket(gdrive_client, gdrive_db, make_user):
+    """沒有 ticket／偽造 ticket 都不能下載。"""
+    user = make_user("vid3", "vid3@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "completed", PARAMS, spark_job_id="spark-t")
+
+    assert gdrive_client.get(f"/jobs/gdrive/{job.id}/video").status_code == 422  # 缺 t
+    assert gdrive_client.get(f"/jobs/gdrive/{job.id}/video?t=garbage").status_code == 403
+
+
+def test_video_ticket_is_bound_to_job_and_user(gdrive_client, gdrive_db, make_user):
+    """ticket 綁 user+job：不能拿別支影片的 ticket 換這支，也不能用別人的。"""
+    from auth import create_video_ticket
+    owner = make_user("vid4a", "vid4a@example.com", password="pw")
+    other = make_user("vid4b", "vid4b@example.com", password="pw")
+    job_a = _mk_job(gdrive_db, owner, "completed", PARAMS, spark_job_id="spark-a")
+    job_b = _mk_job(gdrive_db, owner, "completed", PARAMS, spark_job_id="spark-b")
+
+    # 用 job_b 的 ticket 打 job_a
+    t_b = create_video_ticket(owner.id, job_b.id)
+    assert gdrive_client.get(f"/jobs/gdrive/{job_a.id}/video?t={t_b}").status_code == 403
+
+    # 別人的 ticket（job 對得上，但 user 不是擁有者）→ 查不到這支 job
+    t_other = create_video_ticket(other.id, job_a.id)
+    assert gdrive_client.get(f"/jobs/gdrive/{job_a.id}/video?t={t_other}").status_code == 404
+
+
+def test_video_ticket_purpose_is_isolated():
+    """OAuth ticket 不能拿來下載影片，反之亦然（purpose 隔離）。"""
+    from auth import create_gdrive_oauth_ticket, decode_video_ticket
+    from auth import create_video_ticket, decode_gdrive_oauth_ticket
+    assert decode_video_ticket(create_gdrive_oauth_ticket(15)) is None
+    assert decode_gdrive_oauth_ticket(create_video_ticket(15, 41)) is None
