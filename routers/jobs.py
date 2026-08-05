@@ -207,6 +207,10 @@ DOWNLOAD_CONCURRENCY = int(os.getenv("GDRIVE_DOWNLOAD_CONCURRENCY", "48"))
 THUMBNAIL_SIZES = {1920: 2560, 3840: 4096}   # 輸出寬 -> 要求的縮圖最長邊
 THUMBNAIL_MIN_BYTES = 1024                   # 小於此視為錯誤頁而非圖片
 
+# 每下載幾張回寫一次進度。commit 是同步的（持鎖時不能 await），間隔太小會頻繁
+# 阻塞 event loop：71789 張以 25 為間隔要 2871 次。
+PROGRESS_COMMIT_EVERY = 200
+
 # 下載階段（本服務進程自己擁有）的狀態：進程一沒，這些 job 就是孤兒，必須回收成 interrupted。
 # submitted/processing 不列入——那時工作已交給 Spark，重啟不影響它。
 GDRIVE_OWNED_STATUSES = ("pending", "listing", "downloading")
@@ -533,6 +537,29 @@ async def _download_thumbnail(session: httpx.AsyncClient, token_mgr: "_TokenMana
     return None
 
 
+async def _fetch_and_store(session: httpx.AsyncClient, token_mgr: "_TokenManager",
+                           sem: asyncio.Semaphore, item: dict, dest_path: str,
+                           thumb_size: Optional[int], out_width: int, stats: dict) -> None:
+    """抓一張圖並寫進 NAS。下載與寫檔都在 sem 之內。
+
+    sem 是「同時有幾張圖佔著記憶體」的唯一上限，所以寫檔不能移到 sem 之外——那樣
+    下載（快、48 路）會遠遠超前 NFS 寫入，每張未寫出的圖都以 bytes 留在 RAM。
+    """
+    async with sem:
+        data = None
+        if thumb_size:
+            data = await _download_thumbnail(session, token_mgr, item, thumb_size, out_width)
+        if data is not None:
+            stats["thumb"] = stats.get("thumb", 0) + 1
+        else:
+            data = await _download_file_api(session, token_mgr, item["id"])
+            if data is not None:
+                stats["orig"] = stats.get("orig", 0) + 1
+        if data:
+            stats["bytes"] = stats.get("bytes", 0) + len(data)
+            await asyncio.to_thread(_write_file, dest_path, data)
+
+
 def _write_file(path: str, data: bytes):
     with open(path, "wb") as fp:
         fp.write(data)
@@ -733,26 +760,16 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
                               max_keepalive_connections=DOWNLOAD_CONCURRENCY * 2)
         async with httpx.AsyncClient(timeout=120, limits=limits) as session:
             async def fetch_one(idx: int, item: dict):
-                async with sem:
-                    data = None
-                    if thumb_size:
-                        data = await _download_thumbnail(session, token_mgr, item,
-                                                         thumb_size, out_width)
-                    if data is not None:
-                        stats["thumb"] += 1
-                    else:
-                        data = await _download_file_api(session, token_mgr, item["id"])
-                        if data is not None:
-                            stats["orig"] += 1
-                    if data:
-                        stats["bytes"] += len(data)
-                if data:
-                    await asyncio.to_thread(_write_file, os.path.join(nas_path, _dest_name(idx, item)), data)
+                await _fetch_and_store(session, token_mgr, sem, item,
+                                       os.path.join(nas_path, _dest_name(idx, item)),
+                                       thumb_size, out_width, stats)
                 async with progress_lock:
                     progress["done"] += 1
-                    if progress["done"] % 25 == 0:
+                    if progress["done"] % PROGRESS_COMMIT_EVERY == 0:
                         job.downloaded_count = progress["done"]
-                        await asyncio.to_thread(db.commit)
+                        # 同步 commit：持鎖時不可 await。先前用 asyncio.to_thread 讓這裡
+                        # 排到共用執行緒池的寫檔佇列後面，進度因此凍結在 6550 不動。
+                        db.commit()
             t0 = time.monotonic()
             await asyncio.gather(*[fetch_one(i, it) for i, it in todo])
             elapsed = max(time.monotonic() - t0, 0.001)

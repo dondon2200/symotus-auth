@@ -7,6 +7,7 @@ job_params 的舊任務會被明確拒絕而不是假裝可以續傳。
 """
 import asyncio
 import json
+import time
 import pytest
 
 from models import GDriveJob, GoogleDriveCredential
@@ -285,3 +286,49 @@ def test_pipeline_handles_unparsable_resolution(tmp_path, monkeypatch):
         out_width = int(m.group(1)) if m else 0
         assert isinstance(out_width, int)
         assert jobs_module._thumbnail_size_for(bad) is None
+
+
+# ── 記憶體回歸：下載不得超前寫檔 ─────────────────────────────────────────────
+
+def test_download_does_not_outrun_writes(monkeypatch):
+    """已下載但尚未寫出的圖片數量必須被 sem 上限夾住。
+
+    回歸自 job 41：寫檔原本在 sem 之外，下載（48 路、~1 MB/張）遠遠超前 NFS 寫入，
+    每張未寫出的圖都以 bytes 留在 RAM，30 分鐘內吃到 27 GB / 30 GB 幾乎 OOM。
+    """
+    CONC, TOTAL = 4, 60
+    inflight = {"now": 0, "peak": 0}
+
+    async def fake_thumb(session, token_mgr, item, size, min_width):
+        await asyncio.sleep(0)               # 下載很快
+        inflight["now"] += 1
+        inflight["peak"] = max(inflight["peak"], inflight["now"])
+        return b"x" * 1024
+
+    def slow_write(path, data):
+        time.sleep(0.005)                    # 寫檔很慢（NFS）
+        inflight["now"] -= 1
+
+    monkeypatch.setattr(jobs_module, "_download_thumbnail", fake_thumb)
+    monkeypatch.setattr(jobs_module, "_write_file", slow_write)
+
+    async def run():
+        sem = asyncio.Semaphore(CONC)
+        stats = {}
+        await asyncio.gather(*[
+            jobs_module._fetch_and_store(None, None, sem, {"id": f"f{i}"},
+                                         f"/tmp/{i}", 2560, 1920, stats)
+            for i in range(TOTAL)
+        ])
+        return stats
+
+    stats = asyncio.run(run())
+
+    assert stats["thumb"] == TOTAL
+    # 關鍵斷言：尖峰未寫出張數不得超過並發上限。寫檔若搬到 sem 外，這裡會逼近 TOTAL。
+    assert inflight["peak"] <= CONC, f"未寫出的圖片尖峰 {inflight['peak']} 超過上限 {CONC}"
+
+
+def test_progress_commit_interval_is_not_tiny():
+    """commit 是同步的（持鎖時不能 await），間隔太小會頻繁阻塞 event loop。"""
+    assert jobs_module.PROGRESS_COMMIT_EVERY >= 100
