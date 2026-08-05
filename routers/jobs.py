@@ -1445,13 +1445,22 @@ async def get_gdrive_job(
             job.error_message = error
         db.commit()
 
+    # current_stage 是要顯示給使用者的中文標籤，所以用我們自己的——Spark 的
+    # current_stage 是它的內部英文狀態（實測就是 "processing"），採用它會讓中文
+    # 介面冒出英文字，而且資訊量還不如我們自己的標籤。
+    stage_label = {"completed": "完成", "failed": "失敗"}.get(status, "生成中")
+    # Spark 的細節與 ETA 才是使用者真正想知道的（"Batch 7/50 ...", "3h 27m"），
+    # 原本整個被丟掉，畫面上只剩一個百分比，看起來就像卡住。
     return {
         "job_id": job.id,
         "status": status,
         "percent_complete": percent,
         "image_count": image_count,
         "downloaded_count": downloaded,
-        "current_stage": spark.get("current_stage") or ("生成中" if status == "processing" else status),
+        "current_stage": stage_label,
+        "stage_detail": spark.get("stage_detail") or None,
+        "estimated_time_remaining": spark.get("estimated_time_remaining") or None,
+        "spark_status": spark.get("status") or None,
         "video_download_url": video_url,
         "error_message": error,
     }

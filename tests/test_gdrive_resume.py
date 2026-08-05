@@ -382,3 +382,49 @@ def test_concurrency_memory_budget_fits_container_limit():
     per_image_mib = 2          # 實測縮圖 ~1 MB，抓 2 倍餘裕
     budget_mib = jobs_module.DOWNLOAD_CONCURRENCY * per_image_mib
     assert budget_mib <= 512, f"在途緩衝上限 {budget_mib} MiB 過大（容器上限 2 GiB）"
+
+
+# ── 生成階段的顯示欄位 ───────────────────────────────────────────────────────
+
+class _FakeSparkClient:
+    """假裝成 httpx.AsyncClient，只回一份固定的 Spark 狀態。"""
+    payload = {
+        "status": "quality_gate",
+        "percent_complete": 8,
+        "estimated_time_remaining": "3h 27m",
+        "current_stage": "processing",          # Spark 的內部英文狀態
+        "stage_detail": "Batch 7/50 clip done: 598 keepers, 432 damaged",
+        "image_count": 50000,
+    }
+
+    def __init__(self, *a, **kw): pass
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+
+    async def get(self, *a, **kw):
+        class R:
+            status_code = 200
+            @staticmethod
+            def json(): return _FakeSparkClient.payload
+        return R()
+
+
+def test_processing_stage_is_localised_and_keeps_spark_detail(
+        gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    """生成階段：階段名要用我們的中文，Spark 的細節與 ETA 要往前端傳。
+
+    回歸自 job 41：原本直接採用 Spark 的 current_stage，中文介面因此顯示英文
+    "processing"；而真正有用的 stage_detail 與 estimated_time_remaining 被丟掉，
+    使用者只看到一個不動的百分比，誤以為卡住。
+    """
+    user = make_user("stage1", "stage1@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "processing", PARAMS, spark_job_id="spark-x")
+    monkeypatch.setattr(jobs_module.httpx, "AsyncClient", _FakeSparkClient)
+
+    d = gdrive_client.get(f"/jobs/gdrive/{job.id}", headers=auth_headers(user)).json()
+
+    assert d["current_stage"] == "生成中"                     # 不是 "processing"
+    assert d["stage_detail"] == _FakeSparkClient.payload["stage_detail"]
+    assert d["estimated_time_remaining"] == "3h 27m"
+    assert d["percent_complete"] == 8                          # 百分比仍以 Spark 為準
+    assert d["spark_status"] == "quality_gate"
