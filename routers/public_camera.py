@@ -17,6 +17,70 @@ from config import settings
 
 router = APIRouter(prefix="/cameras/public", tags=["public-camera"])
 
+GO2RTC_BASE = "https://user.symotus.com/go2rtc"
+
+# ── go2rtc stream 名稱解析 ────────────────────────────────────────
+# go2rtc 的 stream 名稱不是固定 cam<IP第三段>：LAN 相機（192.168.N.1）才命名成 cam<N>；
+# 公網 IP 相機是流水號（cam1=110.25.96.4、cam2=110.25.96.15…）跟 IP 無關。
+# 硬推 cam<第三段> 會對公網 IP 相機算出不存在的串流（110.25.96.15 → cam96 → 404），
+# 分享連結因此永遠播不出畫面。改由 go2rtc 設定的 source host 反查，與前端 pickStreamName 同一套規則。
+import re as _re
+
+_STREAM_RE = _re.compile(r"^\s*(cam\w+):\s*rtsp://([0-9.]+)", _re.MULTILINE)
+_stream_map_cache: tuple[list[tuple[str, str]], float] | None = None  # ([(name, host)], expires_at)
+_STREAM_MAP_TTL = 60.0
+
+
+async def _get_stream_map() -> list[tuple[str, str]]:
+    """抓 go2rtc /api/config 解析出 [(stream 名稱, source host)]，快取 60 秒。抓不到回空 list。"""
+    global _stream_map_cache
+    now = _time.time()
+    if _stream_map_cache and _stream_map_cache[1] > now:
+        return _stream_map_cache[0]
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(f"{GO2RTC_BASE}/api/config")
+        pairs = _STREAM_RE.findall(resp.text) if resp.status_code == 200 else []
+    except Exception:
+        pairs = []
+    if pairs:  # 抓失敗不覆蓋既有快取，免得一次網路抖動就讓所有相機退回硬推
+        _stream_map_cache = (pairs, now + _STREAM_MAP_TTL)
+    return pairs or (_stream_map_cache[0] if _stream_map_cache else [])
+
+
+def _pick_stream_name(ip: str, pairs: list[tuple[str, str]]) -> str:
+    """由相機 IP 對應 go2rtc stream 名稱：
+    1) source host 完全相符（含公網 IP 相機，如 110.25.96.15 → cam2）
+    2) 同 /24 子網且唯一相符（LAN 相機 device .100 對到 NVR .1 的 cam<N>）
+    3) 退路：cam<IP第三段>（go2rtc 設定抓不到時的舊慣例）
+    """
+    if not ip:
+        return ""
+    for name, host in pairs:
+        if host == ip:
+            return name
+    sub24 = lambda x: ".".join(x.split(".")[:3])
+    matches = [name for name, host in pairs if sub24(host) == sub24(ip)]
+    if len(matches) == 1:
+        return matches[0]
+    octets = ip.split(".")
+    return f"cam{octets[2]}" if len(octets) >= 3 else ""
+
+
+async def resolve_stream_name(ip: str) -> str:
+    return _pick_stream_name(ip, await _get_stream_map())
+
+
+async def _stream_is_live(stream_name: str) -> bool:
+    """go2rtc 是 on-demand 拉流，producers/bytes_recv 不可靠；改抓一張 frame.jpeg，
+    有效幀為數十 KB，裝置關機則約 5 秒後回 200 空 body。"""
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            resp = await client.get(f"{GO2RTC_BASE}/api/frame.jpeg", params={"src": stream_name})
+        return resp.status_code == 200 and len(resp.content) > 1024
+    except Exception:
+        return False
+
 
 def _live_frame_sig(camera_id: int, exp: int) -> str:
     """F-4：live-frame 簽章（HMAC-SHA256，防以 camera_id 枚舉任意相機畫面）"""
@@ -63,14 +127,20 @@ async def get_public_camera_info(token: str, db: Session = Depends(get_db)):
     cam = resp.json()
     basic = cam.get("basic_info", cam)
     ip = basic.get("ip_address", "")
-    stream_name = f"cam{ip.split('.')[2]}" if ip and len(ip.split('.')) >= 3 else ""
+    stream_name = await resolve_stream_name(ip)
+
+    # online_status 只反映裝置 :8181 心跳，對只有 RTSP 的相機會誤判離線；
+    # 前端用 online 當播放閘門，故補上 go2rtc liveness（有真幀就是在流）。
+    online = bool(basic.get("online_status", False))
+    if not online and stream_name:
+        online = await _stream_is_live(stream_name)
 
     return {
         "camera_id": inv.camera_id,
         "camera_name": inv.camera_name or basic.get("name", f"相機 #{inv.camera_id}"),
         "ip_address": ip,
         "stream_name": stream_name,
-        "online": basic.get("online_status", False),
+        "online": online,
         "permission": "stream_preview",
     }
 
@@ -171,15 +241,15 @@ async def live_camera_frame(camera_id: int, exp: int = 0, sig: str = "", db: Ses
         if cr.status_code == 200:
             info = cr.json(); basic = info.get("basic_info", info)
             ip = basic.get("ip_address", "")
-            if ip and len(ip.split(".")) >= 3:
-                stream_name = f"cam{ip.split('.')[2]}"
+            # 同上：公網 IP 相機不能硬推 cam<第三段>，否則 LINE 即時截圖也會抓到不存在的串流
+            stream_name = await resolve_stream_name(ip) or None
     
     if not stream_name:
         raise HTTPException(404, "找不到串流")
     
     # 從 go2rtc 取即時截圖
     async with _httpx.AsyncClient(timeout=15) as cl:
-        gr = await cl.get(f"https://user.symotus.com/go2rtc/api/frame.jpeg?src={stream_name}")
+        gr = await cl.get(f"{GO2RTC_BASE}/api/frame.jpeg", params={"src": stream_name})
     
     if gr.status_code != 200 or not gr.content:
         raise HTTPException(503, "相機目前無串流")
