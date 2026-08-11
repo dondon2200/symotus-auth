@@ -272,8 +272,8 @@ async def get_thumbnails(
         return {}
 
     cam_token = await get_camera_backend_token(current_user)
-    # end_user 沒有 camera_email → cam_token 為空 → 直接走 admin fallback，省掉一次 401 round-trip
-    resp = None
+    # 先用自己的 backend token 拿；拿得到的是自己 backend 帳號擁有的相機
+    result: dict = {}
     if cam_token:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
@@ -281,14 +281,26 @@ async def get_thumbnails(
                 headers={"Authorization": f"Bearer {cam_token}"},
                 params={"ids": ",".join(str(i) for i in requested_ids)},
             )
-    if not cam_token or resp is None or resp.status_code != 200 or not resp.content:
+        if resp.status_code == 200 and resp.content:
+            try:
+                data = resp.json()
+                if isinstance(data, dict):
+                    result = data
+            except ValueError:
+                pass
+
+    # Camera Backend 依 backend 帳號擁有權過濾：自己 token 的 200 回應會「缺漏」
+    # 不屬於自己的相機（如 LINE 帳號，相機綁在 admin 名下、僅靠 camera_access 授權），
+    # 所以必須逐 id 補查，不能只在整個請求失敗時才 fallback。
+    missing = [i for i in requested_ids if str(i) not in result]
+    if missing:
         # F-3：非 admin 僅對「有 camera_access grant 的相機」允許 admin fallback
         if current_user.role == "symotus_admin":
-            fb_ids = requested_ids
+            fb_ids = missing
         else:
             granted = {a.camera_id for a in db.query(CameraAccess).filter(
                 CameraAccess.user_id == current_user.id).all()}
-            fb_ids = [i for i in requested_ids if i in granted]
+            fb_ids = [i for i in missing if i in granted]
         if fb_ids:
             async with httpx.AsyncClient(timeout=10) as client:
                 tok_r = await client.post(
@@ -299,14 +311,20 @@ async def get_thumbnails(
             admin_tok = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
             if admin_tok:
                 async with httpx.AsyncClient(timeout=15) as client:
-                    resp = await client.get(
+                    fb_resp = await client.get(
                         f"{CAMERA_BACKEND_URL}/api/cameras/thumbnails/latest",
                         headers={"Authorization": f"Bearer {admin_tok}"},
                         params={"ids": ",".join(str(i) for i in fb_ids)},
                     )
-    if resp.status_code == 200:
-        return resp.json()
-    return {}
+                if fb_resp.status_code == 200 and fb_resp.content:
+                    try:
+                        fb_data = fb_resp.json()
+                        if isinstance(fb_data, dict):
+                            for k, v in fb_data.items():
+                                result.setdefault(k, v)
+                    except ValueError:
+                        pass
+    return result
 
 
 @router.post("")
