@@ -43,11 +43,11 @@ def create_invitation(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("reseller", "symotus_admin")),
 ):
-    # 防重複：若已有 pending 邀請，直接回傳現有連結
+    # 防重複：同相機已有仍有效的連結（pending/accepted 皆算，連結可重複接受）→ 回傳現有連結
     existing_inv = db.query(CameraInvitation).filter(
         CameraInvitation.inviter_id == current_user.id,
         CameraInvitation.camera_id == body.camera_id,
-        CameraInvitation.status == "pending",
+        CameraInvitation.status.in_(["pending", "accepted"]),
         CameraInvitation.is_public == body.is_public,
     ).first()
     if existing_inv:
@@ -117,8 +117,9 @@ def preview_invitation(token: str, db: Session = Depends(get_db)):
     inv = db.query(CameraInvitation).filter(CameraInvitation.token == token).first()
     if not inv:
         return {"valid": False, "reason": "not_found"}
-    if inv.status != "pending":
-        return {"valid": False, "reason": inv.status}
+    # 連結可重複接受：只有撤銷或過期才失效（accepted/declined 不擋其他人使用同一連結）
+    if inv.status == "revoked":
+        return {"valid": False, "reason": "revoked"}
     if inv.expires_at and inv.expires_at < datetime.utcnow():
         return {"valid": False, "reason": "expired"}
 
@@ -145,8 +146,9 @@ def accept_invitation(
     inv = db.query(CameraInvitation).filter(CameraInvitation.token == token).first()
     if not inv:
         raise HTTPException(404, "邀請連結不存在")
-    if inv.status != "pending":
-        raise HTTPException(400, f"此邀請已{inv.status}")
+    # 連結可重複接受：撤銷或過期前，多位使用者可用同一連結取得存取權
+    if inv.status == "revoked":
+        raise HTTPException(400, "此邀請已撤銷")
     if inv.expires_at and inv.expires_at < datetime.utcnow():
         raise HTTPException(400, "邀請連結已過期")
 
@@ -156,14 +158,10 @@ def accept_invitation(
         CameraAccess.camera_id == inv.camera_id,
     ).first()
     if existing:
-        # 更新 permission_level 若更高
-        inv.status = "accepted"
-        inv.invitee_id = current_user.id
-        inv.responded_at = datetime.utcnow()
-        db.commit()
         return {"message": f"你已有「{inv.camera_name}」的存取權，儀表板已顯示此相機", "camera_id": inv.camera_id, "already_exists": True}
     db.add(CameraAccess(camera_id=inv.camera_id, user_id=current_user.id, granted_by=inv.inviter_id, permission_level=inv.permission_level))
 
+    # status 標記為 accepted 僅供分享者檢視（不會使連結失效）；invitee_id 記錄最近一位接受者
     inv.status = "accepted"
     inv.invitee_id = current_user.id
     inv.responded_at = datetime.utcnow()
@@ -187,10 +185,10 @@ def decline_invitation(
     inv = db.query(CameraInvitation).filter(CameraInvitation.token == token).first()
     if not inv:
         raise HTTPException(404, "邀請連結不存在")
-    if inv.status != "pending":
-        raise HTTPException(400, "此邀請已處理")
+    if inv.status == "revoked":
+        raise HTTPException(400, "此邀請已撤銷")
 
-    inv.status = "declined"
+    # 連結可重複使用：單一使用者拒絕不改變連結效力，僅記錄回應
     inv.invitee_id = current_user.id
     inv.responded_at = datetime.utcnow()
     db.commit()
@@ -240,12 +238,11 @@ def cancel_invitation(
     inv = q.first()
     if not inv:
         raise HTTPException(404, "邀請不存在或無法撤銷")
-    if inv.status == "accepted" and inv.invitee_id:
-        db.query(CameraAccess).filter(
-            CameraAccess.camera_id == inv.camera_id,
-            CameraAccess.user_id == inv.invitee_id,
-            CameraAccess.granted_by == inv.inviter_id,
-        ).delete()
+    # 連結可被多人接受：撤銷時移除該分享者為此相機授出的所有存取權
+    db.query(CameraAccess).filter(
+        CameraAccess.camera_id == inv.camera_id,
+        CameraAccess.granted_by == inv.inviter_id,
+    ).delete()
     inv.status = "revoked"
     log_action(db, current_user, "revoke_invitation", "invitation", inv.id,
                f"camera={inv.camera_id} inviter={inv.inviter_id} invitee={inv.invitee_id}")
