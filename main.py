@@ -117,6 +117,12 @@ async def startup():
                     conn.commit()
                 except Exception:
                     conn.rollback()
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text("ALTER TABLE camera_access ADD COLUMN IF NOT EXISTS invitation_id INTEGER"))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
 
             # 補上 gdrive_jobs 新流程欄位（OAuth + Picker）並放寬 folder_url
             with engine.connect() as conn:

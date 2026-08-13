@@ -51,6 +51,7 @@ class CameraAccess(Base):
     granted_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     permission_level = Column(String, default="photos_stream", nullable=False)  # full / photos_stream / stream_only
     notify_on_online = Column(Boolean, default=True, nullable=False, server_default="true")  # 開機 LINE 通知
+    invitation_id = Column(Integer, nullable=True, index=True)  # 來源邀請（D2）；舊資料為 NULL，撤銷時 fallback 比對 granted_by+permission_level
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", foreign_keys=[user_id], back_populates="camera_accesses")
