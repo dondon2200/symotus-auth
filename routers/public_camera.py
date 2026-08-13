@@ -112,36 +112,13 @@ async def _get_public_cam(token: str, db: Session):
 
 @router.get("/{token}")
 async def get_public_camera_info(token: str, db: Session = Depends(get_db)):
-    """取得公開分享相機資訊（串流 stream_name + camera_name）"""
-    inv, cam_token = await _get_public_cam(token, db)
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            f"{CAMERA_BACKEND_URL}/api/cameras/{inv.camera_id}",
-            headers={"Authorization": f"Bearer {cam_token}"},
-        )
-
-    if resp.status_code != 200:
-        raise HTTPException(502, "無法取得相機資訊")
-
-    cam = resp.json()
-    basic = cam.get("basic_info", cam)
-    ip = basic.get("ip_address", "")
-    stream_name = await resolve_stream_name(ip)
-
-    # online_status 只反映裝置 :8181 心跳，對只有 RTSP 的相機會誤判離線；
-    # 前端用 online 當播放閘門，故補上 go2rtc liveness（有真幀就是在流）。
-    online = bool(basic.get("online_status", False))
-    if not online and stream_name:
-        online = await _stream_is_live(stream_name)
-
+    """取得公開分享相機資訊。D6：公開頁不含即時串流，僅縮時預覽＋相簿檢視，
+    故不再回傳 stream_name/online（也省去每次開頁打 go2rtc 探活）。"""
+    inv, _cam_token = await _get_public_cam(token, db)
     return {
         "camera_id": inv.camera_id,
-        "camera_name": inv.camera_name or basic.get("name", f"相機 #{inv.camera_id}"),
-        "ip_address": ip,
-        "stream_name": stream_name,
-        "online": online,
-        "permission": "stream_preview",
+        "camera_name": inv.camera_name or f"相機 #{inv.camera_id}",
+        "permission": "preview",
     }
 
 
