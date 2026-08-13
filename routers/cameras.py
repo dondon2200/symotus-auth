@@ -737,27 +737,37 @@ async def delete_camera(
     """
     永久刪除相機（破壞性，無法復原）。
     安全閘：
-    1. 僅 reseller / symotus_admin（end_user 一律拒）。
+    1. 擁有者（reseller / symotus_admin，end_user 一律拒）；被分享者需政策允許（D5：預設
+       full 授權）才能刪除，其餘等級（photos_stream/stream_only）一律拒。
     2. 需 ?confirm=true，防誤觸。
-    3. 只用「使用者自己的」真實 Camera Backend token（user_id=0 + 本人 email）；
-       不做 granter / admin fallback —— 不是自己擁有的相機 Camera Backend 會回 403，
-       藉此天然限制成「只能刪自己擁有的相機」，杜絕用他人 token 越權刪除。
+    3. token：擁有者用「自己的」真實 Camera Backend token；被分享者（full）借用 granter
+       的 token —— Camera Backend 只認擁有者 token，被分享者無法用自己的 token 刪除。
        （刻意避開 camera-delete-backend-500 雷區：不使用 admin@timelapse user_id=0 token。）
+    4. 刪除／換機皆記 audit log（定案③配套：刪除權隨授權鏈外擴，必留稽核）。
     """
-    if current_user.role not in ("reseller", "symotus_admin"):
-        raise HTTPException(403, "僅系統管理員或相機擁有者可刪除相機")
     if not confirm:
         raise HTTPException(400, "需帶 ?confirm=true 才會真正刪除")
 
-    # 被分享下來的相機（granter != self）不得刪除，只能解除綁定
     access = db.query(CameraAccess).filter(
         CameraAccess.camera_id == camera_id,
         CameraAccess.user_id == current_user.id,
     ).first()
-    if access and access.granted_by and access.granted_by != current_user.id:
-        raise HTTPException(403, "此相機為他人分享，僅能解除綁定，無法刪除")
+    shared = bool(access and access.granted_by and access.granted_by != current_user.id)
 
-    cam_token = await get_camera_backend_token(current_user)
+    # D5：被分享者需政策允許（預設 full）才能刪；擁有者路徑維持 reseller/symotus_admin
+    if shared:
+        if not level_allows(db, "camera.delete", access.permission_level):
+            raise HTTPException(403, "此相機為他人分享，需「全功能管理」授權才能刪除")
+    elif current_user.role not in ("reseller", "symotus_admin"):
+        raise HTTPException(403, "僅系統管理員或相機擁有者可刪除相機")
+
+    # token：擁有者用自己的；被分享者（D5）借 granter 的——Camera Backend 只認擁有者 token
+    token_user = current_user
+    if shared:
+        token_user = db.query(User).filter(User.id == access.granted_by).first()
+        if not token_user:
+            raise HTTPException(500, "找不到相機擁有者")
+    cam_token = await get_camera_backend_token(token_user)
     if not cam_token:
         raise HTTPException(403, "無法取得可刪除此相機的有效憑證")
 
@@ -772,6 +782,10 @@ async def delete_camera(
     )
     if resp.status_code not in (200, 204):
         raise HTTPException(resp.status_code, resp.text)
+
+    log_action(db, current_user, "camera.delete", "camera", camera_id,
+               f"shared={shared} granter={access.granted_by if shared else '-'} status={resp.status_code}")
+    db.commit()
 
     # 清掉所有殘留的 camera_access，避免死記錄
     db.query(CameraAccess).filter(CameraAccess.camera_id == camera_id).delete()
@@ -1115,6 +1129,11 @@ async def proxy_camera_api(
         feature = feature_for_write(path)
         if not level_allows(db, feature, access.permission_level):
             raise HTTPException(403, f"此操作需要更高的授權等級（{feature}）")
+        if feature == "device.replace":
+            # 定案③配套：被分享者執行換機/撤機必留稽核
+            log_action(db, current_user, "device.replace", "camera", camera_id,
+                       f"path={path} via_grant_from={access.granted_by}")
+            db.commit()
 
     # A3 決策（2026-07-27）：admin 不受 TechSupportGrant 限制——它是「同意記錄」而非閘門。
     # 落地方式：admin 的寫入操作若未被任何有效支援授權涵蓋，寫一筆稽核（不阻擋），
