@@ -82,3 +82,26 @@ def test_accept_latest_wins_up_and_down(db, owner, guest):
     accept_invitation(full_inv["token"], db=db, current_user=guest)  # 升回
     acc = db.query(CameraAccess).filter_by(user_id=guest.id, camera_id=7).one()
     assert acc.permission_level == "full"
+
+
+def test_revoke_only_kills_own_grants(db, owner, guest):
+    """D2：撤「僅預覽」連結不影響同相機「全功能」授權。"""
+    full_inv = _create(db, owner, "full")
+    preview_inv = _create(db, owner, "stream_only")
+    other = User(id=3, username="other", email="other@x.com", role="end_user")
+    db.add(other); db.commit()
+    accept_invitation(full_inv["token"], db=db, current_user=guest)
+    accept_invitation(preview_inv["token"], db=db, current_user=other)
+    cancel_invitation(preview_inv["id"], db=db, current_user=owner)
+    remaining = db.query(CameraAccess).filter_by(camera_id=7).all()
+    assert [a.user_id for a in remaining] == [guest.id]
+
+
+def test_revoke_legacy_rows_by_level(db, owner, guest):
+    """舊資料（invitation_id=NULL）以 granted_by＋permission_level fallback。"""
+    inv = _create(db, owner, "stream_only")
+    db.add(CameraAccess(camera_id=7, user_id=guest.id, granted_by=owner.id,
+                        permission_level="stream_only", invitation_id=None))
+    db.commit()
+    cancel_invitation(inv["id"], db=db, current_user=owner)
+    assert db.query(CameraAccess).filter_by(camera_id=7).count() == 0

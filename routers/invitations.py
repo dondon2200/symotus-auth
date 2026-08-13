@@ -4,6 +4,7 @@ Admin/Reseller 產生邀請連結 → 分享給任何人 → 點連結接受
 """
 import secrets
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import or_, and_
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from pydantic import BaseModel
@@ -250,11 +251,17 @@ def cancel_invitation(
     inv = q.first()
     if not inv:
         raise HTTPException(404, "邀請不存在或無法撤銷")
-    # 連結可被多人接受：撤銷時移除該分享者為此相機授出的所有存取權
+    # D2：只移除由本連結建立的授權；舊資料（invitation_id 為 NULL）以
+    # granted_by＋permission_level fallback，避免誤刪同相機其他模式的授權
     db.query(CameraAccess).filter(
         CameraAccess.camera_id == inv.camera_id,
-        CameraAccess.granted_by == inv.inviter_id,
-    ).delete()
+        or_(
+            CameraAccess.invitation_id == inv.id,
+            and_(CameraAccess.invitation_id.is_(None),
+                 CameraAccess.granted_by == inv.inviter_id,
+                 CameraAccess.permission_level == inv.permission_level),
+        ),
+    ).delete(synchronize_session=False)
     inv.status = "revoked"
     log_action(db, current_user, "revoke_invitation", "invitation", inv.id,
                f"camera={inv.camera_id} inviter={inv.inviter_id} invitee={inv.invitee_id}")
