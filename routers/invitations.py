@@ -22,9 +22,9 @@ FRONTEND_URL = getattr(settings, "FRONTEND_URL", "https://user.symotus.com")
 
 
 PERMISSION_LABELS = {
-    "full": "完整存取（設定＋照片＋串流）",
-    "photos_stream": "照片＋串流（不可改設定）",
-    "stream_only": "只看串流",
+    "full": "全功能管理（設定、控制、下載、可再分享）",
+    "photos_stream": "縮時與下載（照片、產縮時、下載原檔）",
+    "stream_only": "僅預覽觀看（縮時預覽＋相簿檢視，不可下載）",
 }
 
 class CreateInvitationBody(BaseModel):
@@ -43,10 +43,16 @@ def create_invitation(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("reseller", "symotus_admin")),
 ):
-    # 防重複：同相機已有仍有效的連結（pending/accepted 皆算，連結可重複接受）→ 回傳現有連結
+    if body.permission_level not in ("full", "photos_stream", "stream_only"):
+        raise HTTPException(400, "未知的權限模式")
+    if body.is_public and body.permission_level != "stream_only":
+        raise HTTPException(400, "公開連結僅適用「僅預覽觀看」模式")
+
+    # 防重複：同相機同模式已有仍有效的連結（pending/accepted 皆算，連結可重複接受）→ 回傳現有連結
     existing_inv = db.query(CameraInvitation).filter(
         CameraInvitation.inviter_id == current_user.id,
         CameraInvitation.camera_id == body.camera_id,
+        CameraInvitation.permission_level == body.permission_level,  # D1：一模式一連結
         CameraInvitation.status.in_(["pending", "accepted"]),
         CameraInvitation.is_public == body.is_public,
     ).first()
@@ -70,7 +76,7 @@ def create_invitation(
         camera_id=body.camera_id,
         camera_name=body.camera_name or f"相機 #{body.camera_id}",
         note=body.note,
-        permission_level=body.permission_level if body.permission_level in ("full","photos_stream","stream_only") else "stream_only",
+        permission_level=body.permission_level,
         is_public=body.is_public,
         expires_at=expires_at,
     )
