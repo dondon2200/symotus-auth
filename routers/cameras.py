@@ -1017,14 +1017,16 @@ async def nas_image(
     # 分享用戶沒有自己的 token → 嘗試用 granter token
     if not cam_token:
         # 路徑格式：/homes/firmness/{serial}/... 無法直接得知 camera_id
-        # 查該用戶所有 camera_access，只用「photos.view 等級足夠」的 grant 換 token
-        # （stream_only-only 的被分享者在此直接 403，不再能借 granter token 看照片）
+        # D3：縮圖（相簿瀏覽/預覽）走 photos.view；原圖走 photos.download。
+        # 「不可下載」的伺服器層強制點在此——stream_only 被分享者抓原圖 403。
+        is_thumb = str(request.query_params.get("thumbnail", "")).lower() in ("1", "true", "yes")
+        feature = "photos.view" if is_thumb else "photos.download"
         accesses = db.query(CameraAccess).filter(CameraAccess.user_id == current_user.id).all()
         viewable = [a for a in accesses
                     if a.granted_by == current_user.id
-                    or level_allows(db, "photos.view", a.permission_level)]
+                    or level_allows(db, feature, a.permission_level)]
         if accesses and not viewable and current_user.role != "symotus_admin":
-            raise HTTPException(403, "此操作需要更高的授權等級（photos.view）")
+            raise HTTPException(403, f"此操作需要更高的授權等級（{feature}）")
         for a in viewable:
             if a.granted_by and a.granted_by != current_user.id:
                 owner = db.query(User).filter(User.id == a.granted_by).first()
