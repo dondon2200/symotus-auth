@@ -60,3 +60,25 @@ def test_unknown_level_rejected(db, owner):
     with pytest.raises(HTTPException) as e:
         _create(db, owner, "root")
     assert e.value.status_code == 400
+
+
+def test_accept_stamps_invitation_id(db, owner, guest):
+    inv = _create(db, owner, "photos_stream")
+    accept_invitation(inv["token"], db=db, current_user=guest)
+    acc = db.query(CameraAccess).filter_by(user_id=guest.id, camera_id=7).one()
+    assert acc.permission_level == "photos_stream"
+    assert acc.invitation_id == inv["id"]
+
+
+def test_accept_latest_wins_up_and_down(db, owner, guest):
+    """定案②：重複接受以最新為準（可升可降）。"""
+    full_inv = _create(db, owner, "full")
+    preview_inv = _create(db, owner, "stream_only")
+    accept_invitation(full_inv["token"], db=db, current_user=guest)
+    accept_invitation(preview_inv["token"], db=db, current_user=guest)  # 降級
+    acc = db.query(CameraAccess).filter_by(user_id=guest.id, camera_id=7).one()
+    assert acc.permission_level == "stream_only"
+    assert acc.invitation_id == preview_inv["id"]
+    accept_invitation(full_inv["token"], db=db, current_user=guest)  # 升回
+    acc = db.query(CameraAccess).filter_by(user_id=guest.id, camera_id=7).one()
+    assert acc.permission_level == "full"

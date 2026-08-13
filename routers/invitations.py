@@ -158,14 +158,20 @@ def accept_invitation(
     if inv.expires_at and inv.expires_at < datetime.utcnow():
         raise HTTPException(400, "邀請連結已過期")
 
-    # 若已有此相機的 camera_access，提示已有存取權，不重複建立
+    # 若已有此相機的 camera_access：定案②以最新接受為準（可升可降），同步更新來源連結與分享者
     existing = db.query(CameraAccess).filter(
         CameraAccess.user_id == current_user.id,
         CameraAccess.camera_id == inv.camera_id,
     ).first()
     if existing:
-        return {"message": f"你已有「{inv.camera_name}」的存取權，儀表板已顯示此相機", "camera_id": inv.camera_id, "already_exists": True}
-    db.add(CameraAccess(camera_id=inv.camera_id, user_id=current_user.id, granted_by=inv.inviter_id, permission_level=inv.permission_level))
+        existing.permission_level = inv.permission_level
+        existing.granted_by = inv.inviter_id
+        existing.invitation_id = inv.id
+    else:
+        db.add(CameraAccess(camera_id=inv.camera_id, user_id=current_user.id,
+                             granted_by=inv.inviter_id,
+                             permission_level=inv.permission_level,
+                             invitation_id=inv.id))
 
     # status 標記為 accepted 僅供分享者檢視（不會使連結失效）；invitee_id 記錄最近一位接受者
     inv.status = "accepted"
