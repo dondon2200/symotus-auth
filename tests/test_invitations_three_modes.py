@@ -146,3 +146,25 @@ def test_no_grant_cannot_reshare(db, owner, guest):
     with pytest.raises(HTTPException) as e:
         _create(db, guest, "stream_only")
     assert e.value.status_code == 403
+
+
+def test_end_user_can_cancel_own_link_but_not_others(db, owner, guest):
+    """D4 補遺：end_user 再分享者可撤自己發的連結（連帶移除其授權）；
+    其他 end_user 撤不到（404，受 inviter_id 過濾）。"""
+    db.add(CameraAccess(camera_id=7, user_id=guest.id, granted_by=owner.id,
+                        permission_level="full", invitation_id=None))
+    db.commit()
+    inv = _create(db, guest, "stream_only")  # guest 憑 full grant 再分享
+    other = User(id=3, username="other", email="other@x.com", role="end_user")
+    db.add(other); db.commit()
+    accept_invitation(inv["token"], db=db, current_user=other)
+    # 別的 end_user 不能撤 guest 發的連結
+    stranger = User(id=4, username="stranger", email="stranger@x.com", role="end_user")
+    db.add(stranger); db.commit()
+    with pytest.raises(HTTPException) as e:
+        cancel_invitation(inv["id"], db=db, current_user=stranger)
+    assert e.value.status_code == 404
+    # 發連結的 end_user 本人可撤，且由此連結建立的授權被移除
+    cancel_invitation(inv["id"], db=db, current_user=guest)
+    remaining = db.query(CameraAccess).filter_by(camera_id=7).all()
+    assert [a.user_id for a in remaining] == [guest.id]  # 只剩 guest 自己的 full grant

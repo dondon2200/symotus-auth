@@ -224,7 +224,7 @@ def decline_invitation(
 @router.get("/sent")
 def list_sent_invitations(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("reseller", "symotus_admin")),
+    current_user: User = Depends(get_current_user),  # D4 補遺：end_user 再分享者也能檢視自己發的連結（查詢本就限 inviter_id=自己）
 ):
     invs = db.query(CameraInvitation).filter(
         CameraInvitation.inviter_id == current_user.id,
@@ -251,7 +251,7 @@ def list_sent_invitations(
 def cancel_invitation(
     inv_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("reseller", "symotus_admin")),
+    current_user: User = Depends(get_current_user),  # D4 補遺：end_user 再分享者可撤自己發的連結；非 admin 仍受下方 inviter_id 過濾
 ):
     q = db.query(CameraInvitation).filter(
         CameraInvitation.id == inv_id,
