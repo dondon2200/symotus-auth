@@ -14,6 +14,7 @@ from database import get_db
 from models import User, CameraInvitation, CameraAccess
 from auth import get_current_user, require_role
 from audit import log_action
+from policies import level_allows
 from config import settings
 from schemas import utc_iso
 
@@ -42,12 +43,23 @@ class CreateInvitationBody(BaseModel):
 def create_invitation(
     body: CreateInvitationBody,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("reseller", "symotus_admin")),
+    current_user: User = Depends(get_current_user),
 ):
     if body.permission_level not in ("full", "photos_stream", "stream_only"):
         raise HTTPException(400, "未知的權限模式")
     if body.is_public and body.permission_level != "stream_only":
         raise HTTPException(400, "公開連結僅適用「僅預覽觀看」模式")
+
+    # D4：全功能被分享者可再分享。reseller/symotus_admin 照舊放行；
+    # 其他角色須持有此相機的「真分享」授權（granted_by 非本人）且等級允許 camera.share。
+    if current_user.role not in ("reseller", "symotus_admin"):
+        access = db.query(CameraAccess).filter(
+            CameraAccess.user_id == current_user.id,
+            CameraAccess.camera_id == body.camera_id,
+        ).first()
+        if not (access and access.granted_by != current_user.id
+                and level_allows(db, "camera.share", access.permission_level)):
+            raise HTTPException(403, "需要此相機的「全功能管理」授權才能分享")
 
     # 防重複：同相機同模式已有仍有效的連結（pending/accepted 皆算，連結可重複接受）→ 回傳現有連結
     existing_inv = db.query(CameraInvitation).filter(
@@ -252,13 +264,16 @@ def cancel_invitation(
     if not inv:
         raise HTTPException(404, "邀請不存在或無法撤銷")
     # D2：只移除由本連結建立的授權；舊資料（invitation_id 為 NULL）以
-    # granted_by＋permission_level fallback，避免誤刪同相機其他模式的授權
+    # granted_by＋permission_level fallback，避免誤刪同相機其他模式的授權。
+    # 自我配對列（granted_by==user_id，訂閱通知自動建立）非邀請來源，
+    # 即使等級相同也絕不能被連結撤銷帶走。
     db.query(CameraAccess).filter(
         CameraAccess.camera_id == inv.camera_id,
         or_(
             CameraAccess.invitation_id == inv.id,
             and_(CameraAccess.invitation_id.is_(None),
                  CameraAccess.granted_by == inv.inviter_id,
+                 CameraAccess.granted_by != CameraAccess.user_id,
                  CameraAccess.permission_level == inv.permission_level),
         ),
     ).delete(synchronize_session=False)

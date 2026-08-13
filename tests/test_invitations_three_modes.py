@@ -4,7 +4,8 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from models import Base, User, CameraInvitation, CameraAccess, AuditLog
+from models import Base, User, CameraInvitation, CameraAccess, AuditLog, FeaturePolicy
+from policies import invalidate_cache
 from routers.invitations import (
     CreateInvitationBody, create_invitation, accept_invitation, cancel_invitation,
 )
@@ -14,11 +15,14 @@ from routers.invitations import (
 def db():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine, tables=[
-        User.__table__, CameraInvitation.__table__, CameraAccess.__table__, AuditLog.__table__,
+        User.__table__, CameraInvitation.__table__, CameraAccess.__table__,
+        AuditLog.__table__, FeaturePolicy.__table__,  # D4 再分享會查 camera.share 政策
     ])
+    invalidate_cache()  # 政策表為空 → level_allows 走 FEATURE_DEFAULTS fallback
     s = sessionmaker(bind=engine)()
     yield s
     s.close()
+    invalidate_cache()
 
 
 @pytest.fixture()
@@ -105,3 +109,40 @@ def test_revoke_legacy_rows_by_level(db, owner, guest):
     db.commit()
     cancel_invitation(inv["id"], db=db, current_user=owner)
     assert db.query(CameraAccess).filter_by(camera_id=7).count() == 0
+
+
+def test_revoke_spares_self_paired_rows(db, owner, guest):
+    """I4：自我配對列（user_id==granted_by，訂閱通知自動建立、invitation_id=NULL）
+    即使相機與等級都與被撤銷的連結相同，也不得被 NULL fallback 誤刪。"""
+    inv = _create(db, owner, "stream_only")
+    accept_invitation(inv["token"], db=db, current_user=guest)
+    db.add(CameraAccess(camera_id=7, user_id=owner.id, granted_by=owner.id,
+                        permission_level="stream_only", invitation_id=None))
+    db.commit()
+    cancel_invitation(inv["id"], db=db, current_user=owner)
+    remaining = db.query(CameraAccess).filter_by(camera_id=7).all()
+    assert [a.user_id for a in remaining] == [owner.id]  # 被分享者刪除、自我配對列保留
+
+
+# ── D4：full 被分享者可再分享（I7）─────────────────────────────────
+def test_full_sharee_can_reshare(db, owner, guest):
+    db.add(CameraAccess(camera_id=7, user_id=guest.id, granted_by=owner.id,
+                        permission_level="full", invitation_id=None))
+    db.commit()
+    out = _create(db, guest, "stream_only")
+    assert out["token"]
+
+
+def test_photos_stream_sharee_cannot_reshare(db, owner, guest):
+    db.add(CameraAccess(camera_id=7, user_id=guest.id, granted_by=owner.id,
+                        permission_level="photos_stream", invitation_id=None))
+    db.commit()
+    with pytest.raises(HTTPException) as e:
+        _create(db, guest, "stream_only")
+    assert e.value.status_code == 403
+
+
+def test_no_grant_cannot_reshare(db, owner, guest):
+    with pytest.raises(HTTPException) as e:
+        _create(db, guest, "stream_only")
+    assert e.value.status_code == 403

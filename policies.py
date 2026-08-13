@@ -29,7 +29,8 @@ FEATURE_DEFAULTS = [
     ("notify.subscribe", "photos_stream", "LINE 開機通知訂閱"),
 ]
 
-# 三模式改版的一次性 remap：既有環境政策列仍等於「舊預設」才改為新預設，
+# 三模式改版的一次性 remap：僅在「新程式碼首次啟動」（見 seed_policies 的
+# first_migration 判定）執行；既有環境政策列仍等於「舊預設」才改為新預設，
 # 管理端調過的值不動。(feature_key, 舊預設, 新預設)
 _LEVEL_MIGRATIONS = [
     ("stream.view",      "stream_only",   "photos_stream"),
@@ -52,6 +53,11 @@ def seed_policies(db: Session):
     camera.delete 由「刪除相機/裝置更換」拆分後只剩「刪除相機」。
     """
     rows = {p.feature_key: p for p in db.query(FeaturePolicy).all()}
+    # 一次性 remap 的標記：photos.download 只在三模式改版後才存在，缺列＝
+    # 新程式碼「首次」啟動（首度部署三模式）。之後每次重啟不得再跑 remap，
+    # 否則管理端事後的調整（例如把 camera.delete 重新鎖回 owner_only，恰等於
+    # remap 的「舊預設」）會在每次重啟被靜默還原成新預設。
+    first_migration = "photos.download" not in rows
     dirty = False
     for key, level, desc in FEATURE_DEFAULTS:
         p = rows.get(key)
@@ -61,11 +67,12 @@ def seed_policies(db: Session):
         elif p.description != desc:
             p.description = desc
             dirty = True
-    for key, old_level, new_level in _LEVEL_MIGRATIONS:
-        p = rows.get(key)
-        if p is not None and p.min_level == old_level:
-            p.min_level = new_level
-            dirty = True
+    if first_migration:
+        for key, old_level, new_level in _LEVEL_MIGRATIONS:
+            p = rows.get(key)
+            if p is not None and p.min_level == old_level:
+                p.min_level = new_level
+                dirty = True
     if dirty:
         db.commit()
         invalidate_cache()

@@ -180,7 +180,8 @@ async def grant_access_to_managed_user(
     if existing:
         return {"status": "already_exists", "id": existing.id}
     access = CameraAccess(camera_id=camera_id, user_id=user_id,
-                          granted_by=current_user.id, permission_level=permission_level)
+                          granted_by=current_user.id, permission_level=permission_level,
+                          invitation_id=0)  # 非邀請來源（哨兵，避免撤銷連結時 NULL fallback 誤刪）
     db.add(access)
     log_action(db, current_user, "grant_access", "camera_access", None,
                f"camera={camera_id} user={user_id} level={permission_level}")
@@ -214,7 +215,8 @@ def grant_camera_access(
     ).first()
     if existing:
         return {"message": "已有存取權限"}
-    db.add(CameraAccess(camera_id=camera_id, user_id=user_id, granted_by=current_user.id))
+    db.add(CameraAccess(camera_id=camera_id, user_id=user_id, granted_by=current_user.id,
+                        invitation_id=0))  # 非邀請來源（哨兵，避免撤銷連結時 NULL fallback 誤刪）
     log_action(db, current_user, "grant_access", "camera_access", None,
                f"camera={camera_id} user={user_id}")
     db.commit()

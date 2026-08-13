@@ -385,6 +385,7 @@ async def create_camera(
                     user_id=current_user.id,
                     granted_by=current_user.id,
                     permission_level="full",
+                    invitation_id=0,  # 非邀請來源（哨兵，避免撤銷連結時 NULL fallback 誤刪）
                 ))
                 db.commit()
 
@@ -459,9 +460,11 @@ async def get_camera(
     data = resp.json()
 
     # 附上當前用戶的權限等級
-    # 先查 camera_access（分享邀請授權）；若有，以授權等級為準
+    # 先查 camera_access（分享邀請授權）；僅「真分享」列（granted_by 非本人）以授權等級為準。
+    # 自我配對列（訂閱通知自動建立）不是被分享，D6 改版後若誤標會讓擁有者在
+    # 自己相機上失去串流/通知 UI——視同擁有者處理，不回其列上的等級。
     # access 已在上方查過
-    if access:
+    if access and access.granted_by != current_user.id:
         data["my_permission"] = access.permission_level or "photos_stream"
     elif current_user.role in ("reseller", "symotus_admin"):
         data["my_permission"] = "full"  # 自己擁有的相機
@@ -504,6 +507,7 @@ def _set_notify(db: Session, camera_id: int, user: User, value: bool) -> None:
             camera_id=camera_id, user_id=user.id,
             granted_by=user.id, permission_level="stream_only",
             notify_on_online=value,
+            invitation_id=0,  # 非邀請來源（哨兵，避免撤銷連結時 NULL fallback 誤刪）
         ))
 
 
@@ -1134,6 +1138,15 @@ async def proxy_camera_api(
             log_action(db, current_user, "device.replace", "camera", camera_id,
                        f"path={path} via_grant_from={access.granted_by}")
             db.commit()
+
+    # 縮時影片下載走 spark 代理無認證，故在列表端阻斷 job id 洩漏（D3）：
+    # 低等級真被分享者連 timelapse-jobs 清單（含 job id/下載連結）都不可讀。
+    if (request.method == "GET" and access
+            and access.granted_by != current_user.id
+            and current_user.role != "symotus_admin"
+            and (path or "").split("/")[0].lower().startswith("timelapse-jobs")):
+        if not level_allows(db, "photos.download", access.permission_level):
+            raise HTTPException(403, "此操作需要更高的授權等級（photos.download）")
 
     # A3 決策（2026-07-27）：admin 不受 TechSupportGrant 限制——它是「同意記錄」而非閘門。
     # 落地方式：admin 的寫入操作若未被任何有效支援授權涵蓋，寫一筆稽核（不阻擋），

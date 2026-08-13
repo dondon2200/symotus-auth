@@ -476,7 +476,8 @@ def _oauth_finish(db, oauth_field, oauth_id, email, full_name, invite_token_str=
                 user.camera_user_id = invite.camera_user_id
             if invite.camera_ids:
                 for cam_id in invite.camera_ids:
-                    db.add(CameraAccess(camera_id=cam_id, user_id=user.id, granted_by=invite.reseller_id))
+                    db.add(CameraAccess(camera_id=cam_id, user_id=user.id, granted_by=invite.reseller_id,
+                                        invitation_id=0))  # 非邀請連結來源（哨兵，避免撤銷連結時 NULL fallback 誤刪）
             invite.status = "accepted"; invite.accepted_by = user.id; invite.accepted_at = datetime.utcnow()
         db.commit(); db.refresh(user)
     if not user.is_active:
@@ -570,7 +571,8 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
             user.camera_user_id = invite.camera_user_id
         if invite.camera_ids:
             for cam_id in invite.camera_ids:
-                db.add(CameraAccess(camera_id=cam_id, user_id=user.id, granted_by=invite.reseller_id))
+                db.add(CameraAccess(camera_id=cam_id, user_id=user.id, granted_by=invite.reseller_id,
+                                    invitation_id=0))  # 非邀請連結來源（哨兵，避免撤銷連結時 NULL fallback 誤刪）
         invite.status = "accepted"; invite.accepted_by = user.id; invite.accepted_at = datetime.utcnow()
         db.commit()
         db.refresh(user)

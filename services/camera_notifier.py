@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
 from database import SessionLocal
 from models import User, CameraAccess
+from policies import level_allows
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,12 @@ def get_notify_line_ids(camera_id: int, db: Session) -> list[str]:
         # 只通知有訂閱的用戶（notify_on_online 預設 True）
         notify = getattr(acc, "notify_on_online", True)
         if not notify:
+            continue
+        # D6：真分享列（granted_by 為他人）須通過 notify.subscribe 政策才推播——
+        # 涵蓋 stream_only 新接受時預設 True 的列、改版前既有的 stream_only 訂閱者、
+        # 以及「最新為準」降級後殘留的訂閱。自我配對列（granted_by==自己）視同擁有者不受限。
+        if (acc.granted_by and acc.granted_by != acc.user_id
+                and not level_allows(db, "notify.subscribe", acc.permission_level)):
             continue
         u = db.query(User).filter(User.id == acc.user_id, User.line_id.isnot(None)).first()
         if u:

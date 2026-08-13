@@ -264,6 +264,7 @@ def add_camera_access(
         user_id=user_id,
         granted_by=granted_by,
         permission_level=permission_level,
+        invitation_id=0,  # 非邀請來源（哨兵，避免撤銷連結時 NULL fallback 誤刪）
     )
     db.add(access)
     log_action(db, _actor_user(authorization, db), "grant_access", "camera_access", None,

@@ -139,14 +139,24 @@ async def get_public_timesnap(token: str, db: Session = Depends(get_db)):
 
 @router.get("/{token}/image")
 async def get_public_nas_image(token: str, request: Request, db: Session = Depends(get_db)):
-    """代理 NAS 圖片（供公開縮時預覽用）"""
+    """代理 NAS 圖片（供公開縮時預覽用）。
+    公開連結永不回原檔（D3 誠實邊界：伺服器層強制）——只轉發白名單參數並強制
+    thumbnail=true；其餘來路參數（含 thumbnail=false）一律丟棄。"""
     inv, cam_token = await _get_public_cam(token, db)
+
+    path = request.query_params.get("path")
+    if not path:
+        raise HTTPException(400, "缺少 path 參數")
+    params = {"path": path, "thumbnail": "true"}
+    limit = request.query_params.get("limit")
+    if limit is not None:
+        params["limit"] = limit
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(
             f"{CAMERA_BACKEND_URL}/api/camera/nas/image",
             headers={"Authorization": f"Bearer {cam_token}"},
-            params=dict(request.query_params),
+            params=params,
         )
     if resp.status_code != 200:
         raise HTTPException(resp.status_code, "圖片無法取得")

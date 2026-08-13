@@ -535,6 +535,7 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
                         camera_id=cam_id, user_id=user.id,
                         granted_by=user.id, permission_level="stream_only",
                         notify_on_online=False,
+                        invitation_id=0,  # 非邀請來源（哨兵，避免撤銷連結時 NULL fallback 誤刪）
                     ))
                 db.commit()
                 await line_reply(reply_token, [{"type": "text",
