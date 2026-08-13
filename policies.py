@@ -12,18 +12,31 @@ from models import FeaturePolicy
 LEVEL_ORDER = {"stream_only": 0, "photos_stream": 1, "full": 2, "owner_only": 3}
 
 # (feature_key, 預設 min_level, 說明)
+# 2026-08 三模式改版（spec 2026-08-13-camera-share-three-modes-design.md，D3/D5/D6）：
+# 僅預覽觀看(stream_only)＝縮時預覽＋相簿檢視，無串流/通知/下載；full 可刪機/換機。
 FEATURE_DEFAULTS = [
-    ("stream.view",      "stream_only",   "即時串流觀看"),
-    ("photos.view",      "photos_stream", "照片瀏覽/相簿/預覽縮時"),
+    ("stream.view",      "photos_stream", "即時串流觀看"),
+    ("photos.view",      "stream_only",   "照片瀏覽/相簿/預覽縮時"),
+    ("photos.download",  "photos_stream", "下載照片原圖/縮時影片"),
     ("timelapse.create", "photos_stream", "縮時影片產生"),
     ("camera.settings",  "full",          "相機設定/排程寫入（image/osd/timesnap/timer…）"),
     ("camera.control",   "full",          "即時控制（PTZ/重啟/自動對焦）"),
     ("camera.rename",    "full",          "相機改名"),
     ("camera.share",     "full",          "發相機分享邀請"),
     ("camera.unbind",    "full",          "解除綁定"),
-    ("camera.delete",    "owner_only",    "刪除相機"),
-    ("device.replace",   "owner_only",    "裝置更換（換機/撤下裝置）"),
-    ("notify.subscribe", "stream_only",   "LINE 開機通知訂閱"),
+    ("camera.delete",    "full",          "刪除相機"),
+    ("device.replace",   "full",          "裝置更換（換機/撤下裝置）"),
+    ("notify.subscribe", "photos_stream", "LINE 開機通知訂閱"),
+]
+
+# 三模式改版的一次性 remap：既有環境政策列仍等於「舊預設」才改為新預設，
+# 管理端調過的值不動。(feature_key, 舊預設, 新預設)
+_LEVEL_MIGRATIONS = [
+    ("stream.view",      "stream_only",   "photos_stream"),
+    ("photos.view",      "photos_stream", "stream_only"),
+    ("notify.subscribe", "stream_only",   "photos_stream"),
+    ("camera.delete",    "owner_only",    "full"),
+    ("device.replace",   "owner_only",    "full"),
 ]
 
 # 通用 proxy 寫入路徑 → feature_key（首段比對）
@@ -47,6 +60,11 @@ def seed_policies(db: Session):
             dirty = True
         elif p.description != desc:
             p.description = desc
+            dirty = True
+    for key, old_level, new_level in _LEVEL_MIGRATIONS:
+        p = rows.get(key)
+        if p is not None and p.min_level == old_level:
+            p.min_level = new_level
             dirty = True
     if dirty:
         db.commit()
