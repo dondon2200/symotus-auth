@@ -154,15 +154,19 @@ async def get_public_nas_images(token: str, request: Request, db: Session = Depe
 
 @router.get("/{token}/image")
 async def get_public_nas_image(token: str, request: Request, db: Session = Depends(get_db)):
-    """代理 NAS 圖片（供公開縮時預覽用）。
-    公開連結永不回原檔（D3 誠實邊界：伺服器層強制）——只轉發白名單參數並強制
-    thumbnail=true；其餘來路參數（含 thumbnail=false）一律丟棄。"""
+    """代理 NAS 圖片（公開縮時預覽與相簿放大檢視用）。
+    只轉發白名單參數（path/thumbnail/limit），其餘來路參數一律丟棄。
+
+    thumbnail 由呼叫端決定（預設 true）：2026-08-14 產品決議——公開頁的縮時播放與
+    相簿放大檢視比照登入版顯示原圖，故此端點會回原檔。「不可下載」自此僅指
+    不提供下載按鈕與批次取檔入口（UI 層），非伺服器層阻擋，spec 誠實邊界已同步更新。"""
     inv, cam_token = await _get_public_cam(token, db)
 
     path = request.query_params.get("path")
     if not path:
         raise HTTPException(400, "缺少 path 參數")
-    params = {"path": path, "thumbnail": "true"}
+    thumb = request.query_params.get("thumbnail")
+    params = {"path": path, "thumbnail": "true" if thumb is None else thumb}
     limit = request.query_params.get("limit")
     if limit is not None:
         params["limit"] = limit
