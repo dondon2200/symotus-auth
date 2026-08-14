@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 import asyncio
 import logging
+import time as _time
 import httpx
 
 from datetime import datetime
@@ -27,15 +28,30 @@ CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
 logger = logging.getLogger(__name__)
 
 
+# Camera Backend token 快取：(camera_email, backend_role) → (token, expires_at)
+# 緣由：每張圖片代理都會換一次 token，公開頁縮時預載一次要抓上百張，
+# 等量的 token 簽發打爆連線池，服務會被拖到 unhealthy（2026-08-14 事故）。
+_CAM_TOKEN_TTL = 300.0
+_cam_token_cache: dict[tuple[str, str], tuple[str, float]] = {}
+
+
 async def get_camera_backend_token(user: User) -> str:
-    """取得 Camera Backend token
+    """取得 Camera Backend token（同帳號 5 分鐘內共用同一顆）
     安全原則：
     - 必須有 camera_email 才能換 token（代表該帳號有在 Camera Backend 配對過相機）
     - LINE 自動合成的 camera_email（line_xxx@symotus.com）Camera Backend 會自動建立帳號，正常換 token
     - 沒有 camera_email 的用戶無法直接存取 Camera Backend，只能透過 camera_access 看授權相機
+    - 快取鍵含 role：同帳號換角色不會拿到舊權限的 token
     """
     if not user.camera_email:
         return ""  # 沒有 camera_email = 沒有 Camera Backend 帳號，不給 token
+
+    key = (user.camera_email, to_backend_role(user.role))
+    now = _time.monotonic()
+    hit = _cam_token_cache.get(key)
+    if hit and hit[1] > now:
+        return hit[0]
+
     # user_id=0 讓 Camera Backend 純用 email 查帳號，避免 user_id 不一致問題
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
@@ -44,7 +60,13 @@ async def get_camera_backend_token(user: User) -> str:
             json={"user_id": 0, "email": user.camera_email, "role": to_backend_role(user.role)},
         )
         if resp.status_code == 200:
-            return resp.json().get("access_token", "")
+            token = resp.json().get("access_token", "")
+            if token:
+                _cam_token_cache[key] = (token, now + _CAM_TOKEN_TTL)
+                # 順手清掉過期項，避免長期累積
+                for k in [k for k, (_, exp) in _cam_token_cache.items() if exp <= now]:
+                    _cam_token_cache.pop(k, None)
+            return token
     return ""
 
 
