@@ -863,6 +863,15 @@ async def nas_images(
                     )
                 cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else cam_token
 
+    return await list_nas_images_backend(cam_token, camera_id, params)
+
+
+async def list_nas_images_backend(cam_token: str, camera_id, params: dict):
+    """共用 NAS 照片列表核心：解析 serial → 掃日期資料夾 → 分頁蒐集照片。
+    供登入版 /cameras/nas/images 與公開分享 /cameras/public/{token}/images 共用；
+    權限與 token 由呼叫端負責，camera_id 必須由呼叫端決定（公開端點強制取自邀請）。"""
+    from datetime import timedelta
+
     limit = int(params.get("limit", 30))
     offset = int(params.get("offset", 0))
     start_time = params.get("start_time")

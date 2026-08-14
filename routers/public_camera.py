@@ -137,6 +137,21 @@ async def get_public_timesnap(token: str, db: Session = Depends(get_db)):
     return resp.json()
 
 
+@router.get("/{token}/images")
+async def get_public_nas_images(token: str, request: Request, db: Session = Depends(get_db)):
+    """公開相簿/縮時預覽列表：走與登入版相同的列表核心（serial 解析＋日期資料夾掃描）。
+    camera_id 一律強制取自邀請（client 不可指定其他相機）；僅放行分頁與日期區間參數。
+    緣由：nas/image（單數）不支援目錄列表，舊版以 timesnap.serial 拼路徑的做法從未生效。"""
+    from routers.cameras import list_nas_images_backend
+    inv, cam_token = await _get_public_cam(token, db)
+    params = {"camera_id": str(inv.camera_id)}
+    for k in ("limit", "offset", "start_time", "end_time"):
+        v = request.query_params.get(k)
+        if v is not None:
+            params[k] = v
+    return await list_nas_images_backend(cam_token, str(inv.camera_id), params)
+
+
 @router.get("/{token}/image")
 async def get_public_nas_image(token: str, request: Request, db: Session = Depends(get_db)):
     """代理 NAS 圖片（供公開縮時預覽用）。
