@@ -152,19 +152,53 @@ async def get_public_nas_images(token: str, request: Request, db: Session = Depe
     return await list_nas_images_backend(cam_token, str(inv.camera_id), params)
 
 
+# 相機 serial 快取（camera_id → (serial, expires_at)）：/image 每張都要驗路徑歸屬，
+# 不快取就等於每張圖多一次 Camera Backend 查詢（見 2026-08-14 連線池耗盡事故）。
+_SERIAL_TTL = 300.0
+_serial_cache: dict[int, tuple[str, float]] = {}
+
+
+async def _camera_serial(camera_id: int, cam_token: str) -> str:
+    now = _time.monotonic()
+    hit = _serial_cache.get(camera_id)
+    if hit and hit[1] > now:
+        return hit[0]
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
+            headers={"Authorization": f"Bearer {cam_token}"},
+        )
+    if resp.status_code != 200:
+        return ""
+    basic = resp.json().get("basic_info", resp.json())
+    serial = basic.get("device_serial_id") or basic.get("serial_id") or basic.get("serial") or ""
+    if serial:
+        _serial_cache[camera_id] = (serial, now + _SERIAL_TTL)
+    return serial
+
+
 @router.get("/{token}/image")
 async def get_public_nas_image(token: str, request: Request, db: Session = Depends(get_db)):
     """代理 NAS 圖片（公開縮時預覽與相簿放大檢視用）。
     只轉發白名單參數（path/thumbnail/limit），其餘來路參數一律丟棄。
 
-    thumbnail 由呼叫端決定（預設 true）：2026-08-14 產品決議——公開頁的縮時播放與
-    相簿放大檢視比照登入版顯示原圖，故此端點會回原檔。「不可下載」自此僅指
-    不提供下載按鈕與批次取檔入口（UI 層），非伺服器層阻擋，spec 誠實邊界已同步更新。"""
+    path 必須落在本邀請相機自己的 serial 目錄下（2026-08-14 補洞：分享者名下有多台
+    相機時，同一顆 granter token 對所有相機都有效，未驗歸屬等於任一公開連結可讀取
+    該帳號其他相機的照片）。列表端點本就只回本機 serial 的路徑，故不影響正常使用。
+
+    thumbnail 由呼叫端決定（預設 true）：2026-08-14 產品決議——公開頁的相簿放大檢視
+    顯示原圖。「不可下載」自此僅指不提供下載按鈕與批次取檔入口（UI 層），
+    非伺服器層阻擋，spec 誠實邊界已同步更新。"""
     inv, cam_token = await _get_public_cam(token, db)
 
     path = request.query_params.get("path")
     if not path:
         raise HTTPException(400, "缺少 path 參數")
+
+    serial = await _camera_serial(inv.camera_id, cam_token)
+    if not serial or not path.startswith(f"/homes/firmness/{serial}/"):
+        raise HTTPException(403, "此連結無權存取該路徑")
+
     thumb = request.query_params.get("thumbnail")
     params = {"path": path, "thumbnail": "true" if thumb is None else thumb}
     limit = request.query_params.get("limit")
