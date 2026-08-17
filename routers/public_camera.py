@@ -226,10 +226,12 @@ from datetime import datetime as _dt
 # In-memory 臨時圖片快取（60 秒有效）
 _temp_image_cache: dict[str, tuple[bytes, str, float]] = {}  # token → (data, content_type, expires_at)
 
-async def _store_temp_image(data: bytes, content_type: str) -> str:
-    """存入快取，回傳 60 秒有效 token"""
+async def _store_temp_image(data: bytes, content_type: str, ttl: float = 60) -> str:
+    """存入快取，回傳 token（預設 60 秒有效）。
+    LINE 推圖時 LINE 伺服器會分別抓 originalContentUrl 與 previewImageUrl 且可能重試，
+    歷史照片用較長 ttl（如 300 秒）較穩。"""
     token = _secrets.token_urlsafe(16)
-    expires = _asyncio.get_event_loop().time() + 60
+    expires = _asyncio.get_event_loop().time() + ttl
     _temp_image_cache[token] = (data, content_type, expires)
     # 清理過期
     now = _asyncio.get_event_loop().time()
