@@ -403,20 +403,20 @@ async def _rehost_image_for_line(photo_url: str) -> str | None:
     """
     if _is_public_photo_url(photo_url):
         return photo_url
-    from routers.public_camera import _store_temp_image
-    cam_token = await _mint_camera_admin_token()
-    if not cam_token:
-        return None
     try:
+        from routers.public_camera import _store_temp_image
+        cam_token = await _mint_camera_admin_token()
+        if not cam_token:
+            return None
         async with httpx.AsyncClient(timeout=30) as cl:
             img = await cl.get(photo_url, headers={"Authorization": f"Bearer {cam_token}"})
+        if not img.is_success or not img.content:
+            return None
+        token = await _store_temp_image(img.content, img.headers.get("content-type", "image/jpeg"), ttl=300)
+        frontend = os.getenv("FRONTEND_URL", "https://user.symotus.com")
+        return f"{frontend}/auth-api/cameras/public/temp-image/{token}"
     except Exception:
         return None
-    if not img.is_success or not img.content:
-        return None
-    token = await _store_temp_image(img.content, img.headers.get("content-type", "image/jpeg"), ttl=300)
-    frontend = os.getenv("FRONTEND_URL", "https://user.symotus.com")
-    return f"{frontend}/auth-api/cameras/public/temp-image/{token}"
 
 # ── 截圖處理 ─────────────────────────────────────────────────────────────────
 GO2RTC_BASE = "https://user.symotus.com/go2rtc"
@@ -591,31 +591,30 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
         # 呼叫 AI
         result = await call_ai_line(text, auth_token, line_user_id)
 
-        # 回覆文字
-        await line_reply(reply_token, [{"type": "text", "text": result["text"]}])
+        # 文字 + 圖片 + 導頁按鈕全部併進單一 reply 一起送：
+        # 用 replyToken 的 reply「不計入 push 配額」（push 已被 429 用罄），且一次最多 5 則。
+        # NAS 歷史照片 URL 需授權、LINE 匿名抓不到，先轉成公開 temp-image URL。
+        reply_messages: list[dict] = [{"type": "text", "text": result["text"]}]
 
-        # 若共用 AI 回傳了 photo action，推送圖片給用戶。
-        # NAS 歷史照片 URL 需授權，LINE 匿名抓不到，先轉成公開 temp-image URL 再推。
         if result.get("snapshot") and result["snapshot"].get("photo_url"):
             line_photo = await _rehost_image_for_line(result["snapshot"]["photo_url"])
             if line_photo:
-                await line_push(line_user_id, [{
+                reply_messages.append({
                     "type": "image",
                     "originalContentUrl": line_photo,
                     "previewImageUrl": line_photo,
-                }])
+                })
             else:
-                await line_push(line_user_id, [{
+                reply_messages.append({
                     "type": "text",
                     "text": "照片取得失敗，請稍後再試，或改用網頁查看。",
-                }])
+                })
 
-        # 若有導頁需求，推送可點擊按鈕（LINE Buttons Template），最多一則（LINE 限制）
         nav_links = result.get("nav_links") or []
         if nav_links:
             link = nav_links[0]
             full_url = f"https://admin.symotus.com{link['path']}"
-            await line_push(line_user_id, [{
+            reply_messages.append({
                 "type": "template",
                 "altText": link["label"],
                 "template": {
@@ -625,7 +624,9 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
                         {"type": "uri", "label": link["label"][:20], "uri": full_url}
                     ]
                 }
-            }])
+            })
+
+        await line_reply(reply_token, reply_messages[:5])
 
     return {"status": "ok"}
 
