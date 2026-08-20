@@ -75,3 +75,49 @@ def test_期別邊界起訖恰為台北月初零時():
     # 邊界轉回台北時間應恰為月初 00:00
     assert period_of(start) == "2026-08"
     assert period_of(end) == "2026-09"
+
+
+from services.billing_calc import effective_monthly_fee, commission_amount
+
+
+def test_沒設自訂月費時用方案月費():
+    assert effective_monthly_fee(1200, None) == 1200
+
+
+def test_自訂月費覆蓋方案月費():
+    assert effective_monthly_fee(1200, 800) == 800
+
+
+def test_自訂月費為零是有效值不是未設定():
+    # 談成免費的客戶：0 必須被當成「這台就是 0 元」，不能 fallback 回方案月費
+    assert effective_monthly_fee(1200, 0) == 0
+
+
+def test_百分比分潤():
+    assert commission_amount(10000, "percent", 15) == 1500
+
+
+def test_百分比分潤四捨五入到整數元():
+    # 3333 * 15% = 499.95 → 500
+    assert commission_amount(3333, "percent", 15) == 500
+    # 3333 * 10% = 333.3 → 333
+    assert commission_amount(3333, "percent", 10) == 333
+
+
+def test_固定金額分潤與基數無關():
+    assert commission_amount(10000, "fixed", 2000) == 2000
+    assert commission_amount(0, "fixed", 2000) == 2000
+
+
+def test_未設分潤時為零():
+    assert commission_amount(10000, None, None) == 0
+    assert commission_amount(10000, "percent", None) == 0
+    assert commission_amount(10000, None, 15) == 0
+
+
+def test_未知分潤類型回零而不是猜():
+    assert commission_amount(10000, "unknown_type", 15) == 0
+
+
+def test_百分比分潤基數為零時為零():
+    assert commission_amount(0, "percent", 15) == 0

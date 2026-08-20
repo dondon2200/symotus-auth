@@ -61,3 +61,35 @@ def period_bounds_utc(period: str) -> tuple[datetime, datetime]:
     start_taipei = datetime(year, month, 1)
     end_taipei = datetime(*(int(x) for x in next_period(period).split("-")), 1)
     return start_taipei - TAIPEI_OFFSET, end_taipei - TAIPEI_OFFSET
+
+
+from decimal import Decimal, ROUND_HALF_UP
+
+# 客戶的付款方式與分潤類型；值存 DB，顯示文字由前端負責。
+PAYMENT_METHODS = ("monthly_transfer", "credit_card")
+COMMISSION_TYPES = ("percent", "fixed")
+
+
+def effective_monthly_fee(plan_fee: int, custom_fee: Optional[int]) -> int:
+    """客戶的實際月費。自訂月費設了就覆蓋方案月費。
+
+    注意用 `is None` 判斷而非 falsy：0 是有效的自訂月費（談成免費的客戶），
+    用 `custom_fee or plan_fee` 會讓 0 被當成未設定而錯收全額。
+    """
+    return plan_fee if custom_fee is None else custom_fee
+
+
+def commission_amount(base: int, commission_type: Optional[str], commission_value: Optional[int]) -> int:
+    """分潤金額（TWD 整數）。
+
+    分潤不進發票（設計決定：另列應付），這裡只負責算出「要付給經銷商多少」。
+    percent 用 Decimal ROUND_HALF_UP 四捨五入到元——浮點數的 round() 是
+    banker's rounding，會讓 .5 的情形一半進一半捨，帳務上不可預期。
+    """
+    if not commission_type or commission_value is None:
+        return 0
+    if commission_type == "fixed":
+        return int(commission_value)
+    if commission_type == "percent":
+        return int((Decimal(base) * Decimal(commission_value) / Decimal(100)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return 0  # 未知類型不猜
