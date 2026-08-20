@@ -182,6 +182,21 @@ async def startup():
                         conn.rollback()
                         logger.warning(f"billing 部分唯一索引補建失敗，需人工清理重複資料：{e}")
 
+            # 補上 billing_customers 的客戶條件欄位（既有表 create_all 不會補）
+            with engine.connect() as conn:
+                for col, typ in [
+                    ("payment_method", "TEXT DEFAULT 'monthly_transfer'"),
+                    ("statement_day", "INTEGER DEFAULT 1"),
+                    ("custom_monthly_fee", "INTEGER"),
+                    ("commission_type", "TEXT"),
+                    ("commission_value", "INTEGER"),
+                ]:
+                    try:
+                        conn.execute(text(f"ALTER TABLE billing_customers ADD COLUMN IF NOT EXISTS {col} {typ}"))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+
             logger.info("DB connected and tables created!")
             # 種子功能權限政策（缺列才補，不覆蓋既有調整）
             try:

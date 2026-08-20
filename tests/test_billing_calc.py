@@ -3,6 +3,7 @@ from datetime import datetime
 
 from services.billing_calc import (
     invoice_total, quota_pct, quota_state, period_of, next_period, period_bounds_utc,
+    effective_monthly_fee, commission_amount,
 )
 
 
@@ -75,9 +76,6 @@ def test_期別邊界起訖恰為台北月初零時():
     # 邊界轉回台北時間應恰為月初 00:00
     assert period_of(start) == "2026-08"
     assert period_of(end) == "2026-09"
-
-
-from services.billing_calc import effective_monthly_fee, commission_amount
 
 
 def test_沒設自訂月費時用方案月費():

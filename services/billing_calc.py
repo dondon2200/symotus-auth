@@ -4,6 +4,7 @@
 把它與資料存取隔開才能用最便宜的測試涵蓋所有邊界。
 """
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 # 配額門檻（spec §5）：達 90% 警告，達 100% 標記停用。
@@ -62,8 +63,6 @@ def period_bounds_utc(period: str) -> tuple[datetime, datetime]:
     end_taipei = datetime(*(int(x) for x in next_period(period).split("-")), 1)
     return start_taipei - TAIPEI_OFFSET, end_taipei - TAIPEI_OFFSET
 
-
-from decimal import Decimal, ROUND_HALF_UP
 
 # 客戶的付款方式與分潤類型；值存 DB，顯示文字由前端負責。
 PAYMENT_METHODS = ("monthly_transfer", "credit_card")

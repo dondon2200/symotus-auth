@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, PlainSerializer, Field
-from typing import Optional, List
+from typing import Literal, Optional, List
 from typing_extensions import Annotated
 from datetime import datetime, timezone
 
@@ -182,8 +182,14 @@ class PlanResponse(BaseModel):
 
 
 class CustomerUpdate(BaseModel):
+    """局部更新：未帶的欄位不動既有值（PATCH 語意）。"""
     billing_day: Optional[int] = Field(None, ge=1, le=28)
     note: Optional[str] = None
+    payment_method: Optional[Literal["monthly_transfer", "credit_card"]] = None
+    statement_day: Optional[int] = Field(None, ge=1, le=28)
+    custom_monthly_fee: Optional[int] = Field(None, ge=0)
+    commission_type: Optional[Literal["percent", "fixed"]] = None
+    commission_value: Optional[int] = Field(None, ge=0)
 
 
 class CustomerResponse(BaseModel):
@@ -194,6 +200,11 @@ class CustomerResponse(BaseModel):
     billing_day: int
     frozen: bool
     note: Optional[str] = None
+    payment_method: str
+    statement_day: int
+    custom_monthly_fee: Optional[int] = None
+    commission_type: Optional[str] = None
+    commission_value: Optional[int] = None
 
 
 class SubscriptionCreate(BaseModel):

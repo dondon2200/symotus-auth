@@ -250,6 +250,16 @@ class BillingCustomer(Base):
     frozen_at = Column(DateTime, nullable=True)
     note = Column(Text, nullable=True)
 
+    # ── 客戶條件（2026-08-20 補回，見 2026-08-20-billing-phase2b-customer-terms.md）──
+    payment_method = Column(String, nullable=False, default="monthly_transfer", server_default="monthly_transfer")
+    statement_day = Column(Integer, nullable=False, default=1, server_default="1")  # 1-28，避開月底不存在的日期
+    # 客戶級自訂月費：設了就覆蓋該客戶所有相機的方案月費。
+    # NULL = 未設定（用方案月費）；0 是有效值（談成免費），兩者語意不同。
+    custom_monthly_fee = Column(Integer, nullable=True)
+    # 分潤不進發票（設計決定：另列應付），只用於 /admin/commissions 報表。
+    commission_type = Column(String, nullable=True)   # percent | fixed
+    commission_value = Column(Integer, nullable=True)  # percent 時為百分比、fixed 時為 TWD
+
 
 class BillingSubscription(Base):
     """一台相機一份訂閱。

@@ -139,6 +139,11 @@ def list_customers(
             billing_day=c.billing_day if c else 1,
             frozen=c.frozen if c else False,
             note=c.note if c else None,
+            payment_method=c.payment_method if c else "monthly_transfer",
+            statement_day=c.statement_day if c else 1,
+            custom_monthly_fee=c.custom_monthly_fee if c else None,
+            commission_type=c.commission_type if c else None,
+            commission_value=c.commission_value if c else None,
         ))
     return out
 
@@ -154,14 +159,20 @@ def update_customer(
     if not u:
         raise HTTPException(404, "使用者不存在")
     c = get_or_create_customer(db, user_id)
-    if body.billing_day is not None:
-        c.billing_day = body.billing_day
-    if body.note is not None:
-        c.note = body.note
+    # PATCH 語意：只套用請求中真的有帶的欄位，避免把沒帶到的欄位覆寫成 None
+    # （custom_monthly_fee 等欄位 0 是合法值，不能用 is not None 判斷）
+    data = body.model_dump(exclude_unset=True)
+    for field in ("billing_day", "note", "payment_method", "statement_day",
+                  "custom_monthly_fee", "commission_type", "commission_value"):
+        if field in data:
+            setattr(c, field, data[field])
     log_action(db, current_user, "billing_update_customer", "billing_customer", user_id)
     db.commit(); db.refresh(c)
     return CustomerResponse(user_id=u.id, username=u.username, email=u.email, role=u.role,
-                            billing_day=c.billing_day, frozen=c.frozen, note=c.note)
+                            billing_day=c.billing_day, frozen=c.frozen, note=c.note,
+                            payment_method=c.payment_method, statement_day=c.statement_day,
+                            custom_monthly_fee=c.custom_monthly_fee,
+                            commission_type=c.commission_type, commission_value=c.commission_value)
 
 
 @router.post("/admin/customers/{user_id}/freeze")
