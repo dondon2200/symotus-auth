@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, ARRAY, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, ARRAY, UniqueConstraint, Float
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
@@ -220,3 +220,86 @@ class CameraInvitation(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     responded_at = Column(DateTime, nullable=True)
     is_public = Column(Boolean, default=False, nullable=False, server_default="false")  # 公開連結，不需登入
+
+
+# ── Billing 計費模組 ─────────────────────────────────────────────
+# 設計見 symotus-frontend/docs/superpowers/specs/2026-08-20-billing-rebuild-design.md
+# 金額一律整數 TWD；發票明細存快照（方案改價/相機改名不得回頭改變已開發票）。
+
+class BillingPlan(Base):
+    """計費方案"""
+    __tablename__ = "billing_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    monthly_fee = Column(Integer, nullable=False, default=0)         # TWD/月
+    timelapse_quota_secs = Column(Integer, nullable=False, default=0)  # 0 = 不限
+    storage_quota_gb = Column(Integer, nullable=False, default=0)      # 0 = 不限
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class BillingCustomer(Base):
+    """客戶的計費設定。與 users 一對一，但不污染 User 表。"""
+    __tablename__ = "billing_customers"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    billing_day = Column(Integer, nullable=False, default=1)  # 1-28，避開月底不存在的日期
+    frozen = Column(Boolean, nullable=False, default=False)
+    frozen_at = Column(DateTime, nullable=True)
+    note = Column(Text, nullable=True)
+
+
+class BillingSubscription(Base):
+    """一台相機一份訂閱"""
+    __tablename__ = "billing_subscriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(Integer, nullable=False, index=True)
+    customer_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    plan_id = Column(Integer, ForeignKey("billing_plans.id"), nullable=False)
+    status = Column(String, nullable=False, default="active")  # active | paused | cancelled
+    started_at = Column(DateTime, default=datetime.utcnow)
+    cancelled_at = Column(DateTime, nullable=True)
+
+
+class BillingInvoice(Base):
+    """月結發票。UNIQUE(customer_id, period) 是產生作業冪等性的根據。"""
+    __tablename__ = "billing_invoices"
+    __table_args__ = (UniqueConstraint("customer_id", "period", name="uq_billing_invoice_customer_period"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    customer_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    period = Column(String, nullable=False, index=True)  # YYYY-MM
+    total = Column(Integer, nullable=False, default=0)
+    status = Column(String, nullable=False, default="unpaid")  # unpaid | paid | void
+    issued_at = Column(DateTime, default=datetime.utcnow)
+    paid_at = Column(DateTime, nullable=True)
+    paid_note = Column(Text, nullable=True)
+
+
+class BillingInvoiceLine(Base):
+    """發票明細。camera_name/plan_name/amount 是開立當下的快照，不可回頭變動。"""
+    __tablename__ = "billing_invoice_lines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    invoice_id = Column(Integer, ForeignKey("billing_invoices.id"), nullable=False, index=True)
+    subscription_id = Column(Integer, nullable=True)
+    camera_id = Column(Integer, nullable=False)
+    camera_name = Column(String, nullable=True)
+    plan_name = Column(String, nullable=True)
+    amount = Column(Integer, nullable=False, default=0)
+
+
+class BillingUsageDaily(Base):
+    """每日用量。存日粒度而非累計值，讓採集失敗後可安全補跑（upsert 覆蓋同一天）。"""
+    __tablename__ = "billing_usage_daily"
+    __table_args__ = (UniqueConstraint("camera_id", "date", name="uq_billing_usage_camera_date"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(Integer, nullable=False, index=True)
+    date = Column(String, nullable=False, index=True)  # YYYY-MM-DD（台北時區）
+    timelapse_secs = Column(Integer, nullable=False, default=0)
+    storage_gb = Column(Float, nullable=False, default=0)
+    collected_at = Column(DateTime, default=datetime.utcnow)
