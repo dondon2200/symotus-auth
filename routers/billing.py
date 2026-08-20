@@ -23,11 +23,15 @@ from schemas import (
     CustomerUpdate, CustomerResponse,
     SubscriptionCreate, SubscriptionResponse,
     InvoiceResponse, InvoiceLineResponse, InvoiceDetailResponse,
+    CommissionRowResponse,
     MySubscriptionResponse, MyQuotaResponse,
 )
 from auth import require_role, get_current_user
 from audit import log_action
-from services.billing_calc import invoice_total, quota_state, period_of, period_bounds_utc, effective_monthly_fee
+from services.billing_calc import (
+    invoice_total, quota_state, period_of, period_bounds_utc, effective_monthly_fee,
+    commission_amount,
+)
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -462,6 +466,45 @@ def billing_dashboard(period: str, db: Session = Depends(get_db), current_user: 
         "total_paid": sum(i.total for i in invs if i.status == "paid"),
         "frozen_count": frozen,
     }
+
+
+@router.get("/admin/commissions", response_model=list[CommissionRowResponse])
+def list_commissions(period: str, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
+    """分潤應付報表。
+
+    分潤不進發票（設計決定）：發票照定價開給客戶，這張報表算的是
+    「我這期要付給各經銷商多少」。基數是該期別**非作廢**發票的總額。
+    只列有設分潤條件的客戶——沒設的列出來只是雜訊。
+    """
+    _check_period(period)
+
+    # 一次撈出該期別所有非 void 發票，依 customer_id 加總成 dict，避免逐客戶查詢。
+    invs = db.query(BillingInvoice).filter(
+        BillingInvoice.period == period, BillingInvoice.status != "void",
+    ).all()
+    totals: dict[int, int] = {}
+    for i in invs:
+        totals[i.customer_id] = totals.get(i.customer_id, 0) + i.total
+
+    # 一次撈出所有設有分潤條件的客戶（commission_type 非 NULL）。
+    customers = db.query(BillingCustomer).filter(BillingCustomer.commission_type.isnot(None)).all()
+
+    # 使用者名稱一次查完，不逐筆查 DB。
+    names = {u.id: u.username for u in db.query(User).filter(
+        User.id.in_([c.user_id for c in customers])
+    ).all()}
+
+    out = []
+    for c in customers:
+        base = totals.get(c.user_id, 0)
+        amount = commission_amount(base, c.commission_type, c.commission_value)
+        out.append(CommissionRowResponse(
+            customer_id=c.user_id, customer_name=names.get(c.user_id),
+            period=period, invoice_total=base,
+            commission_type=c.commission_type, commission_value=c.commission_value,
+            commission_amount=amount,
+        ))
+    return out
 
 
 # ── 經銷商自助端點（spec §6：/billing/*/my 只回 current_user 自己的資料） ──

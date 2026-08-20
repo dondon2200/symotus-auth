@@ -249,6 +249,16 @@ class InvoiceDetailResponse(InvoiceResponse):
     lines: list[InvoiceLineResponse] = []
 
 
+class CommissionRowResponse(BaseModel):
+    customer_id: int
+    customer_name: Optional[str] = None
+    period: str
+    invoice_total: int          # 該期別非作廢發票的總額（分潤基數）
+    commission_type: str
+    commission_value: int
+    commission_amount: int      # 實際要付給經銷商的金額
+
+
 class MySubscriptionResponse(BaseModel):
     id: int
     camera_id: int
