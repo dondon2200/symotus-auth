@@ -325,11 +325,19 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
                f"period={period} created={created}")
     try:
         db.commit()
-    except IntegrityError:
+    except IntegrityError as e:
         # 並發下可能有另一個管理者同時產生同一期別的發票，
-        # 部分唯一索引擋下重複列；rollback 後不視為錯誤，回傳說明即可
+        # 部分唯一索引擋下重複列；但 IntegrityError 也可能來自其他資料完整性問題
+        # （例如 customer_id 外鍵失效、明細外鍵違反），不能無條件當成「已由其他操作產生」，
+        # 否則會把真正的錯誤吞成 HTTP 200，讓問題更難查。rollback 後重新查詢該期別
+        # 是否「真的」已有非 void 發票，只有這種情況才視為正常的併發重複。
         db.rollback()
-        return {"message": f"{period} 的發票已由其他操作產生，未重複建立", "created": 0}
+        really_exists = db.query(BillingInvoice).filter(
+            BillingInvoice.period == period, BillingInvoice.status != "void",
+        ).count() > 0
+        if really_exists:
+            return {"message": f"{period} 的發票已由其他操作產生，未重複建立", "created": 0}
+        raise HTTPException(500, f"產生發票時發生資料完整性錯誤：{e}") from e
     return {"message": f"{period} 已產生 {created} 張發票", "created": created}
 
 
@@ -340,6 +348,10 @@ def mark_invoice_paid(invoice_id: int, db: Session = Depends(get_db), current_us
         raise HTTPException(404, "發票不存在")
     if inv.status == "void":
         raise HTTPException(409, "已作廢的發票不能標記收款")
+    if inv.status == "paid":
+        # 重複點擊不是錯誤操作，但不能覆寫已存在的收款時間，
+        # 否則帳上的收款時點會被重複點擊不斷往後推，變得不可信
+        return {"message": "此發票已標記收款，未變更收款時間"}
     inv.status = "paid"
     inv.paid_at = datetime.utcnow()
     log_action(db, current_user, "billing_mark_paid", "billing_invoice", invoice_id)
@@ -367,7 +379,8 @@ def billing_dashboard(period: str, db: Session = Depends(get_db), current_user: 
     frozen = db.query(BillingCustomer).filter(BillingCustomer.frozen == True).count()  # noqa: E712
     return {
         "period": period,
-        "invoice_count": len(invs),
+        # 排除 void：作廢後重開屬正常流程，張數統計不應把作廢的舊發票也算進去
+        "invoice_count": len([i for i in invs if i.status != "void"]),
         "total_billed": sum(i.total for i in invs if i.status != "void"),
         "total_unpaid": sum(i.total for i in invs if i.status == "unpaid"),
         "total_paid": sum(i.total for i in invs if i.status == "paid"),

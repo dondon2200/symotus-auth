@@ -153,3 +153,62 @@ def test_總覽統計(client, two_subs):
     assert d["total_unpaid"] == 2000
     assert d["invoice_count"] == 1
     assert d["frozen_count"] == 0
+
+
+def test_已存在非void發票時併發產生仍回成功語意(client, two_subs, monkeypatch):
+    """模擬部分唯一索引擋下重複列的真實併發情境：
+    commit 拋出 IntegrityError，但重查後發現該期別確實已有非 void 發票，
+    此時應維持「已由其他操作產生」的成功回應，而不是往上拋錯。
+    """
+    from sqlalchemy.exc import IntegrityError
+    import routers.billing as billing_module
+
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
+
+    real_commit = billing_module.Session.commit
+    call_count = {"n": 0}
+
+    def fake_commit(self):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise IntegrityError("stmt", "params", Exception("dup key"))
+        return real_commit(self)
+
+    monkeypatch.setattr(billing_module.Session, "commit", fake_commit)
+    r = client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
+    assert r.status_code == 200
+    assert r.json()["created"] == 0
+    assert "已由其他操作產生" in r.json()["message"]
+
+
+def test_作廢後重開dashboard張數不含void(client, two_subs):
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
+    first = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=two_subs).json()[0]
+    client.post(f"/billing/admin/invoices/{first['id']}/void", headers=two_subs)
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
+
+    invoices = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=two_subs).json()
+    assert len(invoices) == 2  # 一張 void、一張新開
+
+    d = client.get(f"/billing/admin/dashboard?period={PERIOD}", headers=two_subs).json()
+    assert d["invoice_count"] == 1
+    new_inv = [i for i in invoices if i["status"] != "void"][0]
+    assert d["total_billed"] == new_inv["total"]
+
+
+def test_重複標記收款不改變付款時間(client, two_subs):
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
+    inv = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=two_subs).json()[0]
+    r1 = client.post(f"/billing/admin/invoices/{inv['id']}/mark-paid", headers=two_subs)
+    assert r1.status_code == 200
+    first_paid_at = client.get(
+        f"/billing/admin/invoices?period={PERIOD}", headers=two_subs
+    ).json()[0]["paid_at"]
+
+    r2 = client.post(f"/billing/admin/invoices/{inv['id']}/mark-paid", headers=two_subs)
+    assert r2.status_code == 200
+    second_paid_at = client.get(
+        f"/billing/admin/invoices?period={PERIOD}", headers=two_subs
+    ).json()[0]["paid_at"]
+
+    assert first_paid_at == second_paid_at
