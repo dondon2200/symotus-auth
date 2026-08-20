@@ -161,6 +161,27 @@ async def startup():
                     except Exception:
                         conn.rollback()
 
+            # 補建 billing 部分唯一索引（給既有環境用）。
+            # create_all() 只會對「尚不存在」的表建索引，不會替既有表補建索引；
+            # 這個環境目前還沒有 billing_* 表，create_all 會建好一切，這裡是保險。
+            # 若既有資料已有重複列（例如手動塞資料造成同客戶同期別兩張非作廢發票），
+            # 建索引會失敗；失敗只記 log、rollback，不讓服務啟動失敗，需要人工清理重複資料。
+            with engine.connect() as conn:
+                for stmt in [
+                    """CREATE UNIQUE INDEX IF NOT EXISTS uq_billing_invoice_customer_period_active
+                        ON billing_invoices (customer_id, period)
+                        WHERE (status != 'void')""",
+                    """CREATE UNIQUE INDEX IF NOT EXISTS uq_billing_subscription_camera_active
+                        ON billing_subscriptions (camera_id)
+                        WHERE (status = 'active')""",
+                ]:
+                    try:
+                        conn.execute(text(stmt))
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning(f"billing 部分唯一索引補建失敗，需人工清理重複資料：{e}")
+
             logger.info("DB connected and tables created!")
             # 種子功能權限政策（缺列才補，不覆蓋既有調整）
             try:

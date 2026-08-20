@@ -230,6 +230,70 @@ def test_A已有發票B沒有時各自獨立產生且回報created與skipped(cli
     ).count() == 1
 
 
+def test_重跑同期別回報skipped_existing而非conflict(client, two_subs):
+    """重新產生已經有發票的期別，屬於正常的冪等跳過，不是併發衝突——
+    回應應該用 skipped_existing 計數，且訊息不該講『併發衝突』。"""
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
+    r = client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
+    body = r.json()
+    assert body["created"] == 0
+    assert body["skipped_existing"] == 1
+    assert body["skipped_conflict"] == 0
+    assert body["skipped"] == 1
+    assert "併發衝突" not in body["message"]
+
+
+def test_savepoint隔離_單一客戶flush失敗不影響其他客戶(client, admin, reseller, make_user, auth_headers, db, monkeypatch):
+    """generate_invoices 對每個客戶各自開一個 begin_nested() savepoint。
+    這裡直接讓第二個客戶（bob）在 flush 當下真的拋出 IntegrityError（而非走
+    『existing 預查』就跳過的路徑），驗證：
+    1) 第一個客戶（reseller）的發票確實寫進 DB、不會被第二個客戶的失敗牽連 rollback 掉
+    2) 回應正確回報 created==1、skipped_conflict==1（真的走 except IntegrityError 分支）
+    """
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session as OrmSession
+    from models import BillingInvoice as Invoice
+
+    h = auth_headers(admin)
+    plan_id = client.post("/billing/admin/plans", json=PLAN_A, headers=h).json()["id"]
+    bob = make_user("inv_bob2", "inv_bob2@test.com", role="reseller")
+
+    client.post("/billing/admin/subscriptions",
+                json={"camera_id": 201, "customer_id": reseller.id, "plan_id": plan_id}, headers=h)
+    client.post("/billing/admin/subscriptions",
+                json={"camera_id": 202, "customer_id": bob.id, "plan_id": plan_id}, headers=h)
+    _backdate_all_subscriptions(db)
+
+    # 注意：不能單純用「第 N 次 flush」計數——SQLAlchemy autoflush 在一般查詢前
+    # 也會呼叫 session.flush()，計數會被其他無關查詢（找 admin、找方案…）打亂。
+    # 改成只在 session 裡真的有 bob 的待寫入 BillingInvoice 時才讓這次 flush 失敗，
+    # 讓 reseller 那筆能先在自己的 savepoint 裡正常 flush + 結束。
+    original_flush = OrmSession.flush
+
+    def flaky_flush(self, *args, **kwargs):
+        for obj in list(self.new):
+            if isinstance(obj, Invoice) and obj.customer_id == bob.id:
+                raise IntegrityError("simulated unique violation", params=None, orig=Exception("dup"))
+        return original_flush(self, *args, **kwargs)
+
+    monkeypatch.setattr(OrmSession, "flush", flaky_flush)
+
+    r = client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["created"] == 1
+    assert body["skipped_conflict"] == 1
+
+    monkeypatch.undo()  # 之後查 DB 用真正的 flush
+
+    assert db.query(Invoice).filter(
+        Invoice.customer_id == reseller.id, Invoice.period == PERIOD,
+    ).count() == 1
+    assert db.query(Invoice).filter(
+        Invoice.customer_id == bob.id, Invoice.period == PERIOD,
+    ).count() == 0
+
+
 def test_作廢後重開dashboard張數不含void(client, two_subs):
     client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
     first = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=two_subs).json()[0]
@@ -267,17 +331,44 @@ def test_重複標記收款不改變付款時間(client, two_subs):
 
 def test_本月剛加入的訂閱本月不開發票(client, admin, reseller, auth_headers):
     """設計文件§5：入會當月免費，帳單從下一期才開始收。two_subs 之所以要
-    刻意回填 started_at，就是因為『本月剛訂閱』預設不該被這期的產生作業計費。"""
+    刻意回填 started_at，就是因為『本月剛訂閱』預設不該被這期的產生作業計費。
+
+    注意：不可用硬編的 PERIOD 常數（值為 2026-08）當「當月」——時間一過，
+    PERIOD 就不再是「現在」，這條測試會悄悄變成在測完全不同的情境（甚至
+    可能變成測『訂閱存在之前的期別』而巧合通過）。改用 period_of(utcnow())
+    動態算出真正的當月期別。"""
+    from services.billing_calc import period_of
+    current_period = period_of(datetime.utcnow())
+
     h = auth_headers(admin)
     pid = client.post("/billing/admin/plans", json=PLAN_A, headers=h).json()["id"]
     client.post("/billing/admin/subscriptions",
                 json={"camera_id": 501, "customer_id": reseller.id, "plan_id": pid}, headers=h)
-    # 不回填 started_at：維持模型預設值（建立當下＝現在，落在 PERIOD 當月）
+    # 不回填 started_at：維持模型預設值（建立當下＝現在，落在當月）
 
-    r = client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=h)
+    r = client.post(f"/billing/admin/invoices/generate/{current_period}", headers=h)
     assert r.status_code == 200
     assert r.json()["created"] == 0
-    assert client.get(f"/billing/admin/invoices?period={PERIOD}", headers=h).json() == []
+    assert client.get(f"/billing/admin/invoices?period={current_period}", headers=h).json() == []
+
+
+def test_取消時間剛好等於期別起點不計費該期(client, two_subs, reseller, db):
+    """邊界測試：cancelled_at 剛好等於 period_start（而非早於或晚於），
+    比照 started_at < period_start 的『嚴格』語意，判定為該期別一刻都沒生效過，
+    不該被計費。回歸測試對象是 cancelled_at > period_start（而非 >=）。"""
+    from models import BillingSubscription
+    from services.billing_calc import period_bounds_utc
+
+    period_start, _ = period_bounds_utc(PERIOD)
+    subs = db.query(BillingSubscription).all()
+    target = subs[0]
+    target.cancelled_at = period_start  # 恰好等於期別起點
+    target.status = "cancelled"
+    db.commit()
+
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
+    inv = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=two_subs).json()[0]
+    assert inv["total"] == 800  # 只有另一台相機（未取消）的月費，取消那台不計費
 
 
 def test_訂閱存在之前的期別不被計費(client, two_subs, reseller):

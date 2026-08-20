@@ -69,13 +69,15 @@ def update_plan(
     plan = db.query(BillingPlan).filter(BillingPlan.id == plan_id).first()
     if not plan:
         raise HTTPException(404, "方案不存在")
-    for k, v in body.model_dump(exclude={"is_active"}).items():
+    # 局部更新：只套用請求裡「真的有帶」的欄位，未帶的欄位維持既有值
+    # （例如只傳 {"is_active": true} 不該把 monthly_fee/quota 打歸零）。
+    for k, v in body.model_dump(exclude={"is_active"}, exclude_unset=True).items():
         setattr(plan, k, v)
     if body.is_active is not None:
         # 允許重新啟用已停用的方案；is_active 未帶值時不動它（PlanCreate 沒有這欄，舊呼叫端仍相容）
         plan.is_active = body.is_active
     # 已開立的發票存的是快照，不受這次改價影響（spec §4）
-    log_action(db, current_user, "billing_update_plan", "billing_plan", plan_id, f"fee={body.monthly_fee}")
+    log_action(db, current_user, "billing_update_plan", "billing_plan", plan_id, f"fee={plan.monthly_fee}")
     db.commit(); db.refresh(plan)
     return plan
 
@@ -314,11 +316,14 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
     # 訂閱必須在該期別開始「之前」就已存在(started_at < period_start)。
     # 且訂閱狀態不能只看 active：已取消的訂閱在取消之前仍佔用過的期別，
     # 也應該能補開歷史發票，所以連 cancelled 一起查，改用
-    # cancelled_at IS NULL OR cancelled_at >= period_start 判斷「該期別當時是否仍生效」。
+    # cancelled_at IS NULL OR cancelled_at > period_start 判斷「該期別當時是否仍生效」。
+    # 用嚴格大於（而非 >=）是為了與 started_at < period_start 對稱：剛好在期別起點
+    # 取消，代表這個客戶在該期別「一刻都沒有生效過」，不該被計費，等同剛好在期別
+    # 起點才加入的訂閱該期免費一樣的道理。
     subs = db.query(BillingSubscription).filter(
         BillingSubscription.status.in_(["active", "cancelled"]),
         BillingSubscription.started_at < period_start,
-        (BillingSubscription.cancelled_at.is_(None)) | (BillingSubscription.cancelled_at >= period_start),
+        (BillingSubscription.cancelled_at.is_(None)) | (BillingSubscription.cancelled_at > period_start),
     ).all()
     plans = {p.id: p for p in db.query(BillingPlan).all()}
 
@@ -327,10 +332,11 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
         by_customer.setdefault(s.customer_id, []).append(s)
 
     created = 0
-    skipped = 0
+    skipped_existing = 0  # 冪等跳過：這期已有非作廢發票，正常重跑行為，不是錯誤
+    skipped_conflict = 0  # 真的撞到部分唯一索引：預查沒擋到、寫入當下才發現的並發衝突
     for customer_id, customer_subs in by_customer.items():
         if customer_id in existing:
-            skipped += 1
+            skipped_existing += 1
             continue
         line_data = []
         for s in customer_subs:
@@ -361,18 +367,27 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
                     ))
         except IntegrityError:
             # 並發下另一個管理者同時產生了同一客戶＋期別的發票，
-            # 部分唯一索引擋下重複列；savepoint 已自動 rollback，只需計入 skipped
-            skipped += 1
+            # 部分唯一索引擋下重複列；savepoint 已自動 rollback，計入 skipped_conflict
+            skipped_conflict += 1
             continue
         created += 1
 
+    skipped = skipped_existing + skipped_conflict
     log_action(db, current_user, "billing_generate_invoices", "billing_invoice", None,
-               f"period={period} created={created} skipped={skipped}")
+               f"period={period} created={created} skipped_existing={skipped_existing} "
+               f"skipped_conflict={skipped_conflict}")
     db.commit()
+    msg = f"{period} 已產生 {created} 張發票"
+    if skipped_existing:
+        msg += f"，{skipped_existing} 筆該客戶本期已有發票故跳過"
+    if skipped_conflict:
+        msg += f"，另有 {skipped_conflict} 筆因併發衝突略過"
     return {
-        "message": f"{period} 已產生 {created} 張發票" + (f"，另有 {skipped} 筆因併發衝突略過" if skipped else ""),
+        "message": msg,
         "created": created,
         "skipped": skipped,
+        "skipped_existing": skipped_existing,
+        "skipped_conflict": skipped_conflict,
     }
 
 

@@ -88,6 +88,24 @@ def test_修改方案(client, admin, auth_headers):
     assert r.json()["monthly_fee"] == 1500
 
 
+def test_只帶is_active的局部更新不會清空其他欄位(client, admin, auth_headers):
+    """PlanUpdate 改為局部更新（PATCH 語意）後，只傳 is_active 不該把
+    monthly_fee/quota 打歸零——舊版 PlanUpdate 每個欄位都有 int 預設值 0，
+    未帶欄位會被 pydantic 補成 0 再整批覆寫進 DB。"""
+    h = auth_headers(admin)
+    created = client.post("/billing/admin/plans", json=PLAN, headers=h).json()
+
+    r = client.put(f"/billing/admin/plans/{created['id']}",
+                   json={"is_active": True}, headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_active"] is True
+    assert body["monthly_fee"] == PLAN["monthly_fee"]
+    assert body["timelapse_quota_secs"] == PLAN["timelapse_quota_secs"]
+    assert body["storage_quota_gb"] == PLAN["storage_quota_gb"]
+    assert body["name"] == PLAN["name"]
+
+
 def test_改不存在的方案回404(client, admin, auth_headers):
     r = client.put("/billing/admin/plans/9999", json=PLAN, headers=auth_headers(admin))
     assert r.status_code == 404

@@ -159,11 +159,12 @@ class PlanCreate(BaseModel):
 
 
 class PlanUpdate(BaseModel):
-    name: str
+    """局部更新：所有欄位皆可選，未帶的欄位不動既有值（PATCH 語意）。"""
+    name: Optional[str] = None
     description: Optional[str] = None
-    monthly_fee: int = 0
-    timelapse_quota_secs: int = 0
-    storage_quota_gb: int = 0
+    monthly_fee: Optional[int] = None
+    timelapse_quota_secs: Optional[int] = None
+    storage_quota_gb: Optional[int] = None
     is_active: Optional[bool] = None  # None = 不變更啟用狀態；用來讓已停用的方案能重新啟用
 
 
