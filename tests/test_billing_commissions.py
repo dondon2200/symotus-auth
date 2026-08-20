@@ -83,7 +83,13 @@ def test_作廢的發票不計入分潤基數(client, billed, reseller):
 
     rows = client.get(f"/billing/admin/commissions?period={PERIOD}", headers=billed).json()
     row = [r for r in rows if r["customer_id"] == reseller.id]
-    assert row == [] or row[0]["commission_amount"] == 0
+    # 客戶仍設有分潤條件（commission_type 非 null），本來就該出現在報表上；
+    # 舊斷言的 `row == [] or ...` 用 or 掩蓋了「客戶從報表消失」這種真正的
+    # 回歸——這裡改成明確斷言：一定要出現這一列，且作廢發票不計入基數，
+    # 所以 invoice_total 與 commission_amount 都該是 0。
+    assert len(row) == 1
+    assert row[0]["invoice_total"] == 0
+    assert row[0]["commission_amount"] == 0
 
 
 def test_期別格式錯誤回422(client, billed):

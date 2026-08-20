@@ -183,10 +183,48 @@ async def startup():
                         logger.warning(f"billing 部分唯一索引補建失敗，需人工清理重複資料：{e}")
 
             # 補上 billing_customers 的客戶條件欄位（既有表 create_all 不會補）
+            # payment_method / statement_day 在 models.py 是 nullable=False，
+            # 原本只用 ADD COLUMN ... DEFAULT 補欄位、沒有補 NOT NULL 約束，
+            # 造成既有 DB 的欄位定義與 models.py 不一致。分三步各自補齊，
+            # 每一步各自 try/except/rollback，任一步在既有環境失敗（例如
+            # 欄位已存在但仍有 NULL 值）只記警告，不擋啟動。
+            NOT_NULL_COLS = [
+                ("payment_method", "TEXT", "'monthly_transfer'"),
+                ("statement_day", "INTEGER", "1"),
+            ]
+            for col, typ, default in NOT_NULL_COLS:
+                with engine.connect() as conn:
+                    try:
+                        conn.execute(text(
+                            f"ALTER TABLE billing_customers ADD COLUMN IF NOT EXISTS {col} {typ} DEFAULT {default}"
+                        ))
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning(f"billing_customers 補欄位 {col}（ADD COLUMN）失敗：{e}")
+                with engine.connect() as conn:
+                    try:
+                        conn.execute(text(
+                            f"UPDATE billing_customers SET {col} = {default} WHERE {col} IS NULL"
+                        ))
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning(f"billing_customers 補欄位 {col}（UPDATE NULL）失敗：{e}")
+                with engine.connect() as conn:
+                    try:
+                        conn.execute(text(
+                            f"ALTER TABLE billing_customers ALTER COLUMN {col} SET NOT NULL"
+                        ))
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning(f"billing_customers 補欄位 {col}（SET NOT NULL）失敗：{e}")
+
+            # custom_monthly_fee / commission_type / commission_value 在 models.py
+            # 皆為 nullable=True，維持原本單純 ADD COLUMN 即可。
             with engine.connect() as conn:
                 for col, typ in [
-                    ("payment_method", "TEXT DEFAULT 'monthly_transfer'"),
-                    ("statement_day", "INTEGER DEFAULT 1"),
                     ("custom_monthly_fee", "INTEGER"),
                     ("commission_type", "TEXT"),
                     ("commission_value", "INTEGER"),
@@ -197,6 +235,20 @@ async def startup():
                     except Exception as e:
                         conn.rollback()
                         logger.warning(f"billing_customers 補欄位 {col} 失敗：{e}")
+
+            # 自我檢查：確認上面的欄位真的都補上了。計費模組非核心功能
+            # （auth service 同時代理所有相機 CRUD），欄位缺失不該擋住服務啟動，
+            # 但要在 log 大聲示警，讓維運人員能人工介入，而不是靜默讓計費 API 500。
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text(
+                        "SELECT payment_method, statement_day, custom_monthly_fee, "
+                        "commission_type, commission_value FROM billing_customers LIMIT 1"
+                    ))
+                except Exception as e:
+                    logger.error(
+                        "billing_customers 缺少欄位，計費 API 將失效，請人工檢查 migration：" + str(e)
+                    )
 
             logger.info("DB connected and tables created!")
             # 種子功能權限政策（缺列才補，不覆蓋既有調整）

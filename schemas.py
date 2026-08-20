@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, PlainSerializer, Field
+from pydantic import BaseModel, EmailStr, PlainSerializer, Field, model_validator
 from typing import Literal, Optional, List
 from typing_extensions import Annotated
 from datetime import datetime, timezone
@@ -197,6 +197,26 @@ class CustomerUpdate(BaseModel):
     # commission_percent_bps / commission_fixed_amount），而不是放寬這個
     # 上限——放寬會讓 percent 失去「不超過 100%」的保護。
     commission_value: Optional[int] = Field(None, ge=0, le=10000)
+
+    @model_validator(mode="after")
+    def _commission_type_and_value_together(self) -> "CustomerUpdate":
+        """commission_type 和 commission_value 的單位是綁在一起的（type 決定 value
+        該解讀成百分比 bps 還是 TWD 金額），所以兩者必須「一起帶」或「都不帶」，
+        不能只改其中一個。
+
+        用 model_fields_set 判斷「這個請求裡有沒有帶這個 key」，而不是看值是不是
+        None——commission_type/commission_value 兩者都允許明確傳 null 來清除設定，
+        若改用 `value is None` 判斷會把「沒帶」和「帶了 null」混為一談。
+        """
+        fields = self.model_fields_set
+        type_sent = "commission_type" in fields
+        value_sent = "commission_value" in fields
+        if type_sent != value_sent:
+            raise ValueError("commission_type 與 commission_value 必須一起設定（兩者單位互相依賴），不能只改其中一個")
+        # 兩者都有帶：type 若設為非 null，value 就不能是 null（沒有分潤數值）
+        if type_sent and self.commission_type is not None and self.commission_value is None:
+            raise ValueError("commission_type 有值時，commission_value 不可為 null")
+        return self
 
 
 class CustomerResponse(BaseModel):

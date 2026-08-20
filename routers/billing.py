@@ -153,6 +153,12 @@ def list_customers(
     return out
 
 
+# NOT NULL 欄位：models.py 裡 nullable=False。顯式傳 null 會讓 setattr 把欄位
+# 寫成 None，直接違反 DB 的 NOT NULL 約束（而且是在 commit 當下才炸，訊息不友善）。
+# 這裡提前擋下，回一個看得懂原因的 422。
+_NOT_NULL_CUSTOMER_FIELDS = {"billing_day", "payment_method", "statement_day"}
+
+
 @router.put("/admin/customers/{user_id}", response_model=CustomerResponse)
 def update_customer(
     user_id: int,
@@ -165,16 +171,23 @@ def update_customer(
         raise HTTPException(404, "使用者不存在")
     c = get_or_create_customer(db, user_id)
     # PATCH 語意：只套用請求中真的有帶的欄位，避免把沒帶到的欄位覆寫成 None
-    # （custom_monthly_fee 等欄位 0 是合法值，不能用 is not None 判斷）
+    # （custom_monthly_fee 等欄位 0 是合法值，不能用 is not None 判斷）。
+    # 用 model_fields_set 而非 model_dump(exclude_unset=True) 的 key 集合：
+    # 兩者理論上一致，但這裡明確表達「有沒有帶這個 key」的判斷依據。
+    fields_set = body.model_fields_set
     data = body.model_dump(exclude_unset=True)
+    for field in fields_set & _NOT_NULL_CUSTOMER_FIELDS:
+        if data.get(field) is None:
+            raise HTTPException(422, f"{field} 不可清空為 null（此欄位不允許為空）")
     for field in ("billing_day", "note", "payment_method", "statement_day",
                   "custom_monthly_fee", "commission_type", "commission_value"):
         if field in data:
             setattr(c, field, data[field])
-    # 稽核日誌記人看得懂的顯示字串（如 "12.5%"），而不是原始 bps 數字——
-    # 原始數字被人讀的時候，1250 會被誤讀成 1250%。
-    log_action(db, current_user, "billing_update_customer", "billing_customer", user_id,
-               commission_display(c.commission_type, c.commission_value))
+    # 稽核日誌只在分潤欄位真的有被這次請求改動時才附上分潤顯示字串，
+    # 避免日誌內容誤導成「這次操作有動到分潤」——即使值沒變。
+    commission_changed = bool(fields_set & {"commission_type", "commission_value"})
+    detail = commission_display(c.commission_type, c.commission_value) if commission_changed else ""
+    log_action(db, current_user, "billing_update_customer", "billing_customer", user_id, detail)
     db.commit(); db.refresh(c)
     return CustomerResponse(user_id=u.id, username=u.username, email=u.email, role=u.role,
                             billing_day=c.billing_day, frozen=c.frozen, note=c.note,
@@ -211,10 +224,17 @@ def unfreeze_customer(user_id: int, db: Session = Depends(get_db), current_user:
     return {"message": "已解除凍結"}
 
 
-def _sub_response(sub: BillingSubscription, plan: BillingPlan | None) -> SubscriptionResponse:
+def _sub_response(sub: BillingSubscription, plan: BillingPlan | None,
+                  customer: BillingCustomer | None) -> SubscriptionResponse:
+    # monthly_fee 要顯示「客戶實付」，不是方案原價——自訂月費（custom_monthly_fee）
+    # 設了就覆蓋方案月費，這裡跟 generate_invoices 用同一個 effective_monthly_fee，
+    # 否則列表上看到的月費會跟真正開出來的發票金額對不上。
+    plan_fee = plan.monthly_fee if plan else 0
+    custom_fee = customer.custom_monthly_fee if customer else None
     return SubscriptionResponse(
         id=sub.id, camera_id=sub.camera_id, customer_id=sub.customer_id, plan_id=sub.plan_id,
-        plan_name=plan.name if plan else None, monthly_fee=plan.monthly_fee if plan else 0,
+        plan_name=plan.name if plan else None,
+        monthly_fee=effective_monthly_fee(plan_fee, custom_fee) if plan else 0,
         status=sub.status,
     )
 
@@ -223,7 +243,12 @@ def _sub_response(sub: BillingSubscription, plan: BillingPlan | None) -> Subscri
 def list_subscriptions(db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
     subs = db.query(BillingSubscription).order_by(BillingSubscription.id).all()
     plans = {p.id: p for p in db.query(BillingPlan).all()}
-    return [_sub_response(s, plans.get(s.plan_id)) for s in subs]
+    # 一次撈出所有客戶的自訂月費設定，避免逐筆查 DB（同檔既有慣例）。
+    customer_ids = {s.customer_id for s in subs}
+    customer_configs = {
+        c.user_id: c for c in db.query(BillingCustomer).filter(BillingCustomer.user_id.in_(customer_ids)).all()
+    }
+    return [_sub_response(s, plans.get(s.plan_id), customer_configs.get(s.customer_id)) for s in subs]
 
 
 @router.post("/admin/subscriptions", response_model=SubscriptionResponse)
@@ -255,7 +280,8 @@ def create_subscription(
         db.rollback()
         raise HTTPException(409, "此相機已有生效中的訂閱")
     db.refresh(sub)
-    return _sub_response(sub, plan)
+    customer = db.query(BillingCustomer).filter(BillingCustomer.user_id == body.customer_id).first()
+    return _sub_response(sub, plan, customer)
 
 
 @router.delete("/admin/subscriptions/{sub_id}")
@@ -377,8 +403,8 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
 
         # 自訂月費覆蓋方案月費：custom_monthly_fee 為 None 代表沒談成客製價，
         # 用方案原價；0 是合法值（談成免費），effective_monthly_fee 已處理這個判斷。
-        custom_fee = customer_configs.get(customer_id)
-        custom_fee = custom_fee.custom_monthly_fee if custom_fee else None
+        cfg = customer_configs.get(customer_id)
+        custom_fee = cfg.custom_monthly_fee if cfg else None
         line_fees = [(s, p, effective_monthly_fee(p.monthly_fee, custom_fee)) for s, p in line_data]
 
         # 每個客戶各自一個 savepoint：舊版整批只 commit 一次，
@@ -522,11 +548,15 @@ def my_subscriptions(db: Session = Depends(get_db), current_user: User = Depends
         BillingSubscription.status == "active",
     ).order_by(BillingSubscription.id).all()
     plans = {p.id: p for p in db.query(BillingPlan).all()}
+    # 自訂月費要覆蓋方案原價（同 _sub_response／generate_invoices 慣例），
+    # 只有 current_user 自己一筆，不需要批次查（也沒有 N+1 的問題）。
+    customer = db.query(BillingCustomer).filter(BillingCustomer.user_id == current_user.id).first()
+    custom_fee = customer.custom_monthly_fee if customer else None
     return [
         MySubscriptionResponse(
             id=s.id, camera_id=s.camera_id,
             plan_name=plans[s.plan_id].name if s.plan_id in plans else None,
-            monthly_fee=plans[s.plan_id].monthly_fee if s.plan_id in plans else 0,
+            monthly_fee=effective_monthly_fee(plans[s.plan_id].monthly_fee, custom_fee) if s.plan_id in plans else 0,
             status=s.status,
         ) for s in subs
     ]

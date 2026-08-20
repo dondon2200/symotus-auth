@@ -158,3 +158,10 @@ def test_固定金額的顯示字串():
 def test_未設分潤的顯示字串為空():
     assert commission_display(None, None) == ""
     assert commission_display("percent", None) == ""
+
+
+def test_顯示字串不落入科學記號陷阱():
+    # Decimal.normalize() 在整數值上會產生 1E+1 / 1E+2 這種科學記號，
+    # 若沒有用 format(..., "f") 轉回一般記數法，10%/100% 會顯示成 "1E+1%"。
+    assert commission_display("percent", 1000) == "10%"
+    assert commission_display("percent", 10000) == "100%"

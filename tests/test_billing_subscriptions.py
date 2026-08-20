@@ -68,6 +68,37 @@ def test_reseller不能管理訂閱(client, reseller, auth_headers):
     assert r.status_code == 403
 
 
+def test_自訂月費覆蓋訂閱列表顯示的月費(client, admin, reseller, auth_headers, db):
+    """/admin/subscriptions 和 /subscriptions/my 的 monthly_fee 過去直接顯示方案原價，
+    忽略客戶的 custom_monthly_fee，跟真正開出來的發票金額（同用 effective_monthly_fee）
+    對不上。這裡驗證兩個端點都要顯示「客戶實付」，且與發票明細金額一致。"""
+    from datetime import datetime
+    from models import BillingSubscription
+
+    h = auth_headers(admin)
+    pid = _plan_id(client, h)
+    client.post("/billing/admin/subscriptions",
+                json={"camera_id": 99, "customer_id": reseller.id, "plan_id": pid}, headers=h)
+    client.put(f"/billing/admin/customers/{reseller.id}", headers=h, json={"custom_monthly_fee": 300})
+
+    admin_subs = client.get("/billing/admin/subscriptions", headers=h).json()
+    sub = [s for s in admin_subs if s["camera_id"] == 99][0]
+    assert sub["monthly_fee"] == 300
+
+    my_subs = client.get("/billing/subscriptions/my", headers=auth_headers(reseller)).json()
+    my_sub = [s for s in my_subs if s["camera_id"] == 99][0]
+    assert my_sub["monthly_fee"] == 300
+
+    # 跟真正開出來的發票明細金額比對
+    for s in db.query(BillingSubscription).filter(BillingSubscription.camera_id == 99).all():
+        s.started_at = datetime(2026, 1, 1)
+    db.commit()
+    r = client.post("/billing/admin/invoices/generate/2026-08", headers=h)
+    assert r.json()["created"] == 1
+    inv = client.get("/billing/admin/invoices?period=2026-08", headers=h).json()[0]
+    assert inv["total"] == 300
+
+
 def test_客戶設定預設值與更新(client, admin, reseller, auth_headers):
     h = auth_headers(admin)
     customers = client.get("/billing/admin/customers", headers=h).json()

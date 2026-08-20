@@ -438,3 +438,32 @@ def test_自訂月費是開立當下的快照(client, two_subs, reseller):
     client.put(f"/billing/admin/customers/{reseller.id}", headers=h, json={"custom_monthly_fee": 9999})
     inv = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=h).json()[0]
     assert inv["total"] == 1000
+
+
+def test_作廢後重開才會用新價格_舊發票仍保留舊快照(client, two_subs, reseller):
+    """只驗證「欄位有存到值」不足以證明 generate_invoices 真的不會回頭改舊發票——
+    idempotency 檢查是「該期別已有非 void 發票就整批跳過」，所以要先把舊發票作廢，
+    才能讓 generate_invoices 對同一個期別真的重新跑一次，藉此驗證：
+    - 新開的發票用新價格
+    - 被作廢的舊發票（快照）不會被舊資料以外的東西動到
+    """
+    h = two_subs
+    client.put(f"/billing/admin/customers/{reseller.id}", headers=h, json={"custom_monthly_fee": 500})
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=h)
+    old_inv = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=h).json()[0]
+    # two_subs 有兩台相機（兩筆訂閱明細），custom_monthly_fee 對每一筆明細各自生效，
+    # 所以總額是 500 * 2 = 1000，不是 500。
+    assert old_inv["total"] == 1000
+
+    client.post(f"/billing/admin/invoices/{old_inv['id']}/void", headers=h)
+    client.put(f"/billing/admin/customers/{reseller.id}", headers=h, json={"custom_monthly_fee": 9999})
+    r = client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=h)
+    assert r.json()["created"] == 1
+
+    invs = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=h).json()
+    assert len(invs) == 2
+    by_id = {i["id"]: i for i in invs}
+    assert by_id[old_inv["id"]]["status"] == "void"
+    assert by_id[old_inv["id"]]["total"] == 1000  # 舊發票快照沒被改動
+    new_inv = [i for i in invs if i["id"] != old_inv["id"]][0]
+    assert new_inv["total"] == 9999 * 2  # 新發票用新價格（兩筆明細各自套用）
