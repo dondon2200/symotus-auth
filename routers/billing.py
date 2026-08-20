@@ -247,7 +247,8 @@ def _invoice_response(inv: BillingInvoice, customer_name: str | None = None) -> 
 def list_invoices(period: str, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
     _check_period(period)
     invs = db.query(BillingInvoice).filter(BillingInvoice.period == period).order_by(BillingInvoice.id).all()
-    names = {u.id: u.username for u in db.query(User).all()}
+    customer_ids = {i.customer_id for i in invs}
+    names = {u.id: u.username for u in db.query(User).filter(User.id.in_(customer_ids)).all()}
     return [_invoice_response(i, names.get(i.customer_id)) for i in invs]
 
 
@@ -279,7 +280,12 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
     舊版沒有這層，管理者點兩次就產生兩批發票。
     """
     _check_period(period)
-    existing = {i.customer_id for i in db.query(BillingInvoice).filter(BillingInvoice.period == period).all()}
+    # 只計入非作廢的發票：作廢的發票不再佔用該期別，讓客戶＋期別可以重新開立
+    existing = {
+        i.customer_id for i in db.query(BillingInvoice).filter(
+            BillingInvoice.period == period, BillingInvoice.status != "void",
+        ).all()
+    }
 
     subs = db.query(BillingSubscription).filter(BillingSubscription.status == "active").all()
     plans = {p.id: p for p in db.query(BillingPlan).all()}
@@ -317,7 +323,13 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
 
     log_action(db, current_user, "billing_generate_invoices", "billing_invoice", None,
                f"period={period} created={created}")
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # 並發下可能有另一個管理者同時產生同一期別的發票，
+        # 部分唯一索引擋下重複列；rollback 後不視為錯誤，回傳說明即可
+        db.rollback()
+        return {"message": f"{period} 的發票已由其他操作產生，未重複建立", "created": 0}
     return {"message": f"{period} 已產生 {created} 張發票", "created": created}
 
 
@@ -340,6 +352,8 @@ def void_invoice(invoice_id: int, db: Session = Depends(get_db), current_user: U
     inv = db.query(BillingInvoice).filter(BillingInvoice.id == invoice_id).first()
     if not inv:
         raise HTTPException(404, "發票不存在")
+    if inv.status == "paid":
+        raise HTTPException(409, "已收款的發票須先辦理退款/沖銷才能作廢")
     inv.status = "void"
     log_action(db, current_user, "billing_void_invoice", "billing_invoice", invoice_id)
     db.commit()

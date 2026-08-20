@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, ARRAY, UniqueConstraint, Float
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, ARRAY, UniqueConstraint, Float, Index, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
@@ -265,9 +265,22 @@ class BillingSubscription(Base):
 
 
 class BillingInvoice(Base):
-    """月結發票。UNIQUE(customer_id, period) 是產生作業冪等性的根據。"""
+    """月結發票。(customer_id, period) 唯一是產生作業冪等性的根據。
+
+    這裡刻意用「部分唯一索引」而非一般 UniqueConstraint：作廢(void)的發票
+    不算數，讓該客戶＋期別可以重新開立；但同一時間絕不能有兩張「非作廢」
+    的發票佔用同一期別，否則會重複收費。
+    """
     __tablename__ = "billing_invoices"
-    __table_args__ = (UniqueConstraint("customer_id", "period", name="uq_billing_invoice_customer_period"),)
+    __table_args__ = (
+        Index(
+            "uq_billing_invoice_customer_period_active",
+            "customer_id", "period",
+            unique=True,
+            postgresql_where=text("status != 'void'"),
+            sqlite_where=text("status != 'void'"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     customer_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)

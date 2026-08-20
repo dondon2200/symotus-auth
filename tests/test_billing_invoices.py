@@ -108,6 +108,34 @@ def test_已作廢的發票不能標記收款(client, two_subs):
     assert r.status_code == 409
 
 
+def test_作廢後重新產生會開新發票且舊發票留在歷史中(client, two_subs):
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
+    first = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=two_subs).json()[0]
+    client.post(f"/billing/admin/invoices/{first['id']}/void", headers=two_subs)
+
+    r = client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
+    assert r.status_code == 200
+    assert r.json()["created"] == 1
+
+    invoices = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=two_subs).json()
+    assert len(invoices) == 2
+    by_status = {i["status"]: i for i in invoices}
+    assert by_status["void"]["id"] == first["id"]
+    assert by_status["unpaid"]["total"] == 2000
+
+
+def test_已收款的發票不能直接作廢(client, two_subs):
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=two_subs)
+    inv = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=two_subs).json()[0]
+    client.post(f"/billing/admin/invoices/{inv['id']}/mark-paid", headers=two_subs)
+    r = client.post(f"/billing/admin/invoices/{inv['id']}/void", headers=two_subs)
+    assert r.status_code == 409
+
+    after = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=two_subs).json()[0]
+    assert after["status"] == "paid"
+    assert after["paid_at"] is not None
+
+
 def test_期別格式錯誤回422(client, two_subs):
     assert client.post("/billing/admin/invoices/generate/2026-8", headers=two_subs).status_code == 422
     assert client.post("/billing/admin/invoices/generate/abc", headers=two_subs).status_code == 422
