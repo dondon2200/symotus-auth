@@ -8,6 +8,7 @@
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -89,7 +90,16 @@ def get_or_create_customer(db: Session, user_id: int) -> BillingCustomer:
     c = db.query(BillingCustomer).filter(BillingCustomer.user_id == user_id).first()
     if not c:
         c = BillingCustomer(user_id=user_id)
-        db.add(c); db.commit(); db.refresh(c)
+        db.add(c)
+        try:
+            db.commit()
+        except IntegrityError:
+            # 並發下可能有另一個請求搶先建立同一筆客戶紀錄；
+            # user_id 是主鍵不會產生重複列，rollback 後重查回傳既有那筆即可
+            db.rollback()
+            c = db.query(BillingCustomer).filter(BillingCustomer.user_id == user_id).first()
+        else:
+            db.refresh(c)
     return c
 
 
@@ -136,6 +146,9 @@ def update_customer(
 @router.post("/admin/customers/{user_id}/freeze")
 def freeze_customer(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
     """只做標記：不會自動擋登入或斷服務（spec §5）。"""
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u:
+        raise HTTPException(404, "使用者不存在")
     c = get_or_create_customer(db, user_id)
     c.frozen = True
     c.frozen_at = datetime.utcnow()
@@ -146,6 +159,9 @@ def freeze_customer(user_id: int, db: Session = Depends(get_db), current_user: U
 
 @router.post("/admin/customers/{user_id}/unfreeze")
 def unfreeze_customer(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u:
+        raise HTTPException(404, "使用者不存在")
     c = get_or_create_customer(db, user_id)
     c.frozen = False
     c.frozen_at = None

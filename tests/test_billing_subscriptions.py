@@ -97,3 +97,13 @@ def test_凍結與解除凍結(client, admin, reseller, auth_headers):
     assert client.post(f"/billing/admin/customers/{reseller.id}/unfreeze", headers=h).status_code == 200
     customers = client.get("/billing/admin/customers", headers=h).json()
     assert [c for c in customers if c["user_id"] == reseller.id][0]["frozen"] is False
+
+
+def test_凍結不存在的使用者回404(client, admin, auth_headers):
+    r = client.post("/billing/admin/customers/999999/freeze", headers=auth_headers(admin))
+    assert r.status_code == 404
+
+
+def test_解除凍結不存在的使用者回404(client, admin, auth_headers):
+    r = client.post("/billing/admin/customers/999999/unfreeze", headers=auth_headers(admin))
+    assert r.status_code == 404
