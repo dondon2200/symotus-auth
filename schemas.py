@@ -3,6 +3,8 @@ from typing import Literal, Optional, List
 from typing_extensions import Annotated
 from datetime import datetime, timezone
 
+from services.billing_calc import MAX_COMMISSION_BPS, MAX_COMMISSION_FIXED
+
 
 def utc_iso(v: Optional[datetime]) -> Optional[str]:
     """DB 內的 datetime 皆為 naive UTC（datetime.utcnow）。序列化時補上 UTC 時區，
@@ -192,8 +194,8 @@ class CustomerUpdate(BaseModel):
     # 分潤拆成兩個獨立欄位，各自的單位與上限不再互相牽制：
     # - commission_percent_bps 是萬分比（bps），percent 型別時 10000 = 100%
     # - commission_fixed_amount 是 TWD 整數金額，上限一千萬
-    commission_percent_bps: Optional[int] = Field(None, ge=0, le=10000)
-    commission_fixed_amount: Optional[int] = Field(None, ge=0, le=10_000_000)
+    commission_percent_bps: Optional[int] = Field(None, ge=0, le=MAX_COMMISSION_BPS)
+    commission_fixed_amount: Optional[int] = Field(None, ge=0, le=MAX_COMMISSION_FIXED)
 
     @model_validator(mode="after")
     def _commission_type_matches_value(self) -> "CustomerUpdate":

@@ -191,11 +191,27 @@ def update_customer(
             raise HTTPException(422, "未設定 commission_type 為 percent 時，不可更新 commission_percent_bps")
         if "commission_fixed_amount" in fields_set and c.commission_type != "fixed":
             raise HTTPException(422, "未設定 commission_type 為 fixed 時，不可更新 commission_fixed_amount")
+        # 型別本身沒被清除（沒帶 commission_type）的情況下，數值欄位被明確傳 null
+        # 等於想清掉數值卻留著型別，型別/數值會不成對。要清空分潤設定必須整組清，
+        # 也就是傳 {"commission_type": null}，而不是單獨把數值清成 null。
+        if "commission_percent_bps" in fields_set and data.get("commission_percent_bps") is None:
+            raise HTTPException(422, "不可單獨將 commission_percent_bps 清空為 null；"
+                                      "請傳 {\"commission_type\": null} 清除整組分潤設定")
+        if "commission_fixed_amount" in fields_set and data.get("commission_fixed_amount") is None:
+            raise HTTPException(422, "不可單獨將 commission_fixed_amount 清空為 null；"
+                                      "請傳 {\"commission_type\": null} 清除整組分潤設定")
     for field in ("billing_day", "note", "payment_method", "statement_day",
                   "custom_monthly_fee", "commission_type",
                   "commission_percent_bps", "commission_fixed_amount"):
         if field in data:
             setattr(c, field, data[field])
+    # 型別變更時把不相符的數值欄位清掉：兩個欄位都會回傳給前端，
+    # 殘留值會讓管理者看到「型別是固定金額，卻同時顯示 15%」。
+    if "commission_type" in fields_set:
+        if c.commission_type != "percent":
+            c.commission_percent_bps = None
+        if c.commission_type != "fixed":
+            c.commission_fixed_amount = None
     # 稽核日誌只在分潤欄位真的有被這次請求改動時才附上分潤顯示字串，
     # 避免日誌內容誤導成「這次操作有動到分潤」——即使值沒變。
     commission_changed = bool(

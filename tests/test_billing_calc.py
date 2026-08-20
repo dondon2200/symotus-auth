@@ -140,12 +140,17 @@ def test_未知分潤類型回零而不是猜():
     assert commission_amount(10000, "unknown_type", 1500, 2000) == 0
 
 
+def test_基數為零時分潤為零():
+    assert commission_amount(0, "percent", 1500, None) == 0
+
+
 def test_顯示字串():
     assert commission_display("percent", 1500, None) == "15%"
     assert commission_display("percent", 1250, None) == "12.5%"
     assert commission_display("percent", 1, None) == "0.01%"
     assert commission_display("percent", 1000, None) == "10%"    # 科學記號邊界
     assert commission_display("percent", 10000, None) == "100%"  # 科學記號邊界
+    assert commission_display("percent", 725, None) == "7.25%"
     assert commission_display("fixed", None, 500) == "NT$ 500"
     assert commission_display("fixed", None, 50000) == "NT$ 50,000"
     assert commission_display(None, None, None) == ""

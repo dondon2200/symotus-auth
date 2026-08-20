@@ -139,4 +139,38 @@ def test_清除分潤設定(client, admin, reseller, auth_headers):
                    json={"commission_type": None})
     assert r.status_code == 200
     assert r.json()["commission_type"] is None
+    # 清除後底層數值欄位也必須真的變 None：兩個欄位都會回傳給前端，
+    # 殘留值會讓管理者看到「型別已清空，卻還顯示一個百分比數字」。
+    assert r.json()["commission_percent_bps"] is None
+    assert r.json()["commission_fixed_amount"] is None
     assert r.json()["commission_display"] == ""
+
+
+def test_型別切換為fixed後percent欄位被清空(client, admin, reseller, auth_headers):
+    h = auth_headers(admin)
+    client.put(f"/billing/admin/customers/{reseller.id}", headers=h,
+               json={"commission_type": "percent", "commission_percent_bps": 1500})
+    r = client.put(f"/billing/admin/customers/{reseller.id}", headers=h,
+                   json={"commission_type": "fixed", "commission_fixed_amount": 500})
+    assert r.status_code == 200
+    assert r.json()["commission_type"] == "fixed"
+    assert r.json()["commission_fixed_amount"] == 500
+    assert r.json()["commission_percent_bps"] is None
+
+
+def test_單獨清空commission_percent_bps回422(client, admin, reseller, auth_headers):
+    h = auth_headers(admin)
+    client.put(f"/billing/admin/customers/{reseller.id}", headers=h,
+               json={"commission_type": "percent", "commission_percent_bps": 1500})
+    r = client.put(f"/billing/admin/customers/{reseller.id}", headers=h,
+                   json={"commission_percent_bps": None})
+    assert r.status_code == 422
+
+
+def test_傳commission_type為null正常清空(client, admin, reseller, auth_headers):
+    h = auth_headers(admin)
+    client.put(f"/billing/admin/customers/{reseller.id}", headers=h,
+               json={"commission_type": "percent", "commission_percent_bps": 1500})
+    r = client.put(f"/billing/admin/customers/{reseller.id}", headers=h,
+                   json={"commission_type": None})
+    assert r.status_code == 200
