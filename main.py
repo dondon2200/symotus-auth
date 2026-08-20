@@ -179,11 +179,14 @@ async def startup():
                 try:
                     if s.query(BillingPlan).count() == 0:
                         s.add(BillingPlan(
-                            name="標準方案",
-                            description="預設方案，月費為暫定值，正式定價確定後於後台調整",
+                            name="（範本）標準方案",
+                            description="佔位範本，月費 9999 為暫定值尚未定案。"
+                                        "正式定價確定後，請在後台編輯價格並啟用。"
+                                        "啟用前不可指派給任何相機，以免產生真實的 9999/月發票。",
                             monthly_fee=9999,
                             timelapse_quota_secs=0,
                             storage_quota_gb=0,
+                            is_active=False,
                         ))
                         s.commit()
                         logger.info("billing: 已建立預設方案")

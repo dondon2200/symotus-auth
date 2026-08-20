@@ -252,8 +252,22 @@ class BillingCustomer(Base):
 
 
 class BillingSubscription(Base):
-    """一台相機一份訂閱"""
+    """一台相機一份訂閱。
+
+    同一台相機同時間只能有一份「生效中」的訂閱，否則會重複計費。
+    router 端原本只靠 SELECT-then-INSERT 防重複，並發下擋不住，
+    所以這裡也加一道「部分唯一索引」（比照 BillingInvoice 的作法）當最後防線。
+    """
     __tablename__ = "billing_subscriptions"
+    __table_args__ = (
+        Index(
+            "uq_billing_subscription_camera_active",
+            "camera_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     camera_id = Column(Integer, nullable=False, index=True)

@@ -53,10 +53,30 @@ def test_預設只回啟用中的方案(client, admin, auth_headers):
     client.delete(f"/billing/admin/plans/{created['id']}", headers=h)
 
     assert client.get("/billing/admin/plans", headers=h).json() == []
-    # 停用是軟刪，帶 include_inactive 就找得回來——舊版停用後永遠叫不回
+    # 停用是軟刪，帶 include_inactive 就找得回來
     back = client.get("/billing/admin/plans?include_inactive=1", headers=h).json()
     assert len(back) == 1
     assert back[0]["is_active"] is False
+
+
+def test_停用後可以重新啟用(client, admin, auth_headers):
+    """PUT /admin/plans 舊版用 PlanCreate 當 body schema，沒有 is_active 欄位，
+    pydantic 會把前端傳的 is_active:true 直接丟掉，導致停用的方案永遠回不來。
+    改用 PlanUpdate（多了 Optional[bool] is_active）修正後，重新啟用要能生效，
+    且重新啟用的方案要出現在預設（僅列啟用中）的清單裡。"""
+    h = auth_headers(admin)
+    created = client.post("/billing/admin/plans", json=PLAN, headers=h).json()
+    client.delete(f"/billing/admin/plans/{created['id']}", headers=h)
+    assert client.get("/billing/admin/plans", headers=h).json() == []
+
+    r = client.put(f"/billing/admin/plans/{created['id']}",
+                   json={**PLAN, "is_active": True}, headers=h)
+    assert r.status_code == 200
+    assert r.json()["is_active"] is True
+
+    back = client.get("/billing/admin/plans", headers=h).json()
+    assert len(back) == 1
+    assert back[0]["id"] == created["id"]
 
 
 def test_修改方案(client, admin, auth_headers):

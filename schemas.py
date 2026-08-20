@@ -158,6 +158,15 @@ class PlanCreate(BaseModel):
     storage_quota_gb: int = 0
 
 
+class PlanUpdate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    monthly_fee: int = 0
+    timelapse_quota_secs: int = 0
+    storage_quota_gb: int = 0
+    is_active: Optional[bool] = None  # None = 不變更啟用狀態；用來讓已停用的方案能重新啟用
+
+
 class PlanResponse(BaseModel):
     id: int
     name: str

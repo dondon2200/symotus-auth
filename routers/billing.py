@@ -19,7 +19,7 @@ from models import (
     BillingUsageDaily,
 )
 from schemas import (
-    PlanCreate, PlanResponse,
+    PlanCreate, PlanUpdate, PlanResponse,
     CustomerUpdate, CustomerResponse,
     SubscriptionCreate, SubscriptionResponse,
     InvoiceResponse, InvoiceLineResponse, InvoiceDetailResponse,
@@ -27,7 +27,7 @@ from schemas import (
 )
 from auth import require_role, get_current_user
 from audit import log_action
-from services.billing_calc import invoice_total, quota_state, period_of
+from services.billing_calc import invoice_total, quota_state, period_of, period_bounds_utc
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -36,7 +36,7 @@ ADMIN = require_role("symotus_admin")
 
 @router.get("/admin/plans", response_model=list[PlanResponse])
 def list_plans(
-    include_inactive: int = 0,
+    include_inactive: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(ADMIN),
 ):
@@ -62,15 +62,18 @@ def create_plan(
 @router.put("/admin/plans/{plan_id}", response_model=PlanResponse)
 def update_plan(
     plan_id: int,
-    body: PlanCreate,
+    body: PlanUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(ADMIN),
 ):
     plan = db.query(BillingPlan).filter(BillingPlan.id == plan_id).first()
     if not plan:
         raise HTTPException(404, "方案不存在")
-    for k, v in body.model_dump().items():
+    for k, v in body.model_dump(exclude={"is_active"}).items():
         setattr(plan, k, v)
+    if body.is_active is not None:
+        # 允許重新啟用已停用的方案；is_active 未帶值時不動它（PlanCreate 沒有這欄，舊呼叫端仍相容）
+        plan.is_active = body.is_active
     # 已開立的發票存的是快照，不受這次改價影響（spec §4）
     log_action(db, current_user, "billing_update_plan", "billing_plan", plan_id, f"fee={body.monthly_fee}")
     db.commit(); db.refresh(plan)
@@ -117,15 +120,23 @@ def list_customers(
     db: Session = Depends(get_db),
     current_user: User = Depends(ADMIN),
 ):
+    # 這是 GET，不該有寫入副作用：list_customers 曾經對每個使用者呼叫
+    # get_or_create_customer（內含 commit），N 個使用者 = N 次 insert + N 次 commit，
+    # 且與所有相機 CRUD proxy 共用連線池。改用一次查完 billing_customers 再用
+    # Python dict 比對，沒有紀錄的使用者用預設值組出回應，完全不寫 DB。
     q = db.query(User).filter(User.is_active == True)  # noqa: E712
     if role != "all":
         q = q.filter(User.role == role)
+    users = q.order_by(User.id).all()
+    customers = {c.user_id: c for c in db.query(BillingCustomer).all()}
     out = []
-    for u in q.order_by(User.id).all():
-        c = get_or_create_customer(db, u.id)
+    for u in users:
+        c = customers.get(u.id)
         out.append(CustomerResponse(
             user_id=u.id, username=u.username, email=u.email, role=u.role,
-            billing_day=c.billing_day, frozen=c.frozen, note=c.note,
+            billing_day=c.billing_day if c else 1,
+            frozen=c.frozen if c else False,
+            note=c.note if c else None,
         ))
     return out
 
@@ -215,7 +226,13 @@ def create_subscription(
     db.add(sub)
     log_action(db, current_user, "billing_create_subscription", "billing_subscription", None,
                f"camera={body.camera_id} plan={plan.name}")
-    db.commit(); db.refresh(sub)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 並發下兩個請求可能都通過上面的 SELECT 檢查，部分唯一索引是最後防線
+        db.rollback()
+        raise HTTPException(409, "此相機已有生效中的訂閱")
+    db.refresh(sub)
     return _sub_response(sub, plan)
 
 
@@ -292,7 +309,17 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
         ).all()
     }
 
-    subs = db.query(BillingSubscription).filter(BillingSubscription.status == "active").all()
+    period_start, _period_end = period_bounds_utc(period)
+    # design doc §5：入會當月免費，帳單從「加入後的下一期」才開始收——
+    # 訂閱必須在該期別開始「之前」就已存在(started_at < period_start)。
+    # 且訂閱狀態不能只看 active：已取消的訂閱在取消之前仍佔用過的期別，
+    # 也應該能補開歷史發票，所以連 cancelled 一起查，改用
+    # cancelled_at IS NULL OR cancelled_at >= period_start 判斷「該期別當時是否仍生效」。
+    subs = db.query(BillingSubscription).filter(
+        BillingSubscription.status.in_(["active", "cancelled"]),
+        BillingSubscription.started_at < period_start,
+        (BillingSubscription.cancelled_at.is_(None)) | (BillingSubscription.cancelled_at >= period_start),
+    ).all()
     plans = {p.id: p for p in db.query(BillingPlan).all()}
 
     by_customer: dict[int, list] = {}
@@ -300,8 +327,10 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
         by_customer.setdefault(s.customer_id, []).append(s)
 
     created = 0
+    skipped = 0
     for customer_id, customer_subs in by_customer.items():
         if customer_id in existing:
+            skipped += 1
             continue
         line_data = []
         for s in customer_subs:
@@ -312,38 +341,39 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
         if not line_data:
             continue
 
-        inv = BillingInvoice(
-            customer_id=customer_id, period=period,
-            total=invoice_total([p.monthly_fee for _, p in line_data]),
-            status="unpaid",
-        )
-        db.add(inv); db.flush()   # 取得 inv.id 供明細使用
-        for s, p in line_data:
-            # 快照：方案改價或相機改名之後，這張發票的內容不得跟著變
-            db.add(BillingInvoiceLine(
-                invoice_id=inv.id, subscription_id=s.id, camera_id=s.camera_id,
-                camera_name=None, plan_name=p.name, amount=p.monthly_fee,
-            ))
+        # 每個客戶各自一個 savepoint：舊版整批只 commit 一次，
+        # 若某個客戶觸發部分唯一索引，rollback 會連同其他客戶「這次呼叫已建立
+        # 但尚未提交」的發票與明細一起丟掉，卻仍回報成功。改成逐客戶 savepoint，
+        # 一個客戶失敗只影響該客戶，其餘客戶正常寫入。
+        try:
+            with db.begin_nested():
+                inv = BillingInvoice(
+                    customer_id=customer_id, period=period,
+                    total=invoice_total([p.monthly_fee for _, p in line_data]),
+                    status="unpaid",
+                )
+                db.add(inv); db.flush()   # 取得 inv.id 供明細使用
+                for s, p in line_data:
+                    # 快照：方案改價或相機改名之後，這張發票的內容不得跟著變
+                    db.add(BillingInvoiceLine(
+                        invoice_id=inv.id, subscription_id=s.id, camera_id=s.camera_id,
+                        camera_name=None, plan_name=p.name, amount=p.monthly_fee,
+                    ))
+        except IntegrityError:
+            # 並發下另一個管理者同時產生了同一客戶＋期別的發票，
+            # 部分唯一索引擋下重複列；savepoint 已自動 rollback，只需計入 skipped
+            skipped += 1
+            continue
         created += 1
 
     log_action(db, current_user, "billing_generate_invoices", "billing_invoice", None,
-               f"period={period} created={created}")
-    try:
-        db.commit()
-    except IntegrityError as e:
-        # 並發下可能有另一個管理者同時產生同一期別的發票，
-        # 部分唯一索引擋下重複列；但 IntegrityError 也可能來自其他資料完整性問題
-        # （例如 customer_id 外鍵失效、明細外鍵違反），不能無條件當成「已由其他操作產生」，
-        # 否則會把真正的錯誤吞成 HTTP 200，讓問題更難查。rollback 後重新查詢該期別
-        # 是否「真的」已有非 void 發票，只有這種情況才視為正常的併發重複。
-        db.rollback()
-        really_exists = db.query(BillingInvoice).filter(
-            BillingInvoice.period == period, BillingInvoice.status != "void",
-        ).count() > 0
-        if really_exists:
-            return {"message": f"{period} 的發票已由其他操作產生，未重複建立", "created": 0}
-        raise HTTPException(500, f"產生發票時發生資料完整性錯誤：{e}") from e
-    return {"message": f"{period} 已產生 {created} 張發票", "created": created}
+               f"period={period} created={created} skipped={skipped}")
+    db.commit()
+    return {
+        "message": f"{period} 已產生 {created} 張發票" + (f"，另有 {skipped} 筆因併發衝突略過" if skipped else ""),
+        "created": created,
+        "skipped": skipped,
+    }
 
 
 @router.post("/admin/invoices/{invoice_id}/mark-paid")

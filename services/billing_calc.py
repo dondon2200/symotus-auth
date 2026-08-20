@@ -49,3 +49,15 @@ def next_period(period: str) -> str:
     """下一個期別，處理跨年。"""
     year, month = (int(x) for x in period.split("-"))
     return f"{year + 1}-01" if month == 12 else f"{year}-{month + 1:02d}"
+
+
+def period_bounds_utc(period: str) -> tuple[datetime, datetime]:
+    """期別（YYYY-MM）對應的 naive UTC 左閉右開區間 [start, end)。
+
+    語意是台北時間該月 1 日 00:00 到下月 1 日 00:00；轉成 naive UTC 存取，
+    須扣掉 TAIPEI_OFFSET（台北時間 - 8 小時 = UTC）。
+    """
+    year, month = (int(x) for x in period.split("-"))
+    start_taipei = datetime(year, month, 1)
+    end_taipei = datetime(*(int(x) for x in next_period(period).split("-")), 1)
+    return start_taipei - TAIPEI_OFFSET, end_taipei - TAIPEI_OFFSET

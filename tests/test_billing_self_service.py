@@ -1,7 +1,10 @@
+from datetime import datetime
+
 import pytest
 from fastapi import FastAPI
 
 from routers.billing import router as billing_router
+from models import BillingSubscription
 
 PLAN = {"name": "標準方案", "monthly_fee": 1200, "timelapse_quota_secs": 3600, "storage_quota_gb": 100}
 PERIOD = "2026-08"
@@ -30,12 +33,16 @@ def bob(make_user):
 
 
 @pytest.fixture()
-def setup(client, admin, alice, bob, auth_headers):
-    """alice 有一台相機的訂閱與一張發票；bob 什麼都沒有。"""
+def setup(client, admin, alice, bob, auth_headers, db):
+    """alice 有一台相機的訂閱與一張發票；bob 什麼都沒有。
+    訂閱時間回填到期別之前，否則「入會當月免費」規則下這期不會有發票。"""
     h = auth_headers(admin)
     pid = client.post("/billing/admin/plans", json=PLAN, headers=h).json()["id"]
     client.post("/billing/admin/subscriptions",
                 json={"camera_id": 7, "customer_id": alice.id, "plan_id": pid}, headers=h)
+    for s in db.query(BillingSubscription).all():
+        s.started_at = datetime(2026, 7, 1)
+    db.commit()
     client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=h)
     return h
 
