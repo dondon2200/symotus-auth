@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, PlainSerializer
+from pydantic import BaseModel, EmailStr, PlainSerializer, Field
 from typing import Optional, List
 from typing_extensions import Annotated
 from datetime import datetime, timezone
@@ -169,3 +169,34 @@ class PlanResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class CustomerUpdate(BaseModel):
+    billing_day: Optional[int] = Field(None, ge=1, le=28)
+    note: Optional[str] = None
+
+
+class CustomerResponse(BaseModel):
+    user_id: int
+    username: str
+    email: str
+    role: str
+    billing_day: int
+    frozen: bool
+    note: Optional[str] = None
+
+
+class SubscriptionCreate(BaseModel):
+    camera_id: int
+    customer_id: int
+    plan_id: int
+
+
+class SubscriptionResponse(BaseModel):
+    id: int
+    camera_id: int
+    customer_id: int
+    plan_id: int
+    plan_name: Optional[str] = None
+    monthly_fee: int = 0
+    status: str
