@@ -170,6 +170,30 @@ async def startup():
                     seed_policies(_s)
             except Exception as e:
                 logger.warning(f"seed_policies: {e}")
+            # billing 種子方案：全新環境建一個預設方案，避免後台空白無從下手。
+            # 已有任何方案就不動——不覆寫營運中的資料。
+            try:
+                from models import BillingPlan
+                from database import SessionLocal
+                s = SessionLocal()
+                try:
+                    if s.query(BillingPlan).count() == 0:
+                        s.add(BillingPlan(
+                            name="標準方案",
+                            description="預設方案，月費為暫定值，正式定價確定後於後台調整",
+                            monthly_fee=9999,
+                            timelapse_quota_secs=0,
+                            storage_quota_gb=0,
+                        ))
+                        s.commit()
+                        logger.info("billing: 已建立預設方案")
+                except Exception as e:
+                    s.rollback()
+                    logger.warning(f"billing 種子方案建立失敗（不影響啟動）：{e}")
+                finally:
+                    s.close()
+            except Exception as e:
+                logger.warning(f"billing 種子方案初始化失敗（不影響啟動）：{e}")
             # 回收上一個進程留下的 GDrive 下載孤兒（部署／SIGKILL 會讓它們永遠停在
             # downloading）。必須在開放流量前做，否則使用者會看到永遠不動的進度條。
             try:
@@ -203,13 +227,14 @@ async def shutdown():
         logger.warning(f"shutdown_gdrive_jobs: {e}")
 
 
-from routers import auth, invites, users, support, admin, jobs, cameras, line_webhook, invitations, public_camera
+from routers import auth, invites, users, support, admin, jobs, cameras, line_webhook, invitations, public_camera, billing
 app.include_router(auth.router)
 app.include_router(invites.router)
 app.include_router(users.router)
 app.include_router(support.router)
 app.include_router(admin.router)
 app.include_router(jobs.router)
+app.include_router(billing.router)  # 必須在 cameras 前（避免 /{camera_id} catch-all 攔截）
 app.include_router(public_camera.router)  # 必須在 cameras 前（避免 /{camera_id}/{path} catch-all 攔截）
 app.include_router(cameras.router)
 app.include_router(line_webhook.router)
