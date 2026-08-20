@@ -5,6 +5,7 @@
 - /billing/*/my 只回 current_user 自己的資料，路徑不吃 user_id 參數——
   沒有可竄改的輸入，就沒有 IDOR。
 """
+import re
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,14 +13,16 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import User, BillingPlan, BillingCustomer, BillingSubscription
+from models import User, BillingPlan, BillingCustomer, BillingSubscription, BillingInvoice, BillingInvoiceLine
 from schemas import (
     PlanCreate, PlanResponse,
     CustomerUpdate, CustomerResponse,
     SubscriptionCreate, SubscriptionResponse,
+    InvoiceResponse, InvoiceLineResponse, InvoiceDetailResponse,
 )
 from auth import require_role
 from audit import log_action
+from services.billing_calc import invoice_total
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -222,3 +225,137 @@ def cancel_subscription(sub_id: int, db: Session = Depends(get_db), current_user
     log_action(db, current_user, "billing_cancel_subscription", "billing_subscription", sub_id)
     db.commit()
     return {"message": "已取消訂閱"}
+
+
+PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def _check_period(period: str):
+    if not PERIOD_RE.match(period):
+        raise HTTPException(422, "期別格式須為 YYYY-MM")
+
+
+def _invoice_response(inv: BillingInvoice, customer_name: str | None = None) -> InvoiceResponse:
+    return InvoiceResponse(
+        id=inv.id, customer_id=inv.customer_id, customer_name=customer_name,
+        period=inv.period, total=inv.total, status=inv.status,
+        issued_at=inv.issued_at, paid_at=inv.paid_at,
+    )
+
+
+@router.get("/admin/invoices", response_model=list[InvoiceResponse])
+def list_invoices(period: str, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
+    _check_period(period)
+    invs = db.query(BillingInvoice).filter(BillingInvoice.period == period).order_by(BillingInvoice.id).all()
+    names = {u.id: u.username for u in db.query(User).all()}
+    return [_invoice_response(i, names.get(i.customer_id)) for i in invs]
+
+
+@router.get("/admin/invoices/{invoice_id}", response_model=InvoiceDetailResponse)
+def get_invoice(invoice_id: int, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
+    inv = db.query(BillingInvoice).filter(BillingInvoice.id == invoice_id).first()
+    if not inv:
+        raise HTTPException(404, "發票不存在")
+    return _build_invoice_detail(db, inv)
+
+
+def _build_invoice_detail(db: Session, inv: BillingInvoice) -> InvoiceDetailResponse:
+    lines = db.query(BillingInvoiceLine).filter(BillingInvoiceLine.invoice_id == inv.id).all()
+    u = db.query(User).filter(User.id == inv.customer_id).first()
+    return InvoiceDetailResponse(
+        id=inv.id, customer_id=inv.customer_id, customer_name=u.username if u else None,
+        period=inv.period, total=inv.total, status=inv.status,
+        issued_at=inv.issued_at, paid_at=inv.paid_at,
+        lines=[InvoiceLineResponse(id=l.id, camera_id=l.camera_id, camera_name=l.camera_name,
+                                   plan_name=l.plan_name, amount=l.amount) for l in lines],
+    )
+
+
+@router.post("/admin/invoices/generate/{period}")
+def generate_invoices(period: str, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
+    """為該期別產生發票。冪等：已有發票的客戶直接跳過。
+
+    冪等性靠 UNIQUE(customer_id, period)＋這裡的預先查詢兩層保障。
+    舊版沒有這層，管理者點兩次就產生兩批發票。
+    """
+    _check_period(period)
+    existing = {i.customer_id for i in db.query(BillingInvoice).filter(BillingInvoice.period == period).all()}
+
+    subs = db.query(BillingSubscription).filter(BillingSubscription.status == "active").all()
+    plans = {p.id: p for p in db.query(BillingPlan).all()}
+
+    by_customer: dict[int, list] = {}
+    for s in subs:
+        by_customer.setdefault(s.customer_id, []).append(s)
+
+    created = 0
+    for customer_id, customer_subs in by_customer.items():
+        if customer_id in existing:
+            continue
+        line_data = []
+        for s in customer_subs:
+            plan = plans.get(s.plan_id)
+            if not plan:
+                continue
+            line_data.append((s, plan))
+        if not line_data:
+            continue
+
+        inv = BillingInvoice(
+            customer_id=customer_id, period=period,
+            total=invoice_total([p.monthly_fee for _, p in line_data]),
+            status="unpaid",
+        )
+        db.add(inv); db.flush()   # 取得 inv.id 供明細使用
+        for s, p in line_data:
+            # 快照：方案改價或相機改名之後，這張發票的內容不得跟著變
+            db.add(BillingInvoiceLine(
+                invoice_id=inv.id, subscription_id=s.id, camera_id=s.camera_id,
+                camera_name=None, plan_name=p.name, amount=p.monthly_fee,
+            ))
+        created += 1
+
+    log_action(db, current_user, "billing_generate_invoices", "billing_invoice", None,
+               f"period={period} created={created}")
+    db.commit()
+    return {"message": f"{period} 已產生 {created} 張發票", "created": created}
+
+
+@router.post("/admin/invoices/{invoice_id}/mark-paid")
+def mark_invoice_paid(invoice_id: int, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
+    inv = db.query(BillingInvoice).filter(BillingInvoice.id == invoice_id).first()
+    if not inv:
+        raise HTTPException(404, "發票不存在")
+    if inv.status == "void":
+        raise HTTPException(409, "已作廢的發票不能標記收款")
+    inv.status = "paid"
+    inv.paid_at = datetime.utcnow()
+    log_action(db, current_user, "billing_mark_paid", "billing_invoice", invoice_id)
+    db.commit()
+    return {"message": "已標記收款"}
+
+
+@router.post("/admin/invoices/{invoice_id}/void")
+def void_invoice(invoice_id: int, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
+    inv = db.query(BillingInvoice).filter(BillingInvoice.id == invoice_id).first()
+    if not inv:
+        raise HTTPException(404, "發票不存在")
+    inv.status = "void"
+    log_action(db, current_user, "billing_void_invoice", "billing_invoice", invoice_id)
+    db.commit()
+    return {"message": "已作廢"}
+
+
+@router.get("/admin/dashboard")
+def billing_dashboard(period: str, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
+    _check_period(period)
+    invs = db.query(BillingInvoice).filter(BillingInvoice.period == period).all()
+    frozen = db.query(BillingCustomer).filter(BillingCustomer.frozen == True).count()  # noqa: E712
+    return {
+        "period": period,
+        "invoice_count": len(invs),
+        "total_billed": sum(i.total for i in invs if i.status != "void"),
+        "total_unpaid": sum(i.total for i in invs if i.status == "unpaid"),
+        "total_paid": sum(i.total for i in invs if i.status == "paid"),
+        "frozen_count": frozen,
+    }

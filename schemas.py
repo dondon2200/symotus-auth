@@ -200,3 +200,29 @@ class SubscriptionResponse(BaseModel):
     plan_name: Optional[str] = None
     monthly_fee: int = 0
     status: str
+
+
+class InvoiceLineResponse(BaseModel):
+    id: int
+    camera_id: int
+    camera_name: Optional[str] = None
+    plan_name: Optional[str] = None
+    amount: int
+
+
+class InvoiceResponse(BaseModel):
+    id: int
+    customer_id: int
+    customer_name: Optional[str] = None
+    period: str
+    total: int
+    status: str
+    # 必須用 UtcDatetime（schemas.py:19 既有慣例），不可用裸 datetime：
+    # DB 存 naive UTC，裸 datetime 序列化後不帶時區 offset，前端 new Date() 會當成
+    # 本地時間，顯示慢 8 小時。
+    issued_at: Optional[UtcDatetime] = None
+    paid_at: Optional[UtcDatetime] = None
+
+
+class InvoiceDetailResponse(InvoiceResponse):
+    lines: list[InvoiceLineResponse] = []
