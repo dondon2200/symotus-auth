@@ -234,7 +234,9 @@ app.include_router(users.router)
 app.include_router(support.router)
 app.include_router(admin.router)
 app.include_router(jobs.router)
-app.include_router(billing.router)  # 必須在 cameras 前（避免 /{camera_id} catch-all 攔截）
+app.include_router(billing.router)  # 前綴 /billing 與 cameras 的 /cameras 不相交，順序對兩者無影響；
+                                     # 真正要留意的是 billing router 內部 /invoices/my 需先於
+                                     # /invoices/{invoice_id}，見 tests/test_billing_route_order.py
 app.include_router(public_camera.router)  # 必須在 cameras 前（避免 /{camera_id}/{path} catch-all 攔截）
 app.include_router(cameras.router)
 app.include_router(line_webhook.router)
