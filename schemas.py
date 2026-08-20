@@ -147,3 +147,25 @@ class TokenPayload(BaseModel):
     reseller_id: Optional[int] = None
     camera_ids: Optional[List[int]] = None  # end_user 可存取的相機 IDs
     tech_support_until: Optional[str] = None  # symotus_admin 獲得的臨時授權到期時間
+
+
+# ── Billing ──────────────────────────────────────────────────────
+class PlanCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    monthly_fee: int = 0
+    timelapse_quota_secs: int = 0
+    storage_quota_gb: int = 0
+
+
+class PlanResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    monthly_fee: int
+    timelapse_quota_secs: int
+    storage_quota_gb: int
+    is_active: bool
+
+    class Config:
+        from_attributes = True
