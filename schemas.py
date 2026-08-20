@@ -189,7 +189,14 @@ class CustomerUpdate(BaseModel):
     statement_day: Optional[int] = Field(None, ge=1, le=28)
     custom_monthly_fee: Optional[int] = Field(None, ge=0)
     commission_type: Optional[Literal["percent", "fixed"]] = None
-    commission_value: Optional[int] = Field(None, ge=0)
+    # commission_value 以萬分比（bps）儲存：percent 型別時 10000 = 100%。
+    # 上限 10000 同時套用到 fixed 型別（等於固定分潤最多 10000 元）——這是
+    # 單一欄位承載兩種單位的必然取捨：percent 需要「不超過 100%」的保護，
+    # 而 fixed 目前的常見情境都在 10000 元以內，故共用同一上限。
+    # 日後若真的需要更高的固定分潤金額，應該拆成兩個獨立欄位（例如
+    # commission_percent_bps / commission_fixed_amount），而不是放寬這個
+    # 上限——放寬會讓 percent 失去「不超過 100%」的保護。
+    commission_value: Optional[int] = Field(None, ge=0, le=10000)
 
 
 class CustomerResponse(BaseModel):
@@ -205,6 +212,7 @@ class CustomerResponse(BaseModel):
     custom_monthly_fee: Optional[int] = None
     commission_type: Optional[str] = None
     commission_value: Optional[int] = None
+    commission_display: str = ""
 
 
 class SubscriptionCreate(BaseModel):
@@ -257,6 +265,7 @@ class CommissionRowResponse(BaseModel):
     commission_type: str
     commission_value: int
     commission_amount: int      # 實際要付給經銷商的金額
+    commission_display: str = ""
 
 
 class MySubscriptionResponse(BaseModel):

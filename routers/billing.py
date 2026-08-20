@@ -30,7 +30,7 @@ from auth import require_role, get_current_user
 from audit import log_action
 from services.billing_calc import (
     invoice_total, quota_state, period_of, period_bounds_utc, effective_monthly_fee,
-    commission_amount,
+    commission_amount, commission_display,
 )
 
 router = APIRouter(prefix="/billing", tags=["billing"])
@@ -148,6 +148,7 @@ def list_customers(
             custom_monthly_fee=c.custom_monthly_fee if c else None,
             commission_type=c.commission_type if c else None,
             commission_value=c.commission_value if c else None,
+            commission_display=commission_display(c.commission_type, c.commission_value) if c else "",
         ))
     return out
 
@@ -170,13 +171,17 @@ def update_customer(
                   "custom_monthly_fee", "commission_type", "commission_value"):
         if field in data:
             setattr(c, field, data[field])
-    log_action(db, current_user, "billing_update_customer", "billing_customer", user_id)
+    # 稽核日誌記人看得懂的顯示字串（如 "12.5%"），而不是原始 bps 數字——
+    # 原始數字被人讀的時候，1250 會被誤讀成 1250%。
+    log_action(db, current_user, "billing_update_customer", "billing_customer", user_id,
+               commission_display(c.commission_type, c.commission_value))
     db.commit(); db.refresh(c)
     return CustomerResponse(user_id=u.id, username=u.username, email=u.email, role=u.role,
                             billing_day=c.billing_day, frozen=c.frozen, note=c.note,
                             payment_method=c.payment_method, statement_day=c.statement_day,
                             custom_monthly_fee=c.custom_monthly_fee,
-                            commission_type=c.commission_type, commission_value=c.commission_value)
+                            commission_type=c.commission_type, commission_value=c.commission_value,
+                            commission_display=commission_display(c.commission_type, c.commission_value))
 
 
 @router.post("/admin/customers/{user_id}/freeze")
@@ -503,6 +508,7 @@ def list_commissions(period: str, db: Session = Depends(get_db), current_user: U
             period=period, invoice_total=base,
             commission_type=c.commission_type, commission_value=c.commission_value,
             commission_amount=amount,
+            commission_display=commission_display(c.commission_type, c.commission_value),
         ))
     return out
 
