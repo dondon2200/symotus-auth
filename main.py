@@ -221,13 +221,15 @@ async def startup():
                         conn.rollback()
                         logger.warning(f"billing_customers 補欄位 {col}（SET NOT NULL）失敗：{e}")
 
-            # custom_monthly_fee / commission_type / commission_value 在 models.py
-            # 皆為 nullable=True，維持原本單純 ADD COLUMN 即可。
+            # custom_monthly_fee / commission_type / commission_percent_bps /
+            # commission_fixed_amount 在 models.py 皆為 nullable=True，維持原本
+            # 單純 ADD COLUMN 即可。
             with engine.connect() as conn:
                 for col, typ in [
                     ("custom_monthly_fee", "INTEGER"),
                     ("commission_type", "TEXT"),
-                    ("commission_value", "INTEGER"),
+                    ("commission_percent_bps", "INTEGER"),
+                    ("commission_fixed_amount", "INTEGER"),
                 ]:
                     try:
                         conn.execute(text(f"ALTER TABLE billing_customers ADD COLUMN IF NOT EXISTS {col} {typ}"))
@@ -243,7 +245,8 @@ async def startup():
                 try:
                     conn.execute(text(
                         "SELECT payment_method, statement_day, custom_monthly_fee, "
-                        "commission_type, commission_value FROM billing_customers LIMIT 1"
+                        "commission_type, commission_percent_bps, commission_fixed_amount "
+                        "FROM billing_customers LIMIT 1"
                     ))
                 except Exception as e:
                     logger.error(

@@ -257,8 +257,11 @@ class BillingCustomer(Base):
     # NULL = 未設定（用方案月費）；0 是有效值（談成免費），兩者語意不同。
     custom_monthly_fee = Column(Integer, nullable=True)
     # 分潤不進發票（設計決定：另列應付），只用於 /admin/commissions 報表。
-    commission_type = Column(String, nullable=True)   # percent | fixed
-    commission_value = Column(Integer, nullable=True)  # percent 時為百分比、fixed 時為 TWD
+    # 兩個數值欄位各自獨立驗證上限，避免共用欄位時 percent 的「不超過 100%」
+    # 保護把 fixed 綁死在 10000 元；只讀 commission_type 對應的那一個。
+    commission_type = Column(String, nullable=True)          # percent | fixed
+    commission_percent_bps = Column(Integer, nullable=True)  # 萬分比：1250 = 12.5%
+    commission_fixed_amount = Column(Integer, nullable=True) # TWD 整數
 
 
 class BillingSubscription(Base):

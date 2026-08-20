@@ -82,41 +82,60 @@ def effective_monthly_fee(plan_fee: int, custom_fee: Optional[int]) -> int:
 # 為什麼不用浮點數存百分比：分潤金額是要真的付出去的錢，二進位浮點數會有分位誤差。
 # 整數 bps 讓輸入→儲存→計算→顯示全程沒有浮點數參與。
 BPS_PER_PERCENT = 100
-MAX_COMMISSION_BPS = 10000  # 100%
+
+# 分潤的兩個數值欄位各自獨立驗證，不再共用一個 commission_value：
+# - percent 用萬分比（bps），上限 10000（100%）
+# - fixed 是 TWD 金額，上限一千萬（足夠任何合約，也還擋得住手殘多打幾個零）
+# 拆開的理由：共用欄位時 percent 的「不得超過 100%」保護會把 fixed 綁死在 10000 元，
+# 而且只改 commission_type 不改數值會讓單位錯亂（NT$500 被當成 5%）。
+MAX_COMMISSION_BPS = 10000
+MAX_COMMISSION_FIXED = 10_000_000
 
 
-def commission_amount(base: int, commission_type: Optional[str], commission_value: Optional[int]) -> int:
+def commission_amount(
+    base: int,
+    commission_type: Optional[str],
+    percent_bps: Optional[int],
+    fixed_amount: Optional[int],
+) -> int:
     """分潤金額（TWD 整數）。
 
-    分潤不進發票（設計決定：另列應付），這裡只負責算出「要付給經銷商多少」。
-    percent 型別的 commission_value 是 bps（萬分比）；用 Decimal ROUND_HALF_UP
-    四捨五入到元——Python 內建 round() 是 banker's rounding，.5 會一半進一半捨，
-    帳務上不可預期。
+    分潤不進發票（設計決定：另列應付），這裡只算「要付給經銷商多少」。
+    只讀 commission_type 對應的那個欄位，另一個欄位有值也不看——
+    避免改型別時殘留的舊數值被拿去算。
+    percent 用 Decimal ROUND_HALF_UP 四捨五入到元（Python 內建 round() 是
+    banker's rounding，.5 會一半進一半捨，帳務上不可預期）。
     """
-    if not commission_type or commission_value is None:
-        return 0
     if commission_type == "fixed":
-        return int(commission_value)
+        return int(fixed_amount) if fixed_amount is not None else 0
     if commission_type == "percent":
+        if percent_bps is None:
+            return 0
         return int(
-            (Decimal(base) * Decimal(commission_value) / Decimal(10000))
+            (Decimal(base) * Decimal(percent_bps) / Decimal(10000))
             .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
         )
-    return 0  # 未知類型不猜
+    return 0  # 未設或未知類型不猜
 
 
-def commission_display(commission_type: Optional[str], commission_value: Optional[int]) -> str:
+def commission_display(
+    commission_type: Optional[str],
+    percent_bps: Optional[int],
+    fixed_amount: Optional[int],
+) -> str:
     """人看的分潤條件字串。
 
     bps 對人類不直觀（1250 容易被誤讀成 1250%），報表與稽核日誌一律帶這個字串，
-    避免有人照著 commission_value 的數字做決策。
+    避免有人照著 percent_bps 的數字做決策。只讀 commission_type 對應的那個欄位。
     """
-    if not commission_type or commission_value is None:
-        return ""
     if commission_type == "fixed":
-        return f"NT$ {commission_value:,}"
+        if fixed_amount is None:
+            return ""
+        return f"NT$ {fixed_amount:,}"
     if commission_type == "percent":
-        pct = Decimal(commission_value) / Decimal(BPS_PER_PERCENT)
+        if percent_bps is None:
+            return ""
+        pct = Decimal(percent_bps) / Decimal(BPS_PER_PERCENT)
         # normalize() 去掉尾端多餘的零（15.00 → 15），但要避免用到科學記號
         text = format(pct.normalize(), "f")
         return f"{text}%"

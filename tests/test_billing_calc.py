@@ -91,77 +91,63 @@ def test_自訂月費為零是有效值不是未設定():
     assert effective_monthly_fee(1200, 0) == 0
 
 
-def test_百分比分潤以萬分比儲存():
-    # 1500 bps = 15%
-    assert commission_amount(10000, "percent", 1500) == 1500
+def test_百分比分潤以萬分比計算():
+    assert commission_amount(10000, "percent", 1500, None) == 1500
 
 
 def test_小數百分比():
-    # 1250 bps = 12.5%
-    assert commission_amount(10000, "percent", 1250) == 1250
-    # 725 bps = 7.25%
-    assert commission_amount(10000, "percent", 725) == 725
+    assert commission_amount(10000, "percent", 1250, None) == 1250
+    assert commission_amount(10000, "percent", 725, None) == 725
 
 
 def test_最小精度為萬分之一():
-    # 1 bps = 0.01%
-    assert commission_amount(1000000, "percent", 1) == 100
+    assert commission_amount(1000000, "percent", 1, None) == 100
 
 
 def test_四捨五入到整數元():
-    # 3333 * 12.5% = 416.625 → 417
-    assert commission_amount(3333, "percent", 1250) == 417
-    # 3333 * 10% = 333.3 → 333
-    assert commission_amount(3333, "percent", 1000) == 333
-    # 剛好 .5 必須進位（ROUND_HALF_UP），不是 banker's rounding
-    # 10 * 5% = 0.5 → 1
-    assert commission_amount(10, "percent", 500) == 1
+    assert commission_amount(3333, "percent", 1250, None) == 417
+    assert commission_amount(3333, "percent", 1000, None) == 333
+    assert commission_amount(10, "percent", 500, None) == 1
 
 
-def test_固定金額分潤不受單位改變影響():
-    assert commission_amount(10000, "fixed", 2000) == 2000
-    assert commission_amount(0, "fixed", 2000) == 2000
+def test_固定金額分潤與基數無關():
+    assert commission_amount(10000, "fixed", None, 2000) == 2000
+    assert commission_amount(0, "fixed", None, 2000) == 2000
+
+
+def test_固定金額可以超過一萬元():
+    # 這正是拆欄位要解除的限制
+    assert commission_amount(0, "fixed", None, 50000) == 50000
+
+
+def test_只看type對應的那個欄位():
+    # percent 型別不該去看 fixed 欄位，反之亦然——這是拆欄位後最重要的保證
+    assert commission_amount(10000, "percent", 1500, 99999) == 1500
+    assert commission_amount(10000, "fixed", 9999, 2000) == 2000
+
+
+def test_type對應的欄位是None時為零():
+    assert commission_amount(10000, "percent", None, 5000) == 0
+    assert commission_amount(10000, "fixed", 1500, None) == 0
 
 
 def test_未設分潤時為零():
-    assert commission_amount(10000, None, None) == 0
-    assert commission_amount(10000, "percent", None) == 0
-    assert commission_amount(10000, None, 1500) == 0
+    assert commission_amount(10000, None, None, None) == 0
+    assert commission_amount(10000, None, 1500, 2000) == 0
 
 
 def test_未知分潤類型回零而不是猜():
-    assert commission_amount(10000, "unknown_type", 1500) == 0
+    assert commission_amount(10000, "unknown_type", 1500, 2000) == 0
 
 
-def test_百分比分潤基數為零時為零():
-    assert commission_amount(0, "percent", 1500) == 0
-
-
-def test_顯示字串把萬分比還原成百分比():
-    assert commission_display("percent", 1500) == "15%"
-    assert commission_display("percent", 1250) == "12.5%"
-    assert commission_display("percent", 725) == "7.25%"
-    assert commission_display("percent", 1) == "0.01%"
-
-
-def test_顯示字串不留多餘的零():
-    # 15% 不該顯示成 15.00%
-    assert commission_display("percent", 1500) == "15%"
-    assert commission_display("percent", 1200) == "12%"
-
-
-def test_固定金額的顯示字串():
-    assert commission_display("fixed", 500) == "NT$ 500"
-    assert commission_display("fixed", 12000) == "NT$ 12,000"
-
-
-def test_未設分潤的顯示字串為空():
-    assert commission_display(None, None) == ""
-    assert commission_display("percent", None) == ""
-
-
-def test_顯示字串不落入科學記號陷阱():
-    # Decimal.normalize() 在整數值上會產生 1E+1 / 1E+2 這種科學記號，
-    # 若沒有用 format(..., "f") 轉回一般記數法，10%/100% 會顯示成 "1E+1%"。
-    assert commission_display("percent", 1000) == "10%"
-    assert commission_display("percent", 10000) == "100%"
+def test_顯示字串():
+    assert commission_display("percent", 1500, None) == "15%"
+    assert commission_display("percent", 1250, None) == "12.5%"
+    assert commission_display("percent", 1, None) == "0.01%"
+    assert commission_display("percent", 1000, None) == "10%"    # 科學記號邊界
+    assert commission_display("percent", 10000, None) == "100%"  # 科學記號邊界
+    assert commission_display("fixed", None, 500) == "NT$ 500"
+    assert commission_display("fixed", None, 50000) == "NT$ 50,000"
+    assert commission_display(None, None, None) == ""
+    assert commission_display("percent", None, None) == ""
+    assert commission_display("fixed", None, None) == ""

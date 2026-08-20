@@ -49,7 +49,7 @@ def billed(client, admin, reseller, auth_headers, db):
 
 def test_百分比分潤(client, billed, reseller):
     client.put(f"/billing/admin/customers/{reseller.id}", headers=billed,
-               json={"commission_type": "percent", "commission_value": 1500})
+               json={"commission_type": "percent", "commission_percent_bps": 1500})
     rows = client.get(f"/billing/admin/commissions?period={PERIOD}", headers=billed).json()
     row = [r for r in rows if r["customer_id"] == reseller.id][0]
     assert row["invoice_total"] == 1000
@@ -58,14 +58,14 @@ def test_百分比分潤(client, billed, reseller):
 
 def test_固定金額分潤(client, billed, reseller):
     client.put(f"/billing/admin/customers/{reseller.id}", headers=billed,
-               json={"commission_type": "fixed", "commission_value": 300})
+               json={"commission_type": "fixed", "commission_fixed_amount": 300})
     rows = client.get(f"/billing/admin/commissions?period={PERIOD}", headers=billed).json()
     assert [r for r in rows if r["customer_id"] == reseller.id][0]["commission_amount"] == 300
 
 
 def test_分潤不影響發票金額(client, billed, reseller):
     client.put(f"/billing/admin/customers/{reseller.id}", headers=billed,
-               json={"commission_type": "percent", "commission_value": 1500})
+               json={"commission_type": "percent", "commission_percent_bps": 1500})
     inv = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=billed).json()[0]
     assert inv["total"] == 1000   # 照定價開，沒有被扣掉分潤
 
@@ -77,7 +77,7 @@ def test_未設分潤的客戶不出現在報表(client, billed, reseller):
 
 def test_作廢的發票不計入分潤基數(client, billed, reseller):
     client.put(f"/billing/admin/customers/{reseller.id}", headers=billed,
-               json={"commission_type": "percent", "commission_value": 1500})
+               json={"commission_type": "percent", "commission_percent_bps": 1500})
     inv = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=billed).json()[0]
     client.post(f"/billing/admin/invoices/{inv['id']}/void", headers=billed)
 
@@ -104,7 +104,7 @@ def test_reseller不能看分潤報表(client, reseller, auth_headers, billed):
 def test_小數分潤的報表金額(client, billed, reseller):
     # 1000 元的發票、12.5% 分潤 → 125 元
     client.put(f"/billing/admin/customers/{reseller.id}", headers=billed,
-               json={"commission_type": "percent", "commission_value": 1250})
+               json={"commission_type": "percent", "commission_percent_bps": 1250})
     rows = client.get(f"/billing/admin/commissions?period={PERIOD}", headers=billed).json()
     row = [r for r in rows if r["customer_id"] == reseller.id][0]
     assert row["commission_amount"] == 125

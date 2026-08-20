@@ -186,14 +186,15 @@ def test_客戶條件的預設值(client, admin, reseller, auth_headers):
     assert me["statement_day"] == 1
     assert me["custom_monthly_fee"] is None             # None = 用方案月費
     assert me["commission_type"] is None
-    assert me["commission_value"] is None
+    assert me["commission_percent_bps"] is None
+    assert me["commission_fixed_amount"] is None
 
 
 def test_更新客戶條件(client, admin, reseller, auth_headers):
     h = auth_headers(admin)
     r = client.put(f"/billing/admin/customers/{reseller.id}", headers=h, json={
         "payment_method": "credit_card", "statement_day": 25,
-        "custom_monthly_fee": 800, "commission_type": "percent", "commission_value": 1500,
+        "custom_monthly_fee": 800, "commission_type": "percent", "commission_percent_bps": 1500,
     })
     assert r.status_code == 200
     body = r.json()
@@ -201,13 +202,13 @@ def test_更新客戶條件(client, admin, reseller, auth_headers):
     assert body["statement_day"] == 25
     assert body["custom_monthly_fee"] == 800
     assert body["commission_type"] == "percent"
-    assert body["commission_value"] == 1500
+    assert body["commission_percent_bps"] == 1500
 
 
 def test_局部更新不會清掉沒帶的欄位(client, admin, reseller, auth_headers):
     h = auth_headers(admin)
     client.put(f"/billing/admin/customers/{reseller.id}", headers=h,
-               json={"custom_monthly_fee": 800, "commission_type": "fixed", "commission_value": 500})
+               json={"custom_monthly_fee": 800, "commission_type": "fixed", "commission_fixed_amount": 500})
     # 只改收款日，其他條件必須留著
     client.put(f"/billing/admin/customers/{reseller.id}", headers=h, json={"billing_day": 10})
     me = [c for c in client.get("/billing/admin/customers", headers=h).json()
@@ -215,7 +216,7 @@ def test_局部更新不會清掉沒帶的欄位(client, admin, reseller, auth_h
     assert me["billing_day"] == 10
     assert me["custom_monthly_fee"] == 800
     assert me["commission_type"] == "fixed"
-    assert me["commission_value"] == 500
+    assert me["commission_fixed_amount"] == 500
 
 
 def test_自訂月費可設為零(client, admin, reseller, auth_headers):
@@ -247,7 +248,7 @@ def test_分潤類型只接受已知值(client, admin, reseller, auth_headers):
 
 def test_分潤數值不可為負(client, admin, reseller, auth_headers):
     r = client.put(f"/billing/admin/customers/{reseller.id}",
-                   headers=auth_headers(admin), json={"commission_type": "percent", "commission_value": -5})
+                   headers=auth_headers(admin), json={"commission_type": "percent", "commission_percent_bps": -5})
     assert r.status_code == 422
 
 
@@ -255,21 +256,21 @@ def test_分潤上限為一萬bps(client, admin, reseller, auth_headers):
     h = auth_headers(admin)
     # 10000 bps = 100%，是合法上限
     ok = client.put(f"/billing/admin/customers/{reseller.id}", headers=h,
-                    json={"commission_type": "percent", "commission_value": 10000})
+                    json={"commission_type": "percent", "commission_percent_bps": 10000})
     assert ok.status_code == 200
     # 超過 100% 沒有商業意義，應該被擋下
     bad = client.put(f"/billing/admin/customers/{reseller.id}", headers=h,
-                     json={"commission_type": "percent", "commission_value": 10001})
+                     json={"commission_type": "percent", "commission_percent_bps": 10001})
     assert bad.status_code == 422
 
 
 def test_客戶回應帶人看得懂的分潤字串(client, admin, reseller, auth_headers):
     h = auth_headers(admin)
     client.put(f"/billing/admin/customers/{reseller.id}", headers=h,
-               json={"commission_type": "percent", "commission_value": 1250})
+               json={"commission_type": "percent", "commission_percent_bps": 1250})
     me = [c for c in client.get("/billing/admin/customers", headers=h).json()
           if c["user_id"] == reseller.id][0]
-    assert me["commission_value"] == 1250
+    assert me["commission_percent_bps"] == 1250
     assert me["commission_display"] == "12.5%"
 
 

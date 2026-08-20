@@ -189,33 +189,45 @@ class CustomerUpdate(BaseModel):
     statement_day: Optional[int] = Field(None, ge=1, le=28)
     custom_monthly_fee: Optional[int] = Field(None, ge=0)
     commission_type: Optional[Literal["percent", "fixed"]] = None
-    # commission_value 以萬分比（bps）儲存：percent 型別時 10000 = 100%。
-    # 上限 10000 同時套用到 fixed 型別（等於固定分潤最多 10000 元）——這是
-    # 單一欄位承載兩種單位的必然取捨：percent 需要「不超過 100%」的保護，
-    # 而 fixed 目前的常見情境都在 10000 元以內，故共用同一上限。
-    # 日後若真的需要更高的固定分潤金額，應該拆成兩個獨立欄位（例如
-    # commission_percent_bps / commission_fixed_amount），而不是放寬這個
-    # 上限——放寬會讓 percent 失去「不超過 100%」的保護。
-    commission_value: Optional[int] = Field(None, ge=0, le=10000)
+    # 分潤拆成兩個獨立欄位，各自的單位與上限不再互相牽制：
+    # - commission_percent_bps 是萬分比（bps），percent 型別時 10000 = 100%
+    # - commission_fixed_amount 是 TWD 整數金額，上限一千萬
+    commission_percent_bps: Optional[int] = Field(None, ge=0, le=10000)
+    commission_fixed_amount: Optional[int] = Field(None, ge=0, le=10_000_000)
 
     @model_validator(mode="after")
-    def _commission_type_and_value_together(self) -> "CustomerUpdate":
-        """commission_type 和 commission_value 的單位是綁在一起的（type 決定 value
-        該解讀成百分比 bps 還是 TWD 金額），所以兩者必須「一起帶」或「都不帶」，
-        不能只改其中一個。
+    def _commission_type_matches_value(self) -> "CustomerUpdate":
+        """commission_type 決定該讀哪一個數值欄位，兩者必須配對，不能單位錯亂。
+
+        規則：
+        - type="percent" 時，commission_percent_bps 必須同時有值。
+        - type="fixed" 時，commission_fixed_amount 必須同時有值。
+        - type=None（清除分潤）時，兩個數值欄位都不該有值，否則會留下對不上
+          型別的孤兒數值。
+        - 只送數值欄位而不送 commission_type 時，這裡看不到客戶目前已存的
+          型別，交給 router 層依既有型別檢查是否對得上。
 
         用 model_fields_set 判斷「這個請求裡有沒有帶這個 key」，而不是看值是不是
-        None——commission_type/commission_value 兩者都允許明確傳 null 來清除設定，
-        若改用 `value is None` 判斷會把「沒帶」和「帶了 null」混為一談。
+        None——這幾個欄位都允許明確傳 null 來清除設定，若改用 `value is None`
+        判斷會把「沒帶」和「帶了 null」混為一談。
         """
         fields = self.model_fields_set
         type_sent = "commission_type" in fields
-        value_sent = "commission_value" in fields
-        if type_sent != value_sent:
-            raise ValueError("commission_type 與 commission_value 必須一起設定（兩者單位互相依賴），不能只改其中一個")
-        # 兩者都有帶：type 若設為非 null，value 就不能是 null（沒有分潤數值）
-        if type_sent and self.commission_type is not None and self.commission_value is None:
-            raise ValueError("commission_type 有值時，commission_value 不可為 null")
+        if not type_sent:
+            return self
+        if self.commission_type == "percent":
+            if self.commission_percent_bps is None:
+                raise ValueError("commission_type 為 percent 時，commission_percent_bps 不可為 null")
+            if "commission_fixed_amount" in fields and self.commission_fixed_amount is not None:
+                raise ValueError("commission_type 為 percent 時，不可同時設定 commission_fixed_amount")
+        elif self.commission_type == "fixed":
+            if self.commission_fixed_amount is None:
+                raise ValueError("commission_type 為 fixed 時，commission_fixed_amount 不可為 null")
+            if "commission_percent_bps" in fields and self.commission_percent_bps is not None:
+                raise ValueError("commission_type 為 fixed 時，不可同時設定 commission_percent_bps")
+        else:  # commission_type 明確傳 null：清除分潤，兩個數值欄位都不該有值
+            if self.commission_percent_bps is not None or self.commission_fixed_amount is not None:
+                raise ValueError("commission_type 為 null 時，不可同時設定分潤數值欄位")
         return self
 
 
@@ -231,7 +243,8 @@ class CustomerResponse(BaseModel):
     statement_day: int
     custom_monthly_fee: Optional[int] = None
     commission_type: Optional[str] = None
-    commission_value: Optional[int] = None
+    commission_percent_bps: Optional[int] = None
+    commission_fixed_amount: Optional[int] = None
     commission_display: str = ""
 
 
@@ -283,7 +296,8 @@ class CommissionRowResponse(BaseModel):
     period: str
     invoice_total: int          # 該期別非作廢發票的總額（分潤基數）
     commission_type: str
-    commission_value: int
+    commission_percent_bps: Optional[int] = None
+    commission_fixed_amount: Optional[int] = None
     commission_amount: int      # 實際要付給經銷商的金額
     commission_display: str = ""
 

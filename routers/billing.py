@@ -147,8 +147,11 @@ def list_customers(
             statement_day=c.statement_day if c else 1,
             custom_monthly_fee=c.custom_monthly_fee if c else None,
             commission_type=c.commission_type if c else None,
-            commission_value=c.commission_value if c else None,
-            commission_display=commission_display(c.commission_type, c.commission_value) if c else "",
+            commission_percent_bps=c.commission_percent_bps if c else None,
+            commission_fixed_amount=c.commission_fixed_amount if c else None,
+            commission_display=commission_display(
+                c.commission_type, c.commission_percent_bps, c.commission_fixed_amount
+            ) if c else "",
         ))
     return out
 
@@ -179,22 +182,40 @@ def update_customer(
     for field in fields_set & _NOT_NULL_CUSTOMER_FIELDS:
         if data.get(field) is None:
             raise HTTPException(422, f"{field} 不可清空為 null（此欄位不允許為空）")
+    # 只送數值欄位（commission_percent_bps / commission_fixed_amount）而不送
+    # commission_type 時，schema 層看不到客戶目前已存的型別，這裡用客戶現有的
+    # commission_type 判斷數值有沒有送錯欄位——避免看似合法的單一欄位更新，
+    # 實際上把數值寫進與目前型別不符的欄位（單位錯亂）。
+    if "commission_type" not in fields_set:
+        if "commission_percent_bps" in fields_set and c.commission_type != "percent":
+            raise HTTPException(422, "未設定 commission_type 為 percent 時，不可更新 commission_percent_bps")
+        if "commission_fixed_amount" in fields_set and c.commission_type != "fixed":
+            raise HTTPException(422, "未設定 commission_type 為 fixed 時，不可更新 commission_fixed_amount")
     for field in ("billing_day", "note", "payment_method", "statement_day",
-                  "custom_monthly_fee", "commission_type", "commission_value"):
+                  "custom_monthly_fee", "commission_type",
+                  "commission_percent_bps", "commission_fixed_amount"):
         if field in data:
             setattr(c, field, data[field])
     # 稽核日誌只在分潤欄位真的有被這次請求改動時才附上分潤顯示字串，
     # 避免日誌內容誤導成「這次操作有動到分潤」——即使值沒變。
-    commission_changed = bool(fields_set & {"commission_type", "commission_value"})
-    detail = commission_display(c.commission_type, c.commission_value) if commission_changed else ""
+    commission_changed = bool(
+        fields_set & {"commission_type", "commission_percent_bps", "commission_fixed_amount"}
+    )
+    detail = commission_display(
+        c.commission_type, c.commission_percent_bps, c.commission_fixed_amount
+    ) if commission_changed else ""
     log_action(db, current_user, "billing_update_customer", "billing_customer", user_id, detail)
     db.commit(); db.refresh(c)
     return CustomerResponse(user_id=u.id, username=u.username, email=u.email, role=u.role,
                             billing_day=c.billing_day, frozen=c.frozen, note=c.note,
                             payment_method=c.payment_method, statement_day=c.statement_day,
                             custom_monthly_fee=c.custom_monthly_fee,
-                            commission_type=c.commission_type, commission_value=c.commission_value,
-                            commission_display=commission_display(c.commission_type, c.commission_value))
+                            commission_type=c.commission_type,
+                            commission_percent_bps=c.commission_percent_bps,
+                            commission_fixed_amount=c.commission_fixed_amount,
+                            commission_display=commission_display(
+                                c.commission_type, c.commission_percent_bps, c.commission_fixed_amount
+                            ))
 
 
 @router.post("/admin/customers/{user_id}/freeze")
@@ -528,13 +549,17 @@ def list_commissions(period: str, db: Session = Depends(get_db), current_user: U
     out = []
     for c in customers:
         base = totals.get(c.user_id, 0)
-        amount = commission_amount(base, c.commission_type, c.commission_value)
+        amount = commission_amount(base, c.commission_type, c.commission_percent_bps, c.commission_fixed_amount)
         out.append(CommissionRowResponse(
             customer_id=c.user_id, customer_name=names.get(c.user_id),
             period=period, invoice_total=base,
-            commission_type=c.commission_type, commission_value=c.commission_value,
+            commission_type=c.commission_type,
+            commission_percent_bps=c.commission_percent_bps,
+            commission_fixed_amount=c.commission_fixed_amount,
             commission_amount=amount,
-            commission_display=commission_display(c.commission_type, c.commission_value),
+            commission_display=commission_display(
+                c.commission_type, c.commission_percent_bps, c.commission_fixed_amount
+            ),
         ))
     return out
 
