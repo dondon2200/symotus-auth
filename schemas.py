@@ -226,3 +226,21 @@ class InvoiceResponse(BaseModel):
 
 class InvoiceDetailResponse(InvoiceResponse):
     lines: list[InvoiceLineResponse] = []
+
+
+class MySubscriptionResponse(BaseModel):
+    id: int
+    camera_id: int
+    plan_name: Optional[str] = None
+    monthly_fee: int
+    status: str
+
+
+class MyQuotaResponse(BaseModel):
+    camera_id: int
+    period: str
+    timelapse_used_secs: int
+    timelapse_total_secs: int
+    storage_used_gb: float
+    storage_total_gb: int
+    state: str  # ok | warned | suspended

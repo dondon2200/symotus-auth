@@ -9,20 +9,25 @@ import re
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import User, BillingPlan, BillingCustomer, BillingSubscription, BillingInvoice, BillingInvoiceLine
+from models import (
+    User, BillingPlan, BillingCustomer, BillingSubscription, BillingInvoice, BillingInvoiceLine,
+    BillingUsageDaily,
+)
 from schemas import (
     PlanCreate, PlanResponse,
     CustomerUpdate, CustomerResponse,
     SubscriptionCreate, SubscriptionResponse,
     InvoiceResponse, InvoiceLineResponse, InvoiceDetailResponse,
+    MySubscriptionResponse, MyQuotaResponse,
 )
-from auth import require_role
+from auth import require_role, get_current_user
 from audit import log_action
-from services.billing_calc import invoice_total
+from services.billing_calc import invoice_total, quota_state, period_of
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -386,3 +391,75 @@ def billing_dashboard(period: str, db: Session = Depends(get_db), current_user: 
         "total_paid": sum(i.total for i in invs if i.status == "paid"),
         "frozen_count": frozen,
     }
+
+
+# ── 經銷商自助端點（spec §6：/billing/*/my 只回 current_user 自己的資料） ──
+
+@router.get("/subscriptions/my", response_model=list[MySubscriptionResponse])
+def my_subscriptions(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    subs = db.query(BillingSubscription).filter(
+        BillingSubscription.customer_id == current_user.id,
+        BillingSubscription.status == "active",
+    ).order_by(BillingSubscription.id).all()
+    plans = {p.id: p for p in db.query(BillingPlan).all()}
+    return [
+        MySubscriptionResponse(
+            id=s.id, camera_id=s.camera_id,
+            plan_name=plans[s.plan_id].name if s.plan_id in plans else None,
+            monthly_fee=plans[s.plan_id].monthly_fee if s.plan_id in plans else 0,
+            status=s.status,
+        ) for s in subs
+    ]
+
+
+@router.get("/invoices/my", response_model=list[InvoiceResponse])
+def my_invoices(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    invs = db.query(BillingInvoice).filter(
+        BillingInvoice.customer_id == current_user.id,
+    ).order_by(BillingInvoice.period.desc()).all()
+    return [_invoice_response(i, current_user.username) for i in invs]
+
+
+@router.get("/quotas/my", response_model=list[MyQuotaResponse])
+def my_quotas(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """本期各相機用量 vs 配額。用量表在階段三才有資料，在此之前一律為 0。"""
+    period = period_of(datetime.utcnow())
+    subs = db.query(BillingSubscription).filter(
+        BillingSubscription.customer_id == current_user.id,
+        BillingSubscription.status == "active",
+    ).all()
+    plans = {p.id: p for p in db.query(BillingPlan).all()}
+
+    out = []
+    for s in subs:
+        plan = plans.get(s.plan_id)
+        used = db.query(
+            func.coalesce(func.sum(BillingUsageDaily.timelapse_secs), 0),
+            func.coalesce(func.sum(BillingUsageDaily.storage_gb), 0),
+        ).filter(
+            BillingUsageDaily.camera_id == s.camera_id,
+            BillingUsageDaily.date.like(f"{period}-%"),
+        ).one()
+        tl_used, st_used = int(used[0]), float(used[1])
+        tl_total = plan.timelapse_quota_secs if plan else 0
+        st_total = plan.storage_quota_gb if plan else 0
+        # 兩種配額取較嚴重的狀態
+        states = [quota_state(tl_used, tl_total), quota_state(st_used, st_total)]
+        state = "suspended" if "suspended" in states else ("warned" if "warned" in states else "ok")
+        out.append(MyQuotaResponse(
+            camera_id=s.camera_id, period=period,
+            timelapse_used_secs=tl_used, timelapse_total_secs=tl_total,
+            storage_used_gb=st_used, storage_total_gb=st_total, state=state,
+        ))
+    return out
+
+
+# 注意：這條必須放在 /invoices/my 之後定義，否則 "my" 會被當成 invoice_id 而回 422
+@router.get("/invoices/{invoice_id}", response_model=InvoiceDetailResponse)
+def my_invoice_detail(invoice_id: int, db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)):
+    inv = db.query(BillingInvoice).filter(BillingInvoice.id == invoice_id).first()
+    # 非自己的發票一律回 404（不是 403）：不洩漏「這張發票存在」這個資訊
+    if not inv or (inv.customer_id != current_user.id and current_user.role != "symotus_admin"):
+        raise HTTPException(404, "發票不存在")
+    return _build_invoice_detail(db, inv)
