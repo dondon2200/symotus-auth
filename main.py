@@ -194,8 +194,9 @@ async def startup():
                     try:
                         conn.execute(text(f"ALTER TABLE billing_customers ADD COLUMN IF NOT EXISTS {col} {typ}"))
                         conn.commit()
-                    except Exception:
+                    except Exception as e:
                         conn.rollback()
+                        logger.warning(f"billing_customers 補欄位 {col} 失敗：{e}")
 
             logger.info("DB connected and tables created!")
             # 種子功能權限政策（缺列才補，不覆蓋既有調整）

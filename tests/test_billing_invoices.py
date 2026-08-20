@@ -407,3 +407,34 @@ def test_兩張void發票可以共存(db):
     assert db.query(BillingInvoice).filter(
         BillingInvoice.customer_id == 1, BillingInvoice.period == "2026-08",
     ).count() == 2
+
+
+# ── Task 3：自訂月費進入發票 ──
+
+def test_自訂月費覆蓋方案月費(client, two_subs, reseller, auth_headers, admin, db):
+    h = two_subs
+    client.put(f"/billing/admin/customers/{reseller.id}", headers=h, json={"custom_monthly_fee": 500})
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=h)
+
+    inv = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=h).json()[0]
+    assert inv["total"] == 1000          # 兩台相機各 500，而不是 1200+800
+    detail = client.get(f"/billing/admin/invoices/{inv['id']}", headers=h).json()
+    assert [l["amount"] for l in detail["lines"]] == [500, 500]
+
+
+def test_自訂月費為零時整張發票為零(client, two_subs, reseller):
+    h = two_subs
+    client.put(f"/billing/admin/customers/{reseller.id}", headers=h, json={"custom_monthly_fee": 0})
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=h)
+    inv = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=h).json()[0]
+    assert inv["total"] == 0
+
+
+def test_自訂月費是開立當下的快照(client, two_subs, reseller):
+    h = two_subs
+    client.put(f"/billing/admin/customers/{reseller.id}", headers=h, json={"custom_monthly_fee": 500})
+    client.post(f"/billing/admin/invoices/generate/{PERIOD}", headers=h)
+    # 開票後改自訂月費，已開立的發票不得跟著變
+    client.put(f"/billing/admin/customers/{reseller.id}", headers=h, json={"custom_monthly_fee": 9999})
+    inv = client.get(f"/billing/admin/invoices?period={PERIOD}", headers=h).json()[0]
+    assert inv["total"] == 1000

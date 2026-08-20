@@ -27,7 +27,7 @@ from schemas import (
 )
 from auth import require_role, get_current_user
 from audit import log_action
-from services.billing_calc import invoice_total, quota_state, period_of, period_bounds_utc
+from services.billing_calc import invoice_total, quota_state, period_of, period_bounds_utc, effective_monthly_fee
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -342,6 +342,14 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
     for s in subs:
         by_customer.setdefault(s.customer_id, []).append(s)
 
+    # 一次撈出所有相關客戶的自訂月費設定，避免在下方迴圈內逐一查 DB
+    # （同檔 list_subscriptions／list_customers 的既有慣例）。
+    customer_configs = {
+        c.user_id: c for c in db.query(BillingCustomer).filter(
+            BillingCustomer.user_id.in_(by_customer.keys())
+        ).all()
+    }
+
     created = 0
     skipped_existing = 0  # 冪等跳過：這期已有非作廢發票，正常重跑行為，不是錯誤
     skipped_conflict = 0  # 真的撞到部分唯一索引：預查沒擋到、寫入當下才發現的並發衝突
@@ -358,6 +366,12 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
         if not line_data:
             continue
 
+        # 自訂月費覆蓋方案月費：custom_monthly_fee 為 None 代表沒談成客製價，
+        # 用方案原價；0 是合法值（談成免費），effective_monthly_fee 已處理這個判斷。
+        custom_fee = customer_configs.get(customer_id)
+        custom_fee = custom_fee.custom_monthly_fee if custom_fee else None
+        line_fees = [(s, p, effective_monthly_fee(p.monthly_fee, custom_fee)) for s, p in line_data]
+
         # 每個客戶各自一個 savepoint：舊版整批只 commit 一次，
         # 若某個客戶觸發部分唯一索引，rollback 會連同其他客戶「這次呼叫已建立
         # 但尚未提交」的發票與明細一起丟掉，卻仍回報成功。改成逐客戶 savepoint，
@@ -366,15 +380,16 @@ def generate_invoices(period: str, db: Session = Depends(get_db), current_user: 
             with db.begin_nested():
                 inv = BillingInvoice(
                     customer_id=customer_id, period=period,
-                    total=invoice_total([p.monthly_fee for _, p in line_data]),
+                    total=invoice_total([fee for _, _, fee in line_fees]),
                     status="unpaid",
                 )
                 db.add(inv); db.flush()   # 取得 inv.id 供明細使用
-                for s, p in line_data:
-                    # 快照：方案改價或相機改名之後，這張發票的內容不得跟著變
+                for s, p, fee in line_fees:
+                    # 快照：方案改價、相機改名、或事後調整自訂月費，
+                    # 都不得影響這張已開立發票的明細金額。
                     db.add(BillingInvoiceLine(
                         invoice_id=inv.id, subscription_id=s.id, camera_id=s.camera_id,
-                        camera_name=None, plan_name=p.name, amount=p.monthly_fee,
+                        camera_name=None, plan_name=p.name, amount=fee,
                     ))
         except IntegrityError:
             # 並發下另一個管理者同時產生了同一客戶＋期別的發票，
