@@ -6,10 +6,13 @@
 
 本檔前半是純函式（可完整單元測試），後半是 I/O。
 """
+import asyncio
 import logging
 import os
 from datetime import datetime, timedelta
 from typing import Optional
+
+import httpx
 
 from services.billing_calc import TAIPEI_OFFSET
 
@@ -51,7 +54,7 @@ def bytes_to_gb(n: int) -> float:
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models import TimelapsJob, BillingUsageDaily
+from models import TimelapsJob, BillingUsageDaily, BillingSubscription
 
 
 def collect_timelapse_secs(db: Session, day: str) -> dict[int, int]:
@@ -147,3 +150,72 @@ def collect_storage_gb(serial_id: str, base: str = NAS_BASE) -> float:
     if not serial_id:
         return 0.0
     return bytes_to_gb(dir_size_bytes(os.path.join(base, serial_id)))
+
+
+# ---- 每日採集流程：串起縮時秒數與 NAS 儲存，寫入 BillingUsageDaily ----
+
+# 採集用的 Camera Backend 帳號：解析 camera_id → device_serial_id 需要一個
+# 有全部相機可見度的帳號。未設定時跳過解析（已快取 serial 的相機仍可採集）。
+COLLECTOR_CAMERA_EMAIL = os.environ.get("BILLING_COLLECTOR_CAMERA_EMAIL", "")
+CAMERA_BACKEND_URL = "https://user.symotus.com"
+CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
+
+
+async def resolve_camera_serial(db: Session, sub: BillingSubscription) -> str:
+    """取得相機的 NAS 目錄名，並快取在訂閱列上。
+
+    已快取就直接回傳——每日採集不該為每台相機重複打 Camera Backend。
+    """
+    if sub.camera_serial:
+        return sub.camera_serial
+    if not COLLECTOR_CAMERA_EMAIL or not CAMERA_SERVICE_KEY:
+        logger.warning("billing usage: 未設定 BILLING_COLLECTOR_CAMERA_EMAIL/CAMERA_SERVICE_KEY，無法解析 serial")
+        return ""
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        tok = await client.post(
+            f"{CAMERA_BACKEND_URL}/internal/auth/token",
+            headers={"x-service-key": CAMERA_SERVICE_KEY},
+            json={"user_id": 0, "email": COLLECTOR_CAMERA_EMAIL, "role": "admin"},
+        )
+        if tok.status_code != 200:
+            return ""
+        token = tok.json().get("access_token", "")
+        r = await client.get(
+            f"{CAMERA_BACKEND_URL}/api/cameras/{sub.camera_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if r.status_code != 200:
+            return ""
+        data = r.json()
+        basic = data.get("basic_info", data)
+        serial = basic.get("device_serial_id") or basic.get("serial_id") or basic.get("serial") or ""
+
+    if serial:
+        sub.camera_serial = serial
+        db.commit()
+    return serial
+
+
+async def run_collection(db: Session, day: str) -> dict:
+    """採集指定日期（台北）的用量。回 {"day", "cameras", "failed"}。
+
+    單台相機失敗只記 log 並跳過——一台相機的 NAS 掛載問題不該讓當日整批採集消失。
+    """
+    secs_by_camera = collect_timelapse_secs(db, day)
+    subs = db.query(BillingSubscription).filter(BillingSubscription.status == "active").all()
+
+    ok, failed = 0, 0
+    for sub in subs:
+        try:
+            serial = await resolve_camera_serial(db, sub)
+            # 阻塞式 I/O 必須丟到 thread，否則會卡住整個 auth 的事件迴圈
+            gb = await asyncio.to_thread(collect_storage_gb, serial)
+            upsert_usage(db, sub.camera_id, day, secs_by_camera.get(sub.camera_id, 0), gb)
+            ok += 1
+        except Exception as e:
+            failed += 1
+            logger.warning(f"billing usage: 相機 {sub.camera_id} 採集失敗（{day}）：{e}")
+
+    logger.info(f"billing usage: {day} 採集完成，成功 {ok} 台、失敗 {failed} 台")
+    return {"day": day, "cameras": ok, "failed": failed}

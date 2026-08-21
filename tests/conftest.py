@@ -88,3 +88,8 @@ def auth_headers(db):
     def _headers(user):
         return {"Authorization": f"Bearer {create_access_token(user, db)}"}
     return _headers
+
+
+@pytest.fixture()
+def anyio_backend():
+    return "asyncio"

@@ -32,10 +32,13 @@ from services.billing_calc import (
     invoice_total, quota_state, period_of, period_bounds_utc, effective_monthly_fee,
     commission_amount, commission_display,
 )
+from services.billing_usage import run_collection
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
 ADMIN = require_role("symotus_admin")
+
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 @router.get("/admin/plans", response_model=list[PlanResponse])
@@ -654,3 +657,15 @@ def my_invoice_detail(invoice_id: int, db: Session = Depends(get_db),
     if not inv or (inv.customer_id != current_user.id and current_user.role != "symotus_admin"):
         raise HTTPException(404, "發票不存在")
     return _build_invoice_detail(db, inv)
+
+
+@router.post("/admin/usage/collect")
+async def collect_usage(date: str, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
+    """手動補跑某日的用量採集。每日排程失敗時的補救管道。"""
+    if not DATE_RE.match(date):
+        raise HTTPException(422, "日期格式須為 YYYY-MM-DD")
+    result = await run_collection(db, date)
+    log_action(db, current_user, "billing_collect_usage", "billing_usage", None,
+               f"date={date} ok={result['cameras']} failed={result['failed']}")
+    db.commit()
+    return result
