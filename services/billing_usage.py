@@ -1,7 +1,9 @@
 """每日用量採集。
 
-資料來源都在 auth 本機，不依賴 Spark：
-- 縮時秒數：timelapse_jobs 表（auth 自己的 DB），image_count / fps。
+資料來源都在 auth 本機，不依賴 Spark（除了縮時秒數的補值安全網——見
+`backfill_missing_video_duration_secs`）：
+- 縮時秒數：timelapse_jobs 表（auth 自己的 DB）的 video_duration_secs（Spark 回報的
+  產出影片實際長度）；缺值時才退回 image_count / fps 的高估值估算。
 - 儲存 GB：NAS 檔案系統 /homes/firmness/{serial_id}（routers/cameras.py:1330 已有先例）。
 
 本檔前半是純函式（可完整單元測試），後半是 I/O。
@@ -51,12 +53,24 @@ def job_duration_secs(
 
     注意用 `is None` 判斷：0 秒是合法結果（來源只有 1 張照片），
     用 falsy 判斷會讓它退回 image_count/fps 而錯記成好幾百秒。
+
+    對 video_duration_secs 的型別不設防：Spark 目前實測回 float，但若哪天回
+    字串（如 "125.4"）等非數值型別，直接 `int()` 會拋 ValueError 讓呼叫端
+    （collect_timelapse_secs）整批中斷，不只這一筆。這裡改用 `float()` 轉一手，
+    轉換失敗就記 log 退回 image_count/fps。另外用 `max(0, ...)` 擋負值——
+    Spark 不該回負數，但這是零成本保險，避免 int(-1.5) == -1 這種怪值進計費。
     """
     if video_duration_secs is not None:
-        return int(video_duration_secs)
+        try:
+            return max(0, int(float(video_duration_secs)))
+        except (TypeError, ValueError):
+            logger.warning(
+                "billing usage: video_duration_secs=%r 無法轉為數值，退回 image_count/fps 估算",
+                video_duration_secs,
+            )
     if not image_count or not fps:
         return 0
-    return int(image_count // fps)
+    return max(0, int(image_count // fps))
 
 
 def bytes_to_gb(n: int) -> float:
@@ -92,19 +106,101 @@ def collect_timelapse_secs(db: Session, day: str) -> dict[int, int]:
     ).all()
 
     out: dict[int, int] = {}
+    missing_job_ids: list[str] = []
     for j in jobs:
         if not j.camera_id:
             continue  # GDrive 來源的縮時沒有相機，不屬於任何相機的用量
         if j.video_duration_secs is None:
-            # 沒有 Spark 回報的真實影片長度，退回 image_count/fps 的高估值，
-            # 記 log 讓維運看得出哪些任務的用量是估計值。
-            logger.info(
-                f"billing usage: job {j.job_id} 缺 video_duration_secs，"
-                f"退回 image_count/fps 估算（可能高估）"
-            )
+            missing_job_ids.append(j.job_id)
         secs = job_duration_secs(j.video_duration_secs, j.image_count, j.fps)
         out[j.camera_id] = out.get(j.camera_id, 0) + secs
+    if missing_job_ids:
+        # 彙總一則而非逐筆 logger.info：舊資料整批補跑（或補值安全網沒接到）
+        # 那天可能有幾十筆缺值，逐筆記錄會刷版，看不出全貌。
+        logger.info(
+            "billing usage: %d 筆缺 video_duration_secs，退回 image_count/fps 估算"
+            "（可能高估），前幾筆 job_id=%s",
+            len(missing_job_ids), missing_job_ids[:5],
+        )
     return out
+
+
+# ── 補值安全網：collect_timelapse_secs 要用的那天，把缺 video_duration_secs 的
+# completed job 逐一問 Spark 補回真值。獨立成 async 函式而非把 collect_timelapse_secs
+# 本身改成 async：collect_timelapse_secs 是純 DB 查詢的同步函式，被多處（含測試）
+# 直接呼叫；把 I/O 拆到呼叫端（run_collection）先跑一輪、寫回 DB 後再呼叫
+# collect_timelapse_secs，改動範圍最小，也維持 collect_timelapse_secs 本身可同步測試。
+#
+# 併發模式比照 routers/jobs.py 的 _sync_jobs_with_spark：httpx + Semaphore，逐筆
+# try/except，單筆失敗（逾時/查無/Spark 錯誤）不中斷整批，記 log 後跳過，
+# 沿用 collect_timelapse_secs 既有的 image_count/fps fallback。
+from config import settings
+
+SPARK_API_URL = settings.SPARK_API_URL
+SPARK_API_KEY = settings.SPARK_API_KEY
+BACKFILL_SPARK_TIMEOUT = 6
+BACKFILL_CONCURRENCY = 4
+
+
+async def backfill_missing_video_duration_secs(db: Session, day: str) -> int:
+    """把該日（台北）completed 且缺 video_duration_secs 的相機縮時 job 向 Spark 補值並寫回 DB。
+
+    只查缺值的（每日 completed 縮時任務個位數到數十筆，量級可控）；查得到就
+    直接寫回 DB 持久化，讓同日重跑與後續報表一致；查不到/逾時/Spark 回錯
+    的單筆不中斷整批，靜默略過，collect_timelapse_secs 會沿用 image_count/fps。
+
+    回傳成功補值的筆數（供呼叫端記 log/回應用，非必要）。
+    """
+    start_utc, end_utc = taipei_day_bounds_utc(day)
+    effective_time = func.coalesce(TimelapsJob.completed_at, TimelapsJob.created_at)
+    jobs = db.query(TimelapsJob).filter(
+        TimelapsJob.status == "completed",
+        TimelapsJob.video_duration_secs.is_(None),
+        effective_time >= start_utc,
+        effective_time < end_utc,
+    ).all()
+    if not jobs:
+        return 0
+
+    sem = asyncio.Semaphore(BACKFILL_CONCURRENCY)
+
+    async def fetch(job):
+        async with sem:
+            try:
+                async with httpx.AsyncClient(timeout=BACKFILL_SPARK_TIMEOUT) as client:
+                    r = await client.get(
+                        f"{SPARK_API_URL}/jobs/{job.job_id}",
+                        headers={"x-api-key": SPARK_API_KEY},
+                    )
+                if r.status_code == 200:
+                    data = r.json()
+                    val = data.get("video_duration_secs")
+                    if val is not None:
+                        return job, val
+            except Exception:
+                logger.debug(
+                    "billing usage: 補值查 Spark 失敗（沿用 fallback）: job_id=%s",
+                    job.job_id, exc_info=True,
+                )
+            return job, None
+
+    results = await asyncio.gather(*[fetch(j) for j in jobs])
+
+    filled = 0
+    for job, val in results:
+        if val is not None:
+            job.video_duration_secs = val
+            filled += 1
+    if filled:
+        db.commit()
+
+    missing = len(jobs) - filled
+    if missing:
+        logger.info(
+            "billing usage: %s 補值 %d/%d 筆成功，剩 %d 筆維持 image_count/fps fallback",
+            day, filled, len(jobs), missing,
+        )
+    return filled
 
 
 def upsert_usage(db: Session, camera_id: int, day: str, timelapse_secs: int, storage_gb: float) -> None:
@@ -296,6 +392,10 @@ async def run_collection(db: Session, day: str) -> dict:
       不是「沿用」而是貨真價實的 0.0），不嘗試採集新值。
     unresolved 計數不受影響，仍然照計，代表這台相機當天的 storage_gb 沒有更新。
     """
+    # 補值安全網先跑：把當天缺 video_duration_secs 的 completed job 向 Spark
+    # 補回真值並寫回 DB，collect_timelapse_secs 才能吃到補好的值（同一個 db
+    # session，補值的 commit 對接下來的查詢立即可見）。
+    await backfill_missing_video_duration_secs(db, day)
     secs_by_camera = collect_timelapse_secs(db, day)
     subs = db.query(BillingSubscription).filter(BillingSubscription.status == "active").all()
 

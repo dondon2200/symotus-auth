@@ -123,8 +123,14 @@ def update_job(
         # 可接受。
         if body.status == "completed" and job.status != "completed":
             job.completed_at = datetime.utcnow()
-            job.video_duration_secs = body.video_duration_secs
         job.status = body.status
+    # video_duration_secs 不綁在轉態守衛上：這個 PUT 常常是「使用者盯著卡片看」
+    # 那條路徑最先打到的，若跟 completed_at 用同一個守衛，之後任何補值路徑（例如
+    # billing_usage 的補值安全網）都會被「已經轉態過」擋在門外，真值永遠填不進來。
+    # 條件只在「目前是 None 且傳入非 None」才寫，讓後到的真值仍有機會覆蓋先到的
+    # None；completed_at 維持原本語意不變（一旦記錄就不再改，避免用量搬移月份）。
+    if job.video_duration_secs is None and body.video_duration_secs is not None:
+        job.video_duration_secs = body.video_duration_secs
     if body.percent_complete is not None:
         job.percent_complete = body.percent_complete
     job.updated_at = datetime.utcnow()
@@ -189,8 +195,11 @@ def internal_update_job(
             # 這個 endpoint 實務上從未被 Spark 呼叫過，但若真的帶上完成時間就
             # 優先採用（與 list 同步的邏輯一致），沒有才退回 utcnow()。
             job.completed_at = parse_spark_completed_at(body.completed_at, datetime.utcnow())
-            job.video_duration_secs = body.video_duration_secs
         job.status = body.status
+    # 同上（見 update_job）：video_duration_secs 用「目前為 None 且傳入非 None」
+    # 判斷，不綁轉態守衛，讓後到的真值仍能補上先到的 None；completed_at 語意不變。
+    if job.video_duration_secs is None and body.video_duration_secs is not None:
+        job.video_duration_secs = body.video_duration_secs
     if body.percent_complete is not None: job.percent_complete = body.percent_complete
     if body.video_url is not None: job.video_url = body.video_url
     if body.error_message is not None: job.error_message = body.error_message
@@ -336,10 +345,6 @@ async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
                 now = datetime.utcnow()
                 raw_completed_at = data.get("completed_at")
                 job.completed_at = parse_spark_completed_at(raw_completed_at, now)
-                # Spark 回報的產出影片實際長度（秒），計費用量以此為準；只在轉態時寫，
-                # 跟 completed_at 同樣的守衛，不隨每次同步覆寫。缺該欄位存 None，
-                # fallback（image_count/fps）會處理。
-                job.video_duration_secs = data.get("video_duration_secs")
                 if job.completed_at == now:
                     # 代表 raw 缺漏或無法解析，parse_spark_completed_at 回退用了 now。
                     logger.info(
@@ -348,6 +353,13 @@ async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
                         job.job_id, raw_completed_at,
                     )
             job.status = status
+            changed = True
+        # video_duration_secs 不綁在上面的轉態守衛：這條同步路徑不是唯一會先跑到的
+        # 路徑（前端 PUT /jobs/{id} 常常更早送達、且不帶這個欄位，把值定成 None）。
+        # 用「目前為 None 且 Spark 這次有值」判斷，讓真值有機會補上先到的 None；
+        # completed_at 維持原本的轉態守衛語意不變（一旦記錄就不再改）。
+        if job.video_duration_secs is None and data.get("video_duration_secs") is not None:
+            job.video_duration_secs = data.get("video_duration_secs")
             changed = True
         # 完成時補滿 100%，其餘採 Spark 回報值（只在數字有前進時才寫，避免倒退）
         if status == "completed":

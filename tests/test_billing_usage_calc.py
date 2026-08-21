@@ -55,6 +55,22 @@ def test_三個都缺時為零而不猜():
     assert job_duration_secs(None, 900, 0) == 0
 
 
+def test_video_duration_secs為字串仍可轉換():
+    # Spark 目前實測回 float，但字串型別（如序列化再反序列化路徑）不該讓
+    # 整批採集中斷，能轉成數值就照常採用。
+    assert job_duration_secs("125.4", None, None) == 125
+
+
+def test_video_duration_secs非數值時退回fallback不拋錯():
+    assert job_duration_secs("not-a-number", 900, 30) == 30
+    assert job_duration_secs([], 900, 30) == 30
+
+
+def test_video_duration_secs為負值時夾在零():
+    # Spark 不該回負數，但 max(0, ...) 是零成本保險。
+    assert job_duration_secs(-1.5, None, None) == 0
+
+
 def test_位元組換算GB():
     assert bytes_to_gb(1024 ** 3) == 1.0
     assert bytes_to_gb(0) == 0.0
