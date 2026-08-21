@@ -48,6 +48,7 @@ def bytes_to_gb(n: int) -> float:
 
 # ---- 以下為 I/O：資料就在 auth 自己的 DB，不必問 Spark ----
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from models import TimelapsJob, BillingUsageDaily
@@ -86,10 +87,32 @@ def upsert_usage(db: Session, camera_id: int, day: str, timelapse_secs: int, sto
         row.timelapse_secs = timelapse_secs
         row.storage_gb = storage_gb
         row.collected_at = datetime.utcnow()
-    else:
-        db.add(BillingUsageDaily(
-            camera_id=camera_id, date=day,
-            timelapse_secs=timelapse_secs, storage_gb=storage_gb,
-            collected_at=datetime.utcnow(),
-        ))
-    db.commit()
+        db.commit()
+        return
+    db.add(BillingUsageDaily(
+        camera_id=camera_id, date=day,
+        timelapse_secs=timelapse_secs, storage_gb=storage_gb,
+        collected_at=datetime.utcnow(),
+    ))
+    try:
+        db.commit()
+    except IntegrityError:
+        # 先查後寫沒有併發防護：採集逾時被重試、或每日排程與手動補跑
+        # （POST /billing/admin/usage/collect）重疊時，兩個執行緒都可能查不到
+        # 既有列而各自 insert，第二個 commit 會撞上 UNIQUE(camera_id, date)。
+        # 做法比照 routers/billing.py 的 get_or_create_customer：
+        # rollback 後重查，這裡語意是覆蓋，所以把重查到的列更新成本次要寫的值。
+        db.rollback()
+        row = db.query(BillingUsageDaily).filter(
+            BillingUsageDaily.camera_id == camera_id,
+            BillingUsageDaily.date == day,
+        ).first()
+        if row is None:
+            # 理論上不該發生（撞到 UNIQUE 代表該列一定存在）；
+            # 若真的查不到，代表狀況超出預期，往上拋不要吞掉——
+            # 這個專案很在意「失敗不可回報成功」。
+            raise
+        row.timelapse_secs = timelapse_secs
+        row.storage_gb = storage_gb
+        row.collected_at = datetime.utcnow()
+        db.commit()

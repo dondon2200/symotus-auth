@@ -75,3 +75,39 @@ def test_不同日各自一列(db):
     upsert_usage(db, camera_id=1, day=DAY, timelapse_secs=30, storage_gb=1.0)
     upsert_usage(db, camera_id=1, day="2026-08-20", timelapse_secs=60, storage_gb=1.2)
     assert db.query(BillingUsageDaily).filter(BillingUsageDaily.camera_id == 1).count() == 2
+
+
+def test_併發insert撞UNIQUE後改為覆蓋而非拋例外(db, monkeypatch):
+    # 模擬情境：本次查詢時該 (camera_id, date) 尚不存在，走 insert 分支；
+    # 但另一個執行緒（逾時重試 / 手動補跑重疊）已經搶先插入同一筆，
+    # 這裡把第一次 commit 換成先真的插入那筆「別人的資料」再拋 IntegrityError，
+    # 藉此重現撞 UNIQUE(camera_id, date) 的情境。
+    from sqlalchemy.exc import IntegrityError
+
+    real_commit = db.commit
+    calls = {"n": 0}
+
+    def fake_commit():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # 先讓「另一個執行緒」的資料落地，再模擬本次 commit 撞到 UNIQUE
+            db.rollback()
+            db.add(BillingUsageDaily(
+                camera_id=2, date=DAY,
+                timelapse_secs=1, storage_gb=0.1,
+                collected_at=datetime(2026, 1, 1),
+            ))
+            real_commit()
+            raise IntegrityError("upsert_usage race", params=None, orig=Exception("dup"))
+        return real_commit()
+
+    monkeypatch.setattr(db, "commit", fake_commit)
+
+    upsert_usage(db, camera_id=2, day=DAY, timelapse_secs=90, storage_gb=2.0)
+
+    rows = db.query(BillingUsageDaily).filter(
+        BillingUsageDaily.camera_id == 2, BillingUsageDaily.date == DAY
+    ).all()
+    assert len(rows) == 1                     # 沒有變成重複列
+    assert rows[0].timelapse_secs == 90        # 覆蓋成本次要寫的值，不是拋例外
+    assert rows[0].storage_gb == 2.0
