@@ -4,7 +4,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel
 
@@ -114,6 +114,10 @@ def update_job(
     if body.status is not None:
         # 只在「從非 completed 轉為 completed」時寫入 completed_at，避免重複
         # 輪詢到同一個結果時把完成日往後改，導致用量從舊日搬到新日。
+        # 這裡沿用 utcnow() 而非 Spark 回報的真值：這個 endpoint 只在前端浮動
+        # job 卡片開著的時候才會被打，drift 幅度被「使用者盯著看」這件事本身
+        # 限制在頁面停留的時間內（通常幾分鐘），不像背景 list 同步那樣可能拖到幾天，
+        # 可接受。
         if body.status == "completed" and job.status != "completed":
             job.completed_at = datetime.utcnow()
         job.status = body.status
@@ -150,6 +154,9 @@ class JobInternalUpdate(BaseModel):
     error_message: Optional[str] = None
     image_count: Optional[int] = None
     processing_time_secs: Optional[str] = None
+    # Spark 回呼若帶上真正的完成時間就用它；這個 endpoint 實務上從未被 Spark
+    # 呼叫過（Spark 不會 callback），但保留欄位以防萬一，行為與 list 同步一致。
+    completed_at: Optional[str] = None
 
 @router.put("/internal/{job_id}")
 def internal_update_job(
@@ -173,7 +180,9 @@ def internal_update_job(
         # 只在「從非 completed 轉為 completed」時寫入 completed_at，避免重複
         # 回呼同一結果時把完成日往後改，導致用量從舊日搬到新日。
         if body.status == "completed" and job.status != "completed":
-            job.completed_at = datetime.utcnow()
+            # 這個 endpoint 實務上從未被 Spark 呼叫過，但若真的帶上完成時間就
+            # 優先採用（與 list 同步的邏輯一致），沒有才退回 utcnow()。
+            job.completed_at = parse_spark_completed_at(body.completed_at, datetime.utcnow())
         job.status = body.status
     if body.percent_complete is not None: job.percent_complete = body.percent_complete
     if body.video_url is not None: job.video_url = body.video_url
@@ -257,6 +266,26 @@ def _spark_status_to_local(raw: Optional[str]) -> Optional[str]:
     return None
 
 
+def parse_spark_completed_at(raw, now: datetime) -> datetime:
+    """把 Spark `GET /jobs/{id}` 回傳的 completed_at 解析成 naive UTC。
+
+    - `raw` 為 None 或無法解析（非字串、格式錯誤）：回退用 `now`（呼叫端應記一筆
+      log 說明這筆完成時間是估計值，不是 Spark 回報的真值）。
+    - 帶時區資訊的字串（如 "+08:00" 或 "Z"）：換算成 UTC 後再去除 tzinfo，
+      維持本專案「DB 一律存 naive UTC」的慣例。
+    - 換算後若晚於 `now`（Spark 端鐘飄移），夾在 `now`，避免完成時間跑到未來。
+    """
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return min(parsed, now)
+        except (ValueError, TypeError):
+            pass
+    return now
+
+
 async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
     """把未結束的相機縮時 job 與 Spark 現況對齊並寫回 DB（就地更新傳入的 ORM 物件）。
 
@@ -290,11 +319,23 @@ async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
         status = _spark_status_to_local(data.get("status"))
         percent = data.get("percent_complete")
         changed = False
-        if status and status != job.status:
-            # 這裡本來就是「從非 completed 轉為 completed」的判定（status != job.status），
+        # 用 lowercase 比較，跟上面 `active` 篩選（.lower()）一致：DB 若混雜
+        # 大小寫（如 "Completed"），原本的原字串比較會誤判成「仍在轉態」，
+        # 導致每次列表 API 都重寫 completed_at，正是本輪要修的用量日期漂移。
+        if status and status != (job.status or "").lower():
+            # 這裡本來就是「從非 completed 轉為 completed」的判定，
             # 所以 completed_at 只會在真正轉態時寫入，重複同步到同一結果不會覆蓋。
             if status == "completed":
-                job.completed_at = datetime.utcnow()
+                now = datetime.utcnow()
+                raw_completed_at = data.get("completed_at")
+                job.completed_at = parse_spark_completed_at(raw_completed_at, now)
+                if job.completed_at == now:
+                    # 代表 raw 缺漏或無法解析，parse_spark_completed_at 回退用了 now。
+                    logger.info(
+                        "job_id=%s: Spark completed_at 缺漏或無法解析（原始值=%r），"
+                        "completed_at 採同步當下時間（估計值）",
+                        job.job_id, raw_completed_at,
+                    )
             job.status = status
             changed = True
         # 完成時補滿 100%，其餘採 Spark 回報值（只在數字有前進時才寫，避免倒退）

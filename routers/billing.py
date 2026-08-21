@@ -32,7 +32,7 @@ from services.billing_calc import (
     invoice_total, quota_state, period_of, next_period, period_bounds_utc, effective_monthly_fee,
     commission_amount, commission_display,
 )
-from services.billing_usage import run_collection
+from services.billing_usage import run_collection, yesterday_taipei
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -683,6 +683,16 @@ async def collect_usage(date: str, db: Session = Depends(get_db), current_user: 
     """手動補跑某日的用量採集。每日排程失敗時的補救管道。"""
     if not DATE_RE.match(date):
         raise HTTPException(422, "日期格式須為 YYYY-MM-DD")
+    try:
+        parsed_date = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(422, "日期無效（非合法的西曆日期）")
+    # 今天的資料視為尚未完整（快照可能還在變動），只接受「昨天以前（含昨天）」；
+    # 未來日期若被接受，之後的 storage 快照會落到那天，my_quotas 取本期最大 date
+    # 時會被這個未來列永久遮蔽掉真正的每日快照。
+    yesterday = yesterday_taipei(datetime.utcnow())
+    if date > yesterday:
+        raise HTTPException(422, f"只接受 {yesterday}（昨天）以前（含昨天）的日期")
     result = await run_collection(db, date)
     log_action(db, current_user, "billing_collect_usage", "billing_usage", None,
                f"date={date} ok={result['cameras']} failed={result['failed']} unresolved={result['unresolved']}")

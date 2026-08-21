@@ -229,6 +229,31 @@ async def resolve_camera_serial(db: Session, sub: BillingSubscription, token: st
     return serial
 
 
+# serial 解析不到、storage_gb 連續沿用超過這麼多天就把 log 從 warning 升級成
+# error（多半代表相機已從 Camera Backend 刪除，NAS 目錄早就不在了，卻還在
+# 每天重寫舊快照）。
+CARRY_FORWARD_ALERT_DAYS = 7
+
+
+def carried_forward_streak_days(db: Session, camera_id: int, day: str, carried_value: float) -> int:
+    """回推連續幾天（含今天要寫的這筆）storage_gb 都是同一個沿用值。
+
+    沒有明確的「這列是沿用寫入的」欄位，用「storage_gb 剛好等於沿用值」當代理：
+    一旦遇到不同的值（代表那天曾經真的採集成功）就停止往回數。
+    """
+    streak = 1
+    rows = db.query(BillingUsageDaily).filter(
+        BillingUsageDaily.camera_id == camera_id,
+        BillingUsageDaily.date < day,
+    ).order_by(BillingUsageDaily.date.desc()).all()
+    for row in rows:
+        if row.storage_gb == carried_value:
+            streak += 1
+        else:
+            break
+    return streak
+
+
 async def run_collection(db: Session, day: str) -> dict:
     """採集指定日期（台北）的用量。
 
@@ -247,7 +272,8 @@ async def run_collection(db: Session, day: str) -> dict:
       所以照寫，不因為 serial 問題連累原本查得到的資料。
     - storage_gb 是時間點快照，寫 0（或亂寫）之後即使補設定重跑，也只能拿到
       「重跑當下」的目錄大小，不是當天的，等同永久污染歷史；所以沿用該相機
-      目前列裡的舊值（沒有列過就是 0），不嘗試採集新值。
+      目前列裡的舊值（沒有列過就是 0；也就是說從未採集成功過的相機，這裡寫的
+      不是「沿用」而是貨真價實的 0.0），不嘗試採集新值。
     unresolved 計數不受影響，仍然照計，代表這台相機當天的 storage_gb 沒有更新。
     """
     secs_by_camera = collect_timelapse_secs(db, day)
@@ -262,7 +288,6 @@ async def run_collection(db: Session, day: str) -> dict:
         try:
             serial = await resolve_camera_serial(db, sub, token)
             if not serial:
-                unresolved += 1
                 # storage_gb 沿用該相機既有列的舊值（沒有就是 0）——timelapse_secs
                 # 仍照寫，不因為 serial 解析不到就連帶漏掉可回填的資料。
                 # 必須限制 date <= day：補跑舊日期（POST .../collect?date=較早日期）時，
@@ -273,11 +298,20 @@ async def run_collection(db: Session, day: str) -> dict:
                     BillingUsageDaily.date <= day,
                 ).order_by(BillingUsageDaily.date.desc()).first()
                 prev_gb = prev.storage_gb if prev else 0.0
-                logger.warning(
+                # 相機可能已從 Camera Backend 刪除（resolve 404），這種情況下沿用
+                # 舊值會被每天重寫、永遠不會停——追蹤連續沿用了幾天，超過門檻就
+                # 升級成 error 讓人注意到（例如該補訂閱下架而非繼續累計用量）。
+                streak = carried_forward_streak_days(db, sub.camera_id, day, prev_gb)
+                msg = (
                     f"billing usage: 相機 {sub.camera_id} 無法解析 serial（{day}），"
-                    f"storage_gb 沿用舊值 {prev_gb}，timelapse_secs 照常寫入"
+                    f"storage_gb 沿用舊值 {prev_gb}，已連續沿用 {streak} 天，timelapse_secs 照常寫入"
                 )
+                if streak > CARRY_FORWARD_ALERT_DAYS:
+                    logger.error(msg)
+                else:
+                    logger.warning(msg)
                 upsert_usage(db, sub.camera_id, day, secs_by_camera.get(sub.camera_id, 0), prev_gb)
+                unresolved += 1
                 continue
             # 阻塞式 I/O 必須丟到 thread，否則會卡住整個 auth 的事件迴圈
             gb = await asyncio.to_thread(collect_storage_gb, serial)

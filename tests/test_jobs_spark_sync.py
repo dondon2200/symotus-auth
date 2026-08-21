@@ -5,10 +5,12 @@
 這裡不碰 DB schema——直接對 helper 餵假的 job 物件與假的 Spark 回應。
 """
 import asyncio
+from datetime import datetime
 
 import pytest
 
 from routers import jobs as jobs_module
+from routers.jobs import parse_spark_completed_at
 
 
 class FakeJob:
@@ -20,6 +22,7 @@ class FakeJob:
         self.image_count = image_count
         self.error_message = error_message
         self.updated_at = None
+        self.completed_at = None
 
 
 class FakeDB:
@@ -66,6 +69,85 @@ def _patch_spark(monkeypatch, by_job_id):
 
 def _run(db, jobs):
     asyncio.run(jobs_module._sync_jobs_with_spark(db, jobs))
+
+
+class TestParseSparkCompletedAt:
+    """parse_spark_completed_at：Spark completed_at 一律轉成 naive UTC。"""
+
+    def test_z後綴utc字串(self):
+        now = datetime(2026, 8, 21, 12, 0, 0)
+        result = parse_spark_completed_at("2026-08-19T03:04:05Z", now)
+        assert result == datetime(2026, 8, 19, 3, 4, 5)
+
+    def test_帶時區offset字串換算成utc(self):
+        now = datetime(2026, 8, 21, 12, 0, 0)
+        # +08:00 的 11:04:05 換成 UTC 是 03:04:05
+        result = parse_spark_completed_at("2026-08-19T11:04:05+08:00", now)
+        assert result == datetime(2026, 8, 19, 3, 4, 5)
+
+    def test_none回退用now(self):
+        now = datetime(2026, 8, 21, 12, 0, 0)
+        assert parse_spark_completed_at(None, now) == now
+
+    def test_無法解析回退用now(self):
+        now = datetime(2026, 8, 21, 12, 0, 0)
+        assert parse_spark_completed_at("not-a-date", now) == now
+        assert parse_spark_completed_at("", now) == now
+
+    def test_未來時間夾在now(self):
+        now = datetime(2026, 8, 21, 12, 0, 0)
+        future = "2099-01-01T00:00:00Z"
+        assert parse_spark_completed_at(future, now) == now
+
+
+def test_completed_spark_job的completed_at採spark回報值(monkeypatch):
+    """轉為 completed 時，completed_at 應優先採 Spark 回應的真實完成時間，
+    而不是 helper 執行當下（同步時刻）的時間。"""
+    job = FakeJob("bv-realtime", status="processing", percent_complete=80)
+    _patch_spark(monkeypatch, {"bv-realtime": {
+        "status": "completed", "percent_complete": 100, "image_count": 10,
+        "error": None, "completed_at": "2026-08-19T03:04:05Z",
+    }})
+    db = FakeDB()
+
+    _run(db, [job])
+
+    assert job.status == "completed"
+    assert job.completed_at == datetime(2026, 8, 19, 3, 4, 5)
+
+
+def test_completed_spark_job缺completed_at時退回同步時間估計值(monkeypatch):
+    job = FakeJob("bv-noeta", status="processing", percent_complete=80)
+    _patch_spark(monkeypatch, {"bv-noeta": {
+        "status": "completed", "percent_complete": 100, "image_count": 10, "error": None,
+    }})
+    db = FakeDB()
+    before = datetime.utcnow()
+
+    _run(db, [job])
+
+    after = datetime.utcnow()
+    assert job.status == "completed"
+    assert before <= job.completed_at <= after
+
+
+def test_大小寫混雜的db狀態不會被誤判成剛轉態(monkeypatch):
+    """DB 若存 mixed-case 的 'Completed'（歷史資料 / 外部寫入），active 篩選用
+    lower() 已經會把它當終態排除掉，不會查 Spark；這裡直接對 helper 內層邏輯
+    做防禦性驗證：就算它跑到轉態比對那一行，lower() 一致比對也不該把
+    'Completed' vs 'completed' 誤判成「剛轉態」而重寫 completed_at。"""
+    job = FakeJob("bv-mixedcase", status="Completed", percent_complete=100)
+    _patch_spark(monkeypatch, {"bv-mixedcase": {
+        "status": "completed", "percent_complete": 100, "image_count": 5, "error": None,
+        "completed_at": "2026-08-01T00:00:00Z",
+    }})
+    db = FakeDB()
+
+    _run(db, [job])
+
+    # 已經是（大小寫不同的）completed，不該被視為「剛轉態」而重寫 completed_at。
+    assert job.completed_at is None
+    assert db.commits == 0
 
 
 def test_completed_spark_job_is_written_back(monkeypatch):
