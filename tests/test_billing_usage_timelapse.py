@@ -8,11 +8,13 @@ from services.billing_usage import collect_timelapse_secs, upsert_usage
 DAY = "2026-08-19"
 
 
-def _job(db, user_id, camera_id, created_at, status="completed", image_count=900, fps=30, job_id=None):
+def _job(db, user_id, camera_id, created_at, status="completed", image_count=900, fps=30,
+         job_id=None, video_duration_secs=None):
     j = TimelapsJob(
         user_id=user_id, job_id=job_id or f"j{camera_id}-{created_at.isoformat()}",
         camera_id=camera_id, status=status,
         image_count=image_count, fps=fps, created_at=created_at,
+        video_duration_secs=video_duration_secs,
     )
     db.add(j); db.commit()
     return j
@@ -84,6 +86,16 @@ def test_完成時間的台北日界(db, user):
     b.completed_at = datetime(2026, 8, 19, 16, 0)
     db.commit()
     assert collect_timelapse_secs(db, DAY) == {1: 30}
+
+
+def test_video_duration_secs與fallback混合正確加總(db, user):
+    # 同一天兩筆任務：一筆有 Spark 回報的實際影片長度（優先採用），
+    # 一筆是舊資料沒有該欄位（退回 image_count/fps 的高估值）。
+    _job(db, user.id, 1, datetime(2026, 8, 19, 10, 0),
+         image_count=7194, fps=30, video_duration_secs=125.43, job_id="has-duration")  # 125 秒
+    _job(db, user.id, 1, datetime(2026, 8, 19, 11, 0),
+         image_count=900, fps=30, video_duration_secs=None, job_id="no-duration")  # 30 秒（fallback）
+    assert collect_timelapse_secs(db, DAY) == {1: 155}
 
 
 def test_沒有camera_id的任務被忽略(db, user):

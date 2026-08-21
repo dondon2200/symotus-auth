@@ -50,6 +50,7 @@ async def startup():
                     ("image_count", "INTEGER"),
                     ("processing_time_secs", "TEXT"),
                     ("completed_at", "TIMESTAMP"),
+                    ("video_duration_secs", "DOUBLE PRECISION"),
                 ]:
                     try:
                         conn.execute(text(f"ALTER TABLE timelapse_jobs ADD COLUMN IF NOT EXISTS {col} {typ}"))
@@ -289,11 +290,13 @@ async def startup():
             # 所以同樣要自我檢查、大聲示警。
             with engine.connect() as conn:
                 try:
-                    conn.execute(text("SELECT completed_at FROM timelapse_jobs LIMIT 1"))
+                    conn.execute(text(
+                        "SELECT completed_at, video_duration_secs FROM timelapse_jobs LIMIT 1"
+                    ))
                 except Exception as e:
                     logger.error(
-                        "timelapse_jobs 缺少 completed_at 欄位，/jobs 相關功能將失效，"
-                        "請人工檢查 migration：" + str(e)
+                        "timelapse_jobs 缺少 completed_at 或 video_duration_secs 欄位，"
+                        "/jobs 與計費用量採集將失效，請人工檢查 migration：" + str(e)
                     )
 
             logger.info("DB connected and tables created!")

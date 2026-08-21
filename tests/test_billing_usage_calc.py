@@ -25,15 +25,34 @@ def test_前一天以台北時區判定():
     assert yesterday_taipei(datetime(2026, 8, 19, 15, 0)) == "2026-08-18"
 
 
-def test_影片秒數為張數除以fps():
-    assert job_duration_secs(900, 30) == 30
-    assert job_duration_secs(901, 30) == 30  # 無條件捨去，不四捨五入到多收費
+def test_優先用實際影片長度():
+    # Spark 的 video_duration_secs 是產出影片的真實長度。
+    # image_count/fps 是「來源照片張數/fps」，因為 Spark 會抽樣，
+    # 實測會比真實長度大 2～6 倍（見計畫文件的查證表）。
+    assert job_duration_secs(125.43, 7194, 30) == 125
 
 
-def test_缺值的舊資料計為零而非猜測():
-    assert job_duration_secs(None, 30) == 0
-    assert job_duration_secs(900, None) == 0
-    assert job_duration_secs(900, 0) == 0    # fps=0 不能當除數
+def test_無條件捨去不四捨五入():
+    assert job_duration_secs(125.99, None, None) == 125
+    assert job_duration_secs(0.9, None, None) == 0
+
+
+def test_舊資料沒有影片長度時退回張數除以fps():
+    # video_duration_secs 是後加欄位，既有資料為 NULL。
+    # 這個 fallback 是高估值，但總比整批用量消失好。
+    assert job_duration_secs(None, 900, 30) == 30
+
+
+def test_影片長度為零是有效值不是缺值():
+    # 0 秒的影片（例如來源只有 1 張照片）是合法結果，
+    # 不可被當成「沒有值」而退回 image_count/fps。
+    assert job_duration_secs(0, 900, 30) == 0
+
+
+def test_三個都缺時為零而不猜():
+    assert job_duration_secs(None, None, 30) == 0
+    assert job_duration_secs(None, 900, None) == 0
+    assert job_duration_secs(None, 900, 0) == 0
 
 
 def test_位元組換算GB():

@@ -132,6 +132,11 @@ class TimelapsJob(Base):
     # 跨日完成的任務（例如台北 23:40 建立、隔天 04:00 完成）用建立日會被永久漏計。
     # 舊資料為 NULL，採集時退回用 created_at（見 services/billing_usage.py）。
     completed_at = Column(DateTime, nullable=True)
+    # Spark 回報的產出影片實際長度（秒）。計費用量以此為準。
+    # 不可用 image_count/fps 推算——image_count 是「可用的來源照片張數」，
+    # Spark 依 target_duration_secs 抽樣，實測兩者差 2～6 倍且倍率不固定。
+    # 舊資料為 NULL，採集時退回 image_count/fps（高估值，見 billing_usage.py）。
+    video_duration_secs = Column(Float, nullable=True)
 # 注意：下面的欄位需要 ALTER TABLE 或在新環境自動建立
 # TimelapsJob 額外欄位（已在 class 定義，這裡補充說明）
 

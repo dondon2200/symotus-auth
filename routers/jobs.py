@@ -30,6 +30,9 @@ class JobCreate(BaseModel):
 class JobUpdate(BaseModel):
     status: Optional[str] = None
     percent_complete: Optional[int] = None
+    # Spark 回報的產出影片實際長度（秒）。若前端轉態通知有帶就存，沒有就 None
+    # （計費採集時會退回 image_count/fps 的 fallback，見 services/billing_usage.py）。
+    video_duration_secs: Optional[float] = None
 
 class JobResponse(BaseModel):
     id: int
@@ -120,6 +123,7 @@ def update_job(
         # 可接受。
         if body.status == "completed" and job.status != "completed":
             job.completed_at = datetime.utcnow()
+            job.video_duration_secs = body.video_duration_secs
         job.status = body.status
     if body.percent_complete is not None:
         job.percent_complete = body.percent_complete
@@ -157,6 +161,8 @@ class JobInternalUpdate(BaseModel):
     # Spark 回呼若帶上真正的完成時間就用它；這個 endpoint 實務上從未被 Spark
     # 呼叫過（Spark 不會 callback），但保留欄位以防萬一，行為與 list 同步一致。
     completed_at: Optional[str] = None
+    # Spark 回報的產出影片實際長度（秒）。計費用量以此為準（見 services/billing_usage.py）。
+    video_duration_secs: Optional[float] = None
 
 @router.put("/internal/{job_id}")
 def internal_update_job(
@@ -183,6 +189,7 @@ def internal_update_job(
             # 這個 endpoint 實務上從未被 Spark 呼叫過，但若真的帶上完成時間就
             # 優先採用（與 list 同步的邏輯一致），沒有才退回 utcnow()。
             job.completed_at = parse_spark_completed_at(body.completed_at, datetime.utcnow())
+            job.video_duration_secs = body.video_duration_secs
         job.status = body.status
     if body.percent_complete is not None: job.percent_complete = body.percent_complete
     if body.video_url is not None: job.video_url = body.video_url
@@ -329,6 +336,10 @@ async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
                 now = datetime.utcnow()
                 raw_completed_at = data.get("completed_at")
                 job.completed_at = parse_spark_completed_at(raw_completed_at, now)
+                # Spark 回報的產出影片實際長度（秒），計費用量以此為準；只在轉態時寫，
+                # 跟 completed_at 同樣的守衛，不隨每次同步覆寫。缺該欄位存 None，
+                # fallback（image_count/fps）會處理。
+                job.video_duration_secs = data.get("video_duration_secs")
                 if job.completed_at == now:
                     # 代表 raw 缺漏或無法解析，parse_spark_completed_at 回退用了 now。
                     logger.info(

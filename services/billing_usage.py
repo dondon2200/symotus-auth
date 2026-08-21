@@ -37,8 +37,23 @@ def yesterday_taipei(now_utc: datetime) -> str:
     return (now_utc + TAIPEI_OFFSET - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
-def job_duration_secs(image_count: Optional[int], fps: Optional[int]) -> int:
-    """縮時影片長度。缺值或 fps 為 0 一律回 0——猜測會產生錯誤帳單。"""
+def job_duration_secs(
+    video_duration_secs: Optional[float],
+    image_count: Optional[int],
+    fps: Optional[int],
+) -> int:
+    """縮時影片長度（秒，無條件捨去）。
+
+    優先用 Spark 回報的 video_duration_secs——那是產出影片的真實長度。
+    image_count/fps 只是後備：image_count 是「可用的來源照片張數」，Spark 依
+    target_duration_secs 抽樣，實測兩者差 2～6 倍且倍率隨任務變動，用它計費會超收。
+    舊資料（欄位新增前）沒有 video_duration_secs，只能用這個高估值，並記 log。
+
+    注意用 `is None` 判斷：0 秒是合法結果（來源只有 1 張照片），
+    用 falsy 判斷會讓它退回 image_count/fps 而錯記成好幾百秒。
+    """
+    if video_duration_secs is not None:
+        return int(video_duration_secs)
     if not image_count or not fps:
         return 0
     return int(image_count // fps)
@@ -80,9 +95,14 @@ def collect_timelapse_secs(db: Session, day: str) -> dict[int, int]:
     for j in jobs:
         if not j.camera_id:
             continue  # GDrive 來源的縮時沒有相機，不屬於任何相機的用量
-        secs = job_duration_secs(j.image_count, j.fps)
-        if secs == 0 and (not j.image_count or not j.fps):
-            logger.info(f"billing usage: job {j.job_id} 缺 image_count/fps，計 0")
+        if j.video_duration_secs is None:
+            # 沒有 Spark 回報的真實影片長度，退回 image_count/fps 的高估值，
+            # 記 log 讓維運看得出哪些任務的用量是估計值。
+            logger.info(
+                f"billing usage: job {j.job_id} 缺 video_duration_secs，"
+                f"退回 image_count/fps 估算（可能高估）"
+            )
+        secs = job_duration_secs(j.video_duration_secs, j.image_count, j.fps)
         out[j.camera_id] = out.get(j.camera_id, 0) + secs
     return out
 

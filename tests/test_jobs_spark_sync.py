@@ -23,6 +23,7 @@ class FakeJob:
         self.error_message = error_message
         self.updated_at = None
         self.completed_at = None
+        self.video_duration_secs = None
 
 
 class FakeDB:
@@ -114,6 +115,35 @@ def test_completed_spark_job的completed_at採spark回報值(monkeypatch):
 
     assert job.status == "completed"
     assert job.completed_at == datetime(2026, 8, 19, 3, 4, 5)
+
+
+def test_completed_spark_job的video_duration_secs存進db(monkeypatch):
+    """轉為 completed 時，Spark 回報的 video_duration_secs（產出影片的真實長度）
+    要存進 job.video_duration_secs——計費用量以此為準，不可再用 image_count/fps 推算。"""
+    job = FakeJob("bv-duration", status="processing", percent_complete=80)
+    _patch_spark(monkeypatch, {"bv-duration": {
+        "status": "completed", "percent_complete": 100, "image_count": 7194,
+        "error": None, "completed_at": "2026-08-18T05:43:10.557398Z",
+        "video_duration_secs": 125.43333333333334,
+    }})
+    db = FakeDB()
+
+    _run(db, [job])
+
+    assert job.video_duration_secs == 125.43333333333334
+
+
+def test_completed_spark_job缺video_duration_secs時存None不拋錯(monkeypatch):
+    job = FakeJob("bv-noduration", status="processing", percent_complete=80)
+    _patch_spark(monkeypatch, {"bv-noduration": {
+        "status": "completed", "percent_complete": 100, "image_count": 10, "error": None,
+    }})
+    db = FakeDB()
+
+    _run(db, [job])
+
+    assert job.status == "completed"
+    assert job.video_duration_secs is None
 
 
 def test_completed_spark_job缺completed_at時退回同步時間估計值(monkeypatch):
