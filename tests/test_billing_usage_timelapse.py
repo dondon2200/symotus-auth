@@ -1,0 +1,77 @@
+from datetime import datetime
+
+import pytest
+
+from models import TimelapsJob, BillingUsageDaily
+from services.billing_usage import collect_timelapse_secs, upsert_usage
+
+DAY = "2026-08-19"
+
+
+def _job(db, user_id, camera_id, created_at, status="completed", image_count=900, fps=30, job_id=None):
+    j = TimelapsJob(
+        user_id=user_id, job_id=job_id or f"j{camera_id}-{created_at.isoformat()}",
+        camera_id=camera_id, status=status,
+        image_count=image_count, fps=fps, created_at=created_at,
+    )
+    db.add(j); db.commit()
+    return j
+
+
+@pytest.fixture()
+def user(make_user):
+    return make_user("usage_user", "usage@test.com", role="reseller")
+
+
+def test_加總當日完成的任務(db, user):
+    # 台北 2026-08-19 = naive UTC 2026-08-18 16:00 ~ 2026-08-19 16:00
+    _job(db, user.id, 1, datetime(2026, 8, 18, 20, 0), image_count=900, fps=30)   # 30 秒
+    _job(db, user.id, 1, datetime(2026, 8, 19, 10, 0), image_count=1800, fps=30)  # 60 秒
+    assert collect_timelapse_secs(db, DAY) == {1: 90}
+
+
+def test_只計完成的任務(db, user):
+    _job(db, user.id, 1, datetime(2026, 8, 19, 10, 0), status="processing")
+    _job(db, user.id, 1, datetime(2026, 8, 19, 11, 0), status="failed")
+    assert collect_timelapse_secs(db, DAY) == {}
+
+
+def test_台北時區的日界(db, user):
+    # naive UTC 15:59 = 台北 23:59 → 屬於 08-19
+    _job(db, user.id, 1, datetime(2026, 8, 19, 15, 59), image_count=900, fps=30)
+    # naive UTC 16:00 = 台北 隔天 00:00 → 屬於 08-20，不該被算進來
+    _job(db, user.id, 1, datetime(2026, 8, 19, 16, 0), image_count=900, fps=30)
+    assert collect_timelapse_secs(db, DAY) == {1: 30}
+
+
+def test_缺image_count的舊資料計零(db, user):
+    _job(db, user.id, 1, datetime(2026, 8, 19, 10, 0), image_count=None, fps=30)
+    assert collect_timelapse_secs(db, DAY) == {1: 0}
+
+
+def test_多台相機分開統計(db, user):
+    _job(db, user.id, 1, datetime(2026, 8, 19, 10, 0), image_count=900, fps=30)
+    _job(db, user.id, 2, datetime(2026, 8, 19, 10, 0), image_count=1800, fps=30)
+    assert collect_timelapse_secs(db, DAY) == {1: 30, 2: 60}
+
+
+def test_沒有camera_id的任務被忽略(db, user):
+    # GDrive 來源的縮時沒有相機，不屬於任何相機的用量
+    _job(db, user.id, None, datetime(2026, 8, 19, 10, 0))
+    assert collect_timelapse_secs(db, DAY) == {}
+
+
+def test_同日重跑覆蓋而非累加(db):
+    upsert_usage(db, camera_id=1, day=DAY, timelapse_secs=30, storage_gb=1.5)
+    upsert_usage(db, camera_id=1, day=DAY, timelapse_secs=90, storage_gb=2.0)
+
+    rows = db.query(BillingUsageDaily).filter(BillingUsageDaily.camera_id == 1).all()
+    assert len(rows) == 1           # 不是兩列
+    assert rows[0].timelapse_secs == 90   # 覆蓋，不是 120
+    assert rows[0].storage_gb == 2.0
+
+
+def test_不同日各自一列(db):
+    upsert_usage(db, camera_id=1, day=DAY, timelapse_secs=30, storage_gb=1.0)
+    upsert_usage(db, camera_id=1, day="2026-08-20", timelapse_secs=60, storage_gb=1.2)
+    assert db.query(BillingUsageDaily).filter(BillingUsageDaily.camera_id == 1).count() == 2

@@ -44,3 +44,52 @@ def job_duration_secs(image_count: Optional[int], fps: Optional[int]) -> int:
 def bytes_to_gb(n: int) -> float:
     """位元組 → GB，保留三位小數（一天幾百 MB 的相機四捨五入到整數會全變 0）。"""
     return round(n / _GB, 3)
+
+
+# ---- 以下為 I/O：資料就在 auth 自己的 DB，不必問 Spark ----
+
+from sqlalchemy.orm import Session
+
+from models import TimelapsJob, BillingUsageDaily
+
+
+def collect_timelapse_secs(db: Session, day: str) -> dict[int, int]:
+    """該日（台北）各相機完成的縮時影片總秒數。
+
+    資料就在 auth 自己的 DB，不必問 Spark——Spark 從不回呼，狀態不可信。
+    """
+    start_utc, end_utc = taipei_day_bounds_utc(day)
+    jobs = db.query(TimelapsJob).filter(
+        TimelapsJob.status == "completed",
+        TimelapsJob.created_at >= start_utc,
+        TimelapsJob.created_at < end_utc,
+    ).all()
+
+    out: dict[int, int] = {}
+    for j in jobs:
+        if not j.camera_id:
+            continue  # GDrive 來源的縮時沒有相機，不屬於任何相機的用量
+        secs = job_duration_secs(j.image_count, j.fps)
+        if secs == 0 and (not j.image_count or not j.fps):
+            logger.info(f"billing usage: job {j.job_id} 缺 image_count/fps，計 0")
+        out[j.camera_id] = out.get(j.camera_id, 0) + secs
+    return out
+
+
+def upsert_usage(db: Session, camera_id: int, day: str, timelapse_secs: int, storage_gb: float) -> None:
+    """寫入該相機該日用量。已存在就覆蓋——採集失敗後補跑不會重複累加。"""
+    row = db.query(BillingUsageDaily).filter(
+        BillingUsageDaily.camera_id == camera_id,
+        BillingUsageDaily.date == day,
+    ).first()
+    if row:
+        row.timelapse_secs = timelapse_secs
+        row.storage_gb = storage_gb
+        row.collected_at = datetime.utcnow()
+    else:
+        db.add(BillingUsageDaily(
+            camera_id=camera_id, date=day,
+            timelapse_secs=timelapse_secs, storage_gb=storage_gb,
+            collected_at=datetime.utcnow(),
+        ))
+    db.commit()
