@@ -238,6 +238,16 @@ async def startup():
                         conn.rollback()
                         logger.warning(f"billing_customers 補欄位 {col} 失敗：{e}")
 
+            # billing_subscriptions.camera_serial：NAS 用量採集快取欄位。
+            # 這張表已在正式庫存在，create_all 不會補欄位，需比照上面手動 ALTER。
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text("ALTER TABLE billing_subscriptions ADD COLUMN IF NOT EXISTS camera_serial TEXT"))
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    logger.warning(f"billing_subscriptions 補欄位 camera_serial 失敗：{e}")
+
             # 自我檢查：確認上面的欄位真的都補上了。計費模組非核心功能
             # （auth service 同時代理所有相機 CRUD），欄位缺失不該擋住服務啟動，
             # 但要在 log 大聲示警，讓維運人員能人工介入，而不是靜默讓計費 API 500。

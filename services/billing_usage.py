@@ -116,3 +116,34 @@ def upsert_usage(db: Session, camera_id: int, day: str, timelapse_secs: int, sto
         row.storage_gb = storage_gb
         row.collected_at = datetime.utcnow()
         db.commit()
+
+
+# NAS 根目錄。與 routers/cameras.py:1330 的 /homes/firmness/{serial_id} 一致。
+NAS_BASE = "/homes/firmness"
+
+
+def dir_size_bytes(path: str) -> int:
+    """走訪目錄加總檔案大小。
+
+    阻塞式 I/O——呼叫端必須用 asyncio.to_thread 包起來，否則會卡住整個事件迴圈。
+    auth service 同時是所有相機 CRUD 的代理，若在事件迴圈裡直接呼叫本函式，
+    走訪大目錄會卡住全站。
+    """
+    if not os.path.isdir(path):
+        return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                # 採集期間檔案被刪或權限問題：跳過單一檔案，不讓整台相機的統計失敗
+                continue
+    return total
+
+
+def collect_storage_gb(serial_id: str, base: str = NAS_BASE) -> float:
+    """該相機在 NAS 上佔用的空間（GB）。目錄不存在（新相機/未上傳）回 0。"""
+    if not serial_id:
+        return 0.0
+    return bytes_to_gb(dir_size_bytes(os.path.join(base, serial_id)))

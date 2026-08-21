@@ -290,6 +290,10 @@ class BillingSubscription(Base):
     started_at = Column(DateTime, default=datetime.utcnow)
     cancelled_at = Column(DateTime, nullable=True)
 
+    # NAS 目錄名（= Camera Backend 的 device_serial_id）。
+    # 由用量採集在首次需要時解析並快取，避免每日為每台相機重複打 Camera Backend。
+    camera_serial = Column(String, nullable=True)
+
 
 class BillingInvoice(Base):
     """月結發票。(customer_id, period) 唯一是產生作業冪等性的根據。
