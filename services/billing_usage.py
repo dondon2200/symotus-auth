@@ -146,7 +146,9 @@ def dir_size_bytes(path: str) -> int:
 
 
 def collect_storage_gb(serial_id: str, base: str = NAS_BASE) -> float:
-    """該相機在 NAS 上佔用的空間（GB）。目錄不存在（新相機/未上傳）回 0。"""
+    """該相機在 NAS 上目前的總佔用空間（GB）——時間點快照，不是當日的增量。
+    目錄不存在（新相機/未上傳）回 0。呼叫端寫入 BillingUsageDaily.storage_gb 時
+    不可對多天加總，期間用量須取期間內最後一列。"""
     if not serial_id:
         return 0.0
     return bytes_to_gb(dir_size_bytes(os.path.join(base, serial_id)))
@@ -231,9 +233,14 @@ async def run_collection(db: Session, day: str) -> dict:
     - failed：serial 解析成功但採集過程本身出錯（NAS 掛載問題等）的台數
 
     單台相機失敗只記 log 並跳過——一台相機的 NAS 掛載問題不該讓當日整批採集消失。
-    serial 解析不到的相機一律跳過、不寫入 storage_gb=0——storage_gb 是時間點快照，
-    寫 0 之後即使補設定重跑，也只能拿到「重跑當下」的目錄大小，不是當天的，
-    等同永久污染歷史，所以寧可不寫也不要寫錯。
+
+    serial 解析不到時，timelapse_secs 與 storage_gb 處理方式不同：
+    - timelapse_secs 來自 auth 自己的 DB，跟 serial 解析無關，事後可安全回填，
+      所以照寫，不因為 serial 問題連累原本查得到的資料。
+    - storage_gb 是時間點快照，寫 0（或亂寫）之後即使補設定重跑，也只能拿到
+      「重跑當下」的目錄大小，不是當天的，等同永久污染歷史；所以沿用該相機
+      目前列裡的舊值（沒有列過就是 0），不嘗試採集新值。
+    unresolved 計數不受影響，仍然照計，代表這台相機當天的 storage_gb 沒有更新。
     """
     secs_by_camera = collect_timelapse_secs(db, day)
     subs = db.query(BillingSubscription).filter(BillingSubscription.status == "active").all()
@@ -248,7 +255,17 @@ async def run_collection(db: Session, day: str) -> dict:
             serial = await resolve_camera_serial(db, sub, token)
             if not serial:
                 unresolved += 1
-                logger.warning(f"billing usage: 相機 {sub.camera_id} 無法解析 serial，跳過（{day}），不寫入 storage_gb=0")
+                # storage_gb 沿用該相機既有列的舊值（沒有就是 0）——timelapse_secs
+                # 仍照寫，不因為 serial 解析不到就連帶漏掉可回填的資料。
+                prev = db.query(BillingUsageDaily).filter(
+                    BillingUsageDaily.camera_id == sub.camera_id,
+                ).order_by(BillingUsageDaily.date.desc()).first()
+                prev_gb = prev.storage_gb if prev else 0.0
+                logger.warning(
+                    f"billing usage: 相機 {sub.camera_id} 無法解析 serial（{day}），"
+                    f"storage_gb 沿用舊值 {prev_gb}，timelapse_secs 照常寫入"
+                )
+                upsert_usage(db, sub.camera_id, day, secs_by_camera.get(sub.camera_id, 0), prev_gb)
                 continue
             # 阻塞式 I/O 必須丟到 thread，否則會卡住整個 auth 的事件迴圈
             gb = await asyncio.to_thread(collect_storage_gb, serial)

@@ -265,6 +265,15 @@ async def startup():
                         "billing_customers 缺少欄位，計費 API 將失效，請人工檢查 migration：" + str(e)
                     )
 
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text("SELECT camera_serial FROM billing_subscriptions LIMIT 1"))
+                except Exception as e:
+                    logger.error(
+                        "billing_subscriptions 缺少 camera_serial 欄位，NAS 儲存用量採集將失效，"
+                        "請人工檢查 migration：" + str(e)
+                    )
+
             logger.info("DB connected and tables created!")
             # 種子功能權限政策（缺列才補，不覆蓋既有調整）
             try:

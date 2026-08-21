@@ -11,6 +11,17 @@ import services.billing_usage as usage
 DAY = "2026-08-19"
 
 
+@pytest.fixture(autouse=True)
+def no_real_token_fetch(monkeypatch):
+    """這些測試意圖上完全不該打真正的 Camera Backend——過去只靠 CI/本機沒設
+    CAMERA_SERVICE_KEY/BILLING_COLLECTOR_CAMERA_EMAIL 讓 fetch_collector_token
+    隱性回傳 ""；若哪台機器剛好設了這兩個環境變數，測試會真的打
+    https://user.symotus.com/internal/auth/token。明確 monkeypatch 掉，不依賴環境。"""
+    async def _fake_fetch_collector_token(timeout: float = 15) -> str:
+        return ""
+    monkeypatch.setattr(usage, "fetch_collector_token", _fake_fetch_collector_token)
+
+
 @pytest.fixture()
 def app():
     a = FastAPI()
@@ -80,10 +91,13 @@ async def test_單台失敗不影響其他相機(db, customer, subs, monkeypatch
 
 
 @pytest.mark.anyio
-async def test_serial解析不到不寫入0且獨立計數(db, customer, subs, monkeypatch):
+async def test_serial解析不到仍寫入timelapse_secs且獨立計數(db, customer, subs, monkeypatch):
     monkeypatch.setattr(usage, "collect_storage_gb", lambda serial, base=None: {"SN001": 1.5, "SN002": 2.5}[serial])
     sub2 = db.query(BillingSubscription).filter(BillingSubscription.camera_id == 2).first()
     sub2.camera_serial = None  # 模擬未快取且無法解析（env 沒設定）
+    db.commit()
+    db.add(TimelapsJob(user_id=customer.id, job_id="j2", camera_id=2, status="completed",
+                       image_count=600, fps=30, created_at=datetime(2026, 8, 19, 10, 0)))
     db.commit()
 
     result = await usage.run_collection(db, DAY)
@@ -92,8 +106,10 @@ async def test_serial解析不到不寫入0且獨立計數(db, customer, subs, m
     assert result["failed"] == 0
     assert result["cameras"] == 1
     rows = {r.camera_id: r for r in db.query(BillingUsageDaily).all()}
-    assert 2 not in rows          # 沒有寫入 storage_gb=0 的錯誤列
-    assert rows[1].storage_gb == 1.5  # 其他正常相機不受影響
+    assert 2 in rows                    # timelapse_secs 可回填，照寫入一列
+    assert rows[2].timelapse_secs == 20  # 600 張 / 30fps = 20 秒
+    assert rows[2].storage_gb == 0.0    # 沒有舊列可沿用，storage_gb 為 0（不嘗試採集新值）
+    assert rows[1].storage_gb == 1.5    # 其他正常相機不受影響
 
 
 @pytest.mark.anyio

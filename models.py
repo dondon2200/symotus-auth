@@ -345,5 +345,5 @@ class BillingUsageDaily(Base):
     camera_id = Column(Integer, nullable=False, index=True)
     date = Column(String, nullable=False, index=True)  # YYYY-MM-DD（台北時區）
     timelapse_secs = Column(Integer, nullable=False, default=0)
-    storage_gb = Column(Float, nullable=False, default=0)
+    storage_gb = Column(Float, nullable=False, default=0)  # 時間點快照（該相機在 NAS 上的總佔用量），不是每日增量，跨天絕不可加總
     collected_at = Column(DateTime, default=datetime.utcnow)

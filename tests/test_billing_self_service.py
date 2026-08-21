@@ -4,7 +4,7 @@ import pytest
 from fastapi import FastAPI
 
 from routers.billing import router as billing_router
-from models import BillingSubscription
+from models import BillingSubscription, BillingUsageDaily
 
 PLAN = {"name": "標準方案", "monthly_fee": 1200, "timelapse_quota_secs": 3600, "storage_quota_gb": 100}
 PERIOD = "2026-08"
@@ -81,6 +81,19 @@ def test_配額回方案上限且用量預設為零(client, setup, alice, auth_h
     assert q[0]["storage_total_gb"] == 100
     assert q[0]["timelapse_used_secs"] == 0     # 用量採集在階段三才上線
     assert q[0]["state"] == "ok"
+
+
+def test_storage_gb取最新一列而非加總(client, setup, alice, auth_headers, db):
+    """storage_gb 是時間點快照：同一台相機兩天各寫 1.5GB，期間用量應是 1.5（最新一列），
+    不是 3.0（加總）。timelapse_secs 仍須是兩天的加總。"""
+    db.add(BillingUsageDaily(camera_id=7, date="2026-08-10", timelapse_secs=100, storage_gb=1.5))
+    db.add(BillingUsageDaily(camera_id=7, date="2026-08-15", timelapse_secs=200, storage_gb=1.5))
+    db.commit()
+
+    q = client.get("/billing/quotas/my", headers=auth_headers(alice)).json()
+    assert len(q) == 1
+    assert q[0]["storage_used_gb"] == 1.5
+    assert q[0]["timelapse_used_secs"] == 300
 
 
 def test_未登入不能讀自助端點(client, setup):

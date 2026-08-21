@@ -309,6 +309,9 @@ def create_subscription(
     if dup:
         raise HTTPException(409, "此相機已有生效中的訂閱")
 
+    # camera_serial 故意不從任何來源帶入，永遠是新建時的預設值 None：
+    # 目前沒有「更改既有訂閱 camera_id」的端點，所以沒有快取失效路徑；
+    # 未來若加上相機改派功能，務必在那裡清空舊訂閱的 camera_serial。
     sub = BillingSubscription(camera_id=body.camera_id, customer_id=body.customer_id, plan_id=body.plan_id)
     db.add(sub)
     log_action(db, current_user, "billing_create_subscription", "billing_subscription", None,
@@ -627,14 +630,19 @@ def my_quotas(db: Session = Depends(get_db), current_user: User = Depends(get_cu
     out = []
     for s in subs:
         plan = plans.get(s.plan_id)
-        used = db.query(
+        tl_used = int(db.query(
             func.coalesce(func.sum(BillingUsageDaily.timelapse_secs), 0),
-            func.coalesce(func.sum(BillingUsageDaily.storage_gb), 0),
         ).filter(
             BillingUsageDaily.camera_id == s.camera_id,
             BillingUsageDaily.date.like(f"{period}-%"),
-        ).one()
-        tl_used, st_used = int(used[0]), float(used[1])
+        ).scalar())
+        # storage_gb 是時間點快照，不可跨天加總——取期間內最新一列的值，
+        # 沒有資料就是 0（同 collect_storage_gb / models.py 欄位註解）。
+        last_row = db.query(BillingUsageDaily).filter(
+            BillingUsageDaily.camera_id == s.camera_id,
+            BillingUsageDaily.date.like(f"{period}-%"),
+        ).order_by(BillingUsageDaily.date.desc()).first()
+        st_used = float(last_row.storage_gb) if last_row else 0.0
         tl_total = plan.timelapse_quota_secs if plan else 0
         st_total = plan.storage_quota_gb if plan else 0
         # 兩種配額取較嚴重的狀態
