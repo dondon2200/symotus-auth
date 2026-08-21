@@ -160,19 +160,25 @@ COLLECTOR_CAMERA_EMAIL = os.environ.get("BILLING_COLLECTOR_CAMERA_EMAIL", "")
 CAMERA_BACKEND_URL = "https://user.symotus.com"
 CAMERA_SERVICE_KEY = os.environ.get("CAMERA_SERVICE_KEY", "")
 
+if not COLLECTOR_CAMERA_EMAIL or not CAMERA_SERVICE_KEY:
+    # error 而非 warning：這條路徑最系統性——一旦漏設，所有未快取 serial 的
+    # 相機（尤其新相機）當天的 NAS 儲存用量都會無法採集。放在每台相機的迴圈
+    # 裡刷 warning 一次採集會刷 N 則反而更容易被忽略，所以在 import 時只講一次。
+    logger.error(
+        "billing usage: 未設定 BILLING_COLLECTOR_CAMERA_EMAIL/CAMERA_SERVICE_KEY，"
+        "新相機（尚未快取 camera_serial）的 NAS 儲存用量將無法採集"
+    )
 
-async def resolve_camera_serial(db: Session, sub: BillingSubscription) -> str:
-    """取得相機的 NAS 目錄名，並快取在訂閱列上。
 
-    已快取就直接回傳——每日採集不該為每台相機重複打 Camera Backend。
+async def fetch_collector_token(timeout: float = 15) -> str:
+    """取得採集用的 Camera Backend token。
+
+    每日採集只需要拿一次——呼叫端（run_collection）應在迴圈外呼叫本函式一次，
+    而不是讓 resolve_camera_serial 每台相機各自重打 /internal/auth/token。
     """
-    if sub.camera_serial:
-        return sub.camera_serial
     if not COLLECTOR_CAMERA_EMAIL or not CAMERA_SERVICE_KEY:
-        logger.warning("billing usage: 未設定 BILLING_COLLECTOR_CAMERA_EMAIL/CAMERA_SERVICE_KEY，無法解析 serial")
         return ""
-
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         tok = await client.post(
             f"{CAMERA_BACKEND_URL}/internal/auth/token",
             headers={"x-service-key": CAMERA_SERVICE_KEY},
@@ -180,7 +186,24 @@ async def resolve_camera_serial(db: Session, sub: BillingSubscription) -> str:
         )
         if tok.status_code != 200:
             return ""
-        token = tok.json().get("access_token", "")
+        return tok.json().get("access_token", "")
+
+
+async def resolve_camera_serial(db: Session, sub: BillingSubscription, token: str = "") -> str:
+    """取得相機的 NAS 目錄名，並快取在訂閱列上。
+
+    已快取就直接回傳——每日採集不該為每台相機重複打 Camera Backend。
+    `token` 由呼叫端（run_collection）先取好傳入，避免每台相機各自 mint 一次。
+    """
+    if sub.camera_serial:
+        return sub.camera_serial
+    if not COLLECTOR_CAMERA_EMAIL or not CAMERA_SERVICE_KEY:
+        logger.warning("billing usage: 未設定 BILLING_COLLECTOR_CAMERA_EMAIL/CAMERA_SERVICE_KEY，無法解析 serial")
+        return ""
+    if not token:
+        return ""
+
+    async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(
             f"{CAMERA_BACKEND_URL}/api/cameras/{sub.camera_id}",
             headers={"Authorization": f"Bearer {token}"},
@@ -198,17 +221,35 @@ async def resolve_camera_serial(db: Session, sub: BillingSubscription) -> str:
 
 
 async def run_collection(db: Session, day: str) -> dict:
-    """採集指定日期（台北）的用量。回 {"day", "cameras", "failed"}。
+    """採集指定日期（台北）的用量。
+
+    回傳 {"day", "total", "cameras", "unresolved", "failed"}：
+    - total：當日應採集的訂閱數（分母）
+    - cameras：實際成功寫入的台數
+    - unresolved：serial 解析不到而跳過的台數（env 沒設定，或相機已不存在）——
+      這是設定問題，不是採集失敗，維運動作不同所以獨立計數，不併入 failed。
+    - failed：serial 解析成功但採集過程本身出錯（NAS 掛載問題等）的台數
 
     單台相機失敗只記 log 並跳過——一台相機的 NAS 掛載問題不該讓當日整批採集消失。
+    serial 解析不到的相機一律跳過、不寫入 storage_gb=0——storage_gb 是時間點快照，
+    寫 0 之後即使補設定重跑，也只能拿到「重跑當下」的目錄大小，不是當天的，
+    等同永久污染歷史，所以寧可不寫也不要寫錯。
     """
     secs_by_camera = collect_timelapse_secs(db, day)
     subs = db.query(BillingSubscription).filter(BillingSubscription.status == "active").all()
 
-    ok, failed = 0, 0
+    # 迴圈外先取一次 token：首次上線時所有訂閱的 camera_serial 都是 NULL，
+    # 若在 resolve_camera_serial 內個別 mint，會對 Camera Backend 發 2N 次請求。
+    token = await fetch_collector_token()
+
+    ok, failed, unresolved = 0, 0, 0
     for sub in subs:
         try:
-            serial = await resolve_camera_serial(db, sub)
+            serial = await resolve_camera_serial(db, sub, token)
+            if not serial:
+                unresolved += 1
+                logger.warning(f"billing usage: 相機 {sub.camera_id} 無法解析 serial，跳過（{day}），不寫入 storage_gb=0")
+                continue
             # 阻塞式 I/O 必須丟到 thread，否則會卡住整個 auth 的事件迴圈
             gb = await asyncio.to_thread(collect_storage_gb, serial)
             upsert_usage(db, sub.camera_id, day, secs_by_camera.get(sub.camera_id, 0), gb)
@@ -217,5 +258,5 @@ async def run_collection(db: Session, day: str) -> dict:
             failed += 1
             logger.warning(f"billing usage: 相機 {sub.camera_id} 採集失敗（{day}）：{e}")
 
-    logger.info(f"billing usage: {day} 採集完成，成功 {ok} 台、失敗 {failed} 台")
-    return {"day": day, "cameras": ok, "failed": failed}
+    logger.info(f"billing usage: {day} 採集完成，成功 {ok} 台、失敗 {failed} 台、無法解析 {unresolved} 台")
+    return {"day": day, "total": len(subs), "cameras": ok, "failed": failed, "unresolved": unresolved}

@@ -2,11 +2,30 @@
 from datetime import datetime
 
 import pytest
+from fastapi import FastAPI
 
+from routers.billing import router as billing_router
 from models import TimelapsJob, BillingUsageDaily, BillingPlan, BillingSubscription
 import services.billing_usage as usage
 
 DAY = "2026-08-19"
+
+
+@pytest.fixture()
+def app():
+    a = FastAPI()
+    a.include_router(billing_router)
+    return a
+
+
+@pytest.fixture()
+def admin(make_user):
+    return make_user("usage_admin", "usage_admin@test.com", role="symotus_admin")
+
+
+@pytest.fixture()
+def reseller(make_user):
+    return make_user("usage_reseller", "usage_reseller@test.com", role="reseller")
 
 
 @pytest.fixture()
@@ -61,6 +80,23 @@ async def test_單台失敗不影響其他相機(db, customer, subs, monkeypatch
 
 
 @pytest.mark.anyio
+async def test_serial解析不到不寫入0且獨立計數(db, customer, subs, monkeypatch):
+    monkeypatch.setattr(usage, "collect_storage_gb", lambda serial, base=None: {"SN001": 1.5, "SN002": 2.5}[serial])
+    sub2 = db.query(BillingSubscription).filter(BillingSubscription.camera_id == 2).first()
+    sub2.camera_serial = None  # 模擬未快取且無法解析（env 沒設定）
+    db.commit()
+
+    result = await usage.run_collection(db, DAY)
+
+    assert result["unresolved"] == 1
+    assert result["failed"] == 0
+    assert result["cameras"] == 1
+    rows = {r.camera_id: r for r in db.query(BillingUsageDaily).all()}
+    assert 2 not in rows          # 沒有寫入 storage_gb=0 的錯誤列
+    assert rows[1].storage_gb == 1.5  # 其他正常相機不受影響
+
+
+@pytest.mark.anyio
 async def test_取消的訂閱不採集(db, customer, subs, monkeypatch):
     monkeypatch.setattr(usage, "collect_storage_gb", lambda serial, base=None: 1.0)
     sub = db.query(BillingSubscription).filter(BillingSubscription.camera_id == 1).first()
@@ -77,3 +113,13 @@ async def test_重跑同一天不產生重複列(db, customer, subs, monkeypatch
     await usage.run_collection(db, DAY)
     await usage.run_collection(db, DAY)
     assert db.query(BillingUsageDaily).count() == 2   # 兩台相機各一列，不是四列
+
+
+def test_非admin不能手動補跑採集(client, reseller, auth_headers):
+    r = client.post("/billing/admin/usage/collect?date=2026-08-19", headers=auth_headers(reseller))
+    assert r.status_code == 403
+
+
+def test_採集端點日期格式錯誤回422(client, admin, auth_headers):
+    r = client.post("/billing/admin/usage/collect?date=2026-8-19", headers=auth_headers(admin))
+    assert r.status_code == 422

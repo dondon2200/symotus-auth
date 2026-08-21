@@ -666,6 +666,6 @@ async def collect_usage(date: str, db: Session = Depends(get_db), current_user: 
         raise HTTPException(422, "日期格式須為 YYYY-MM-DD")
     result = await run_collection(db, date)
     log_action(db, current_user, "billing_collect_usage", "billing_usage", None,
-               f"date={date} ok={result['cameras']} failed={result['failed']}")
+               f"date={date} ok={result['cameras']} failed={result['failed']} unresolved={result['unresolved']}")
     db.commit()
     return result
