@@ -54,16 +54,18 @@ async def startup():
                     try:
                         conn.execute(text(f"ALTER TABLE timelapse_jobs ADD COLUMN IF NOT EXISTS {col} {typ}"))
                         conn.commit()
-                    except Exception:
+                    except Exception as e:
                         conn.rollback()
+                        logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
             # 在 users 表加 camera_email（若尚未存在）
             from sqlalchemy import text
             with engine.connect() as conn:
                 try:
                     conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS camera_email TEXT"))
                     conn.commit()
-                except Exception:
+                except Exception as e:
                     conn.rollback()
+                    logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
             # 確保 camera_invitations table 存在（新功能）
             with engine.connect() as conn:
                 try:
@@ -104,28 +106,32 @@ async def startup():
                         else:
                             conn.execute(text(f"ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS {col} {typ}"))
                         conn.commit()
-                    except Exception:
+                    except Exception as e:
                         conn.rollback()
+                        logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
 
             # 補上 camera_access.permission_level
             with engine.connect() as conn:
                 try:
                     conn.execute(text("ALTER TABLE camera_access ADD COLUMN IF NOT EXISTS permission_level VARCHAR DEFAULT 'photos_stream' NOT NULL"))
                     conn.commit()
-                except Exception:
+                except Exception as e:
                     conn.rollback()
+                    logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
             with engine.connect() as conn:
                 try:
                     conn.execute(text("ALTER TABLE camera_access ADD COLUMN IF NOT EXISTS notify_on_online BOOLEAN DEFAULT TRUE NOT NULL"))
                     conn.commit()
-                except Exception:
+                except Exception as e:
                     conn.rollback()
+                    logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
             with engine.connect() as conn:
                 try:
                     conn.execute(text("ALTER TABLE camera_access ADD COLUMN IF NOT EXISTS invitation_id INTEGER"))
                     conn.commit()
-                except Exception:
+                except Exception as e:
                     conn.rollback()
+                    logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
 
             # 補上 gdrive_jobs 新流程欄位（OAuth + Picker）並放寬 folder_url
             with engine.connect() as conn:
@@ -148,8 +154,9 @@ async def startup():
                     try:
                         conn.execute(text(stmt))
                         conn.commit()
-                    except Exception:
+                    except Exception as e:
                         conn.rollback()
+                        logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
 
             # 補上 invite_tokens 的角色 + 預綁 Camera Backend 帳號欄位
             with engine.connect() as conn:
@@ -161,8 +168,9 @@ async def startup():
                     try:
                         conn.execute(text(stmt))
                         conn.commit()
-                    except Exception:
+                    except Exception as e:
                         conn.rollback()
+                        logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
 
             # 補建 billing 部分唯一索引（給既有環境用）。
             # create_all() 只會對「尚不存在」的表建索引，不會替既有表補建索引；

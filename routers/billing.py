@@ -29,7 +29,7 @@ from schemas import (
 from auth import require_role, get_current_user
 from audit import log_action
 from services.billing_calc import (
-    invoice_total, quota_state, period_of, period_bounds_utc, effective_monthly_fee,
+    invoice_total, quota_state, period_of, next_period, period_bounds_utc, effective_monthly_fee,
     commission_amount, commission_display,
 )
 from services.billing_usage import run_collection
@@ -642,6 +642,17 @@ def my_quotas(db: Session = Depends(get_db), current_user: User = Depends(get_cu
             BillingUsageDaily.camera_id == s.camera_id,
             BillingUsageDaily.date.like(f"{period}-%"),
         ).order_by(BillingUsageDaily.date.desc()).first()
+        if last_row is None:
+            # 排程在台北 03:00 採「前一天」，所以每月 1 號白天到 2 號 03:00 之前，
+            # 本期完全沒有列——這不代表沒有用量，只是快照還沒落地。
+            # storage_gb 是「目前佔用」的快照，跨月沿用上一筆舊值比直接回 0
+            # 更接近事實：0 會讓實際佔用 90GB 的相機在帳單上顯示 0GB。
+            # 退而取「本期最後一天以前」全域最新一列；仍查無才真的是 0。
+            period_end = f"{next_period(period)}-01"
+            last_row = db.query(BillingUsageDaily).filter(
+                BillingUsageDaily.camera_id == s.camera_id,
+                BillingUsageDaily.date < period_end,
+            ).order_by(BillingUsageDaily.date.desc()).first()
         st_used = float(last_row.storage_gb) if last_row else 0.0
         tl_total = plan.timelapse_quota_secs if plan else 0
         st_total = plan.storage_quota_gb if plan else 0

@@ -113,6 +113,27 @@ async def test_serial解析不到仍寫入timelapse_secs且獨立計數(db, cust
 
 
 @pytest.mark.anyio
+async def test_補跑舊日期不會把新快照寫進過去那天(db, customer, subs, monkeypatch):
+    """先有 08-20 的列（storage 5.0），再補跑 08-15。serial 解析不到時沿用的
+    prev 必須是「08-15 或更早」的列，不能取到 08-20 的 5.0 寫進 08-15——
+    那正是污染歷史（docstring 明講要避免的事）。"""
+    monkeypatch.setattr(usage, "collect_storage_gb", lambda serial, base=None: {"SN001": 1.0, "SN002": 9.0}[serial])
+    await usage.run_collection(db, "2026-08-20")  # 先產生 08-20 的正常列，storage 9.0
+
+    sub2 = db.query(BillingSubscription).filter(BillingSubscription.camera_id == 2).first()
+    sub2.camera_serial = None  # 模擬補跑舊日期時 serial 解析不到
+    db.commit()
+
+    result = await usage.run_collection(db, "2026-08-15")  # 補跑更早的日期
+
+    assert result["unresolved"] == 1
+    row_0815 = db.query(BillingUsageDaily).filter(
+        BillingUsageDaily.camera_id == 2, BillingUsageDaily.date == "2026-08-15",
+    ).first()
+    assert row_0815.storage_gb == 0.0  # 沒有 08-15（或更早）的舊列可沿用，不能借用 08-20 的 9.0
+
+
+@pytest.mark.anyio
 async def test_取消的訂閱不採集(db, customer, subs, monkeypatch):
     monkeypatch.setattr(usage, "collect_storage_gb", lambda serial, base=None: 1.0)
     sub = db.query(BillingSubscription).filter(BillingSubscription.camera_id == 1).first()

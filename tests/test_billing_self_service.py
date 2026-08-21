@@ -96,5 +96,18 @@ def test_storage_gb取最新一列而非加總(client, setup, alice, auth_header
     assert q[0]["timelapse_used_secs"] == 300
 
 
+def test_本期還沒有採集列時沿用最近一次快照(client, setup, alice, auth_headers, db):
+    """排程 03:00 採「前一天」，所以每月 1 號白天、2 號 03:00 之前，本期都還沒有任何列。
+    若這時回 0，實際佔 90GB 的相機會顯示 0GB——快照的語意是「目前佔用」，
+    跨月沿用比歸零更接近事實。只寫上月最後一天的列，本期完全無列 → 仍應沿用該值。"""
+    db.add(BillingUsageDaily(camera_id=7, date="2026-07-31", timelapse_secs=50, storage_gb=1.5))
+    db.commit()
+
+    q = client.get("/billing/quotas/my", headers=auth_headers(alice)).json()
+    assert len(q) == 1
+    assert q[0]["storage_used_gb"] == 1.5
+    assert q[0]["timelapse_used_secs"] == 0  # 本期 timelapse 仍是 0，不受沿用影響
+
+
 def test_未登入不能讀自助端點(client, setup):
     assert client.get("/billing/subscriptions/my").status_code in (401, 403)

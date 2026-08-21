@@ -234,7 +234,8 @@ async def run_collection(db: Session, day: str) -> dict:
 
     回傳 {"day", "total", "cameras", "unresolved", "failed"}：
     - total：當日應採集的訂閱數（分母）
-    - cameras：實際成功寫入的台數
+    - cameras：storage 與 timelapse 都完整採集成功的台數（unresolved 分支雖然也會
+      寫入一列，但只有 timelapse_secs 是新採的，storage_gb 是沿用舊值，不計入這裡）
     - unresolved：serial 解析不到而跳過的台數（env 沒設定，或相機已不存在）——
       這是設定問題，不是採集失敗，維運動作不同所以獨立計數，不併入 failed。
     - failed：serial 解析成功但採集過程本身出錯（NAS 掛載問題等）的台數
@@ -264,8 +265,12 @@ async def run_collection(db: Session, day: str) -> dict:
                 unresolved += 1
                 # storage_gb 沿用該相機既有列的舊值（沒有就是 0）——timelapse_secs
                 # 仍照寫，不因為 serial 解析不到就連帶漏掉可回填的資料。
+                # 必須限制 date <= day：補跑舊日期（POST .../collect?date=較早日期）時，
+                # 若不加這個條件，會取到「之後某天」的快照寫回這個較早的日期，
+                # 那正是本函式 docstring 說要避免的「永久污染歷史」。
                 prev = db.query(BillingUsageDaily).filter(
                     BillingUsageDaily.camera_id == sub.camera_id,
+                    BillingUsageDaily.date <= day,
                 ).order_by(BillingUsageDaily.date.desc()).first()
                 prev_gb = prev.storage_gb if prev else 0.0
                 logger.warning(
