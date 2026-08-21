@@ -51,6 +51,7 @@ def bytes_to_gb(n: int) -> float:
 
 # ---- 以下為 I/O：資料就在 auth 自己的 DB，不必問 Spark ----
 
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -61,12 +62,18 @@ def collect_timelapse_secs(db: Session, day: str) -> dict[int, int]:
     """該日（台北）各相機完成的縮時影片總秒數。
 
     資料就在 auth 自己的 DB，不必問 Spark——Spark 從不回呼，狀態不可信。
+
+    以「完成日」（completed_at）而非「建立日」（created_at）歸日：任務可能跨日
+    完成（例如台北 23:40 建立、隔天 04:00 才完成的任務），用建立日切會讓完成當天
+    的用量永久漏計。completed_at 是後加欄位，正式庫既有資料一律是 NULL，因此用
+    COALESCE(completed_at, created_at) 退回 created_at，否則既有的縮時用量會整批消失。
     """
     start_utc, end_utc = taipei_day_bounds_utc(day)
+    effective_time = func.coalesce(TimelapsJob.completed_at, TimelapsJob.created_at)
     jobs = db.query(TimelapsJob).filter(
         TimelapsJob.status == "completed",
-        TimelapsJob.created_at >= start_utc,
-        TimelapsJob.created_at < end_utc,
+        effective_time >= start_utc,
+        effective_time < end_utc,
     ).all()
 
     out: dict[int, int] = {}

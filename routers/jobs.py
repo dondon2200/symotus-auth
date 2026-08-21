@@ -112,6 +112,10 @@ def update_job(
     if not job:
         raise HTTPException(404, "Job 不存在")
     if body.status is not None:
+        # 只在「從非 completed 轉為 completed」時寫入 completed_at，避免重複
+        # 輪詢到同一個結果時把完成日往後改，導致用量從舊日搬到新日。
+        if body.status == "completed" and job.status != "completed":
+            job.completed_at = datetime.utcnow()
         job.status = body.status
     if body.percent_complete is not None:
         job.percent_complete = body.percent_complete
@@ -165,7 +169,12 @@ def internal_update_job(
     if not job:
         return {"message": "Job not found, ignored"}
 
-    if body.status is not None: job.status = body.status
+    if body.status is not None:
+        # 只在「從非 completed 轉為 completed」時寫入 completed_at，避免重複
+        # 回呼同一結果時把完成日往後改，導致用量從舊日搬到新日。
+        if body.status == "completed" and job.status != "completed":
+            job.completed_at = datetime.utcnow()
+        job.status = body.status
     if body.percent_complete is not None: job.percent_complete = body.percent_complete
     if body.video_url is not None: job.video_url = body.video_url
     if body.error_message is not None: job.error_message = body.error_message
@@ -282,6 +291,10 @@ async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
         percent = data.get("percent_complete")
         changed = False
         if status and status != job.status:
+            # 這裡本來就是「從非 completed 轉為 completed」的判定（status != job.status），
+            # 所以 completed_at 只會在真正轉態時寫入，重複同步到同一結果不會覆蓋。
+            if status == "completed":
+                job.completed_at = datetime.utcnow()
             job.status = status
             changed = True
         # 完成時補滿 100%，其餘採 Spark 回報值（只在數字有前進時才寫，避免倒退）

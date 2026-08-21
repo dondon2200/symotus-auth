@@ -128,6 +128,10 @@ class TimelapsJob(Base):
     processing_time_secs = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # 任務完成時間（naive UTC）。計費用量以「完成日」歸屬，不用 created_at——
+    # 跨日完成的任務（例如台北 23:40 建立、隔天 04:00 完成）用建立日會被永久漏計。
+    # 舊資料為 NULL，採集時退回用 created_at（見 services/billing_usage.py）。
+    completed_at = Column(DateTime, nullable=True)
 # 注意：下面的欄位需要 ALTER TABLE 或在新環境自動建立
 # TimelapsJob 額外欄位（已在 class 定義，這裡補充說明）
 

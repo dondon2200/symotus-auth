@@ -49,6 +49,7 @@ async def startup():
                     ("error_message", "TEXT"),
                     ("image_count", "INTEGER"),
                     ("processing_time_secs", "TEXT"),
+                    ("completed_at", "TIMESTAMP"),
                 ]:
                     try:
                         conn.execute(text(f"ALTER TABLE timelapse_jobs ADD COLUMN IF NOT EXISTS {col} {typ}"))
@@ -271,6 +272,19 @@ async def startup():
                 except Exception as e:
                     logger.error(
                         "billing_subscriptions 缺少 camera_serial 欄位，NAS 儲存用量採集將失效，"
+                        "請人工檢查 migration：" + str(e)
+                    )
+
+            # timelapse_jobs.completed_at：這張表在正式庫已存在且有資料，
+            # create_all 不會補欄位。若 ALTER 失敗，SQLAlchemy 之後對 TimelapsJob
+            # 的每次查詢都會 SELECT 一個不存在的欄位 → /jobs 相關功能全部 500，
+            # 所以同樣要自我檢查、大聲示警。
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text("SELECT completed_at FROM timelapse_jobs LIMIT 1"))
+                except Exception as e:
+                    logger.error(
+                        "timelapse_jobs 缺少 completed_at 欄位，/jobs 相關功能將失效，"
                         "請人工檢查 migration：" + str(e)
                     )
 

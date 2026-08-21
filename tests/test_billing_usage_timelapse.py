@@ -55,6 +55,37 @@ def test_多台相機分開統計(db, user):
     assert collect_timelapse_secs(db, DAY) == {1: 30, 2: 60}
 
 
+def test_以完成時間歸日而非建立時間(db, user):
+    # 台北 08-19 23:40 建立（naive UTC 15:40）、08-20 04:00 完成（naive UTC 19:00 前一天）
+    # 建立日是 08-19、完成日是 08-20 → 應計入 08-20，不是 08-19
+    j = _job(db, user.id, 1, datetime(2026, 8, 19, 15, 40), image_count=900, fps=30)
+    j.completed_at = datetime(2026, 8, 19, 20, 0)   # 台北 08-20 04:00
+    db.commit()
+
+    assert collect_timelapse_secs(db, "2026-08-19") == {}
+    assert collect_timelapse_secs(db, "2026-08-20") == {1: 30}
+
+
+def test_舊資料沒有完成時間時退回建立時間(db, user):
+    # completed_at 是後來才加的欄位，既有資料是 NULL。
+    # 若不 fallback，正式庫既有的縮時用量會整批消失。
+    j = _job(db, user.id, 1, datetime(2026, 8, 19, 10, 0), image_count=900, fps=30)
+    j.completed_at = None
+    db.commit()
+    assert collect_timelapse_secs(db, DAY) == {1: 30}
+
+
+def test_完成時間的台北日界(db, user):
+    # naive UTC 15:59 = 台北 23:59 → 屬 08-19
+    a = _job(db, user.id, 1, datetime(2026, 8, 1, 0, 0), image_count=900, fps=30, job_id="a")
+    a.completed_at = datetime(2026, 8, 19, 15, 59)
+    # naive UTC 16:00 = 台北隔天 00:00 → 屬 08-20
+    b = _job(db, user.id, 1, datetime(2026, 8, 1, 0, 0), image_count=900, fps=30, job_id="b")
+    b.completed_at = datetime(2026, 8, 19, 16, 0)
+    db.commit()
+    assert collect_timelapse_secs(db, DAY) == {1: 30}
+
+
 def test_沒有camera_id的任務被忽略(db, user):
     # GDrive 來源的縮時沒有相機，不屬於任何相機的用量
     _job(db, user.id, None, datetime(2026, 8, 19, 10, 0))
