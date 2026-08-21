@@ -7,6 +7,8 @@ from config import settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_USAGE_TASK = None  # 模組層級，避免 asyncio.create_task 的回傳值被 GC 回收後任務無聲消失
+
 app = FastAPI(
     title="Symotus Auth Service",
     description="權限管理服務",
@@ -309,6 +311,10 @@ async def startup():
             # 啟動相機開機 LINE 推播背景工作
             from services.camera_notifier import start_camera_notifier
             asyncio.create_task(start_camera_notifier())
+            # 啟動計費用量每日採集背景工作
+            from services.billing_usage import start_usage_collector
+            global _USAGE_TASK
+            _USAGE_TASK = asyncio.create_task(start_usage_collector())
             break
         except Exception as e:
             logger.warning(f"DB not ready: {e}")

@@ -260,3 +260,54 @@ async def run_collection(db: Session, day: str) -> dict:
 
     logger.info(f"billing usage: {day} 採集完成，成功 {ok} 台、失敗 {failed} 台、無法解析 {unresolved} 台")
     return {"day": day, "total": len(subs), "cameras": ok, "failed": failed, "unresolved": unresolved}
+
+
+# 每日採集時間（台北時區的小時）。03:00 是離峰，且前一天的資料已全部落地。
+COLLECT_HOUR_TAIPEI = 3
+
+
+def seconds_until_next_collect(now_utc: datetime) -> float:
+    """算出距離下一個台北時間 03:00 還有幾秒（純函式，可單元測試）。
+
+    抽成獨立函式是為了讓跨日、跨時區的邊界可測——排程迴圈本身有無限迴圈
+    + 長時間 sleep，無法直接測試。
+    """
+    taipei = now_utc + TAIPEI_OFFSET
+    target = taipei.replace(hour=COLLECT_HOUR_TAIPEI, minute=0, second=0, microsecond=0)
+    if target <= taipei:
+        target += timedelta(days=1)
+    return (target - taipei).total_seconds()
+
+
+async def start_usage_collector() -> None:
+    """每日在台北時間 03:00 採集前一天的用量。
+
+    比照 services/camera_notifier.py 的模式，由 main.py 的 startup 以
+    asyncio.create_task 啟動。整個迴圈包在 try 裡——採集出錯絕不能讓服務停掉
+    （auth 同時是所有相機 CRUD 的代理）。asyncio.CancelledError 例外：那是
+    正常的關閉流程，往上拋才能讓服務乾淨關閉，吞掉會卡住 shutdown。
+
+    限制：storage_gb 是時間點快照，無法回溯補算——排程漏跑一天之後再補跑，
+    寫進去的是「補跑當下」的 NAS 目錄大小，不是那天的。所以排程的可靠性
+    比補跑機制更重要，這也是本函式把每一步失敗都設計成「記 log 後重試」
+    而不是「放棄」的原因。
+    """
+    from database import SessionLocal
+
+    logger.info("billing usage collector 已啟動")
+    while True:
+        try:
+            await asyncio.sleep(seconds_until_next_collect(datetime.utcnow()))
+
+            db = SessionLocal()
+            try:
+                day = yesterday_taipei(datetime.utcnow())
+                await run_collection(db, day)
+            finally:
+                db.close()
+        except asyncio.CancelledError:
+            logger.info("billing usage collector 已停止")
+            raise
+        except Exception as e:
+            logger.error(f"billing usage collector 發生錯誤，60 秒後重試：{e}")
+            await asyncio.sleep(60)
