@@ -3,6 +3,7 @@
 用於「有連結即可看串流＋縮時預覽」的分享功能
 """
 import httpx
+import json as _json
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -152,10 +153,17 @@ async def get_public_nas_images(token: str, request: Request, db: Session = Depe
     return await list_nas_images_backend(cam_token, str(inv.camera_id), params)
 
 
-# 相機 serial 快取（camera_id → (serial, expires_at)）：/image 每張都要驗路徑歸屬，
+# 相機照片根目錄快取（camera_id → (base_path, expires_at)）：/image 每張都要驗路徑歸屬，
 # 不快取就等於每張圖多一次 Camera Backend 查詢（見 2026-08-14 連線池耗盡事故）。
+#
+# 2026-08-21：原本只認 /homes/firmness/{serial}/ 這一種版型，但實際 NAS 版型因帳號而異
+# （例：camera_id=4 的照片在 /homes/james/ipcam/），且部分相機用 granter token 查
+# /api/cameras/{id} 拿不到 serial —— 兩種情況都讓公開頁每一張圖 403，「僅預覽觀看」
+# 分享連結因此全部播不出畫面。改成直接問列表核心「這台相機的照片在哪個資料夾」，
+# 與 /images 端點回給前端的路徑同源，杜絕版型假設。
 _SERIAL_TTL = 300.0
-_serial_cache: dict[int, tuple[str, float]] = {}
+_serial_cache: dict[int, tuple[str, float]] = {}          # 舊名保留：其他模組/測試沿用
+_base_path_cache: dict[int, tuple[str, float]] = {}
 
 
 async def _camera_serial(camera_id: int, cam_token: str) -> str:
@@ -177,14 +185,59 @@ async def _camera_serial(camera_id: int, cam_token: str) -> str:
     return serial
 
 
+def _json_of(resp) -> dict:
+    """列表核心回的是 JSONResponse（body 為 bytes），也可能是 dict。"""
+    if isinstance(resp, dict):
+        return resp
+    body = getattr(resp, "body", None)
+    if body is None:
+        return {}
+    try:
+        return _json.loads(body)
+    except Exception:
+        return {}
+
+
+async def _listing_base_path(camera_id: int, cam_token: str) -> str:
+    """問列表核心「這台相機的照片放在哪」，回 debug.folder_path（無尾斜線）。
+    serial 版型會回 /homes/firmness/{serial}；其餘版型由 Camera Backend 決定。"""
+    now = _time.monotonic()
+    hit = _base_path_cache.get(camera_id)
+    if hit and hit[1] > now:
+        return hit[0]
+    from routers.cameras import list_nas_images_backend
+    try:
+        data = _json_of(await list_nas_images_backend(cam_token, str(camera_id), {"limit": "1"}))
+        base = ((data.get("debug") or {}).get("folder_path") or "").rstrip("/")
+    except Exception:
+        base = ""
+    if base:
+        _base_path_cache[camera_id] = (base, now + _SERIAL_TTL)
+    return base
+
+
+async def _path_belongs_to_camera(camera_id: int, cam_token: str, path: str) -> tuple[bool, bool]:
+    """(是否屬於本相機, 是否能判定)。
+
+    先用 serial 版型快速判斷（便宜、命中率高）；不符再問列表核心要實際根目錄，
+    避免把版型不同或 serial 查不到的相機一律當成越權。"""
+    serial = await _camera_serial(camera_id, cam_token)
+    if serial and path.startswith(f"/homes/firmness/{serial}/"):
+        return True, True
+    base = await _listing_base_path(camera_id, cam_token)
+    if not base:
+        return False, False
+    return path.startswith(f"{base}/"), True
+
+
 @router.get("/{token}/image")
 async def get_public_nas_image(token: str, request: Request, db: Session = Depends(get_db)):
     """代理 NAS 圖片（公開縮時預覽與相簿放大檢視用）。
     只轉發白名單參數（path/thumbnail/limit），其餘來路參數一律丟棄。
 
-    path 必須落在本邀請相機自己的 serial 目錄下（2026-08-14 補洞：分享者名下有多台
+    path 必須落在本邀請相機自己的照片根目錄下（2026-08-14 補洞：分享者名下有多台
     相機時，同一顆 granter token 對所有相機都有效，未驗歸屬等於任一公開連結可讀取
-    該帳號其他相機的照片）。列表端點本就只回本機 serial 的路徑，故不影響正常使用。
+    該帳號其他相機的照片）。根目錄取自列表核心，與 /images 回給前端的路徑同源。
 
     thumbnail 由呼叫端決定（預設 true）：2026-08-14 產品決議——公開頁的相簿放大檢視
     顯示原圖。「不可下載」自此僅指不提供下載按鈕與批次取檔入口（UI 層），
@@ -194,9 +247,14 @@ async def get_public_nas_image(token: str, request: Request, db: Session = Depen
     path = request.query_params.get("path")
     if not path:
         raise HTTPException(400, "缺少 path 參數")
+    if ".." in path:   # 前綴比對擋不住 ../ 回上層
+        raise HTTPException(403, "此連結無權存取該路徑")
 
-    serial = await _camera_serial(inv.camera_id, cam_token)
-    if not serial or not path.startswith(f"/homes/firmness/{serial}/"):
+    belongs, decided = await _path_belongs_to_camera(inv.camera_id, cam_token, path)
+    if not decided:
+        # 查不出根目錄是後端/網路問題，不是越權；回 403 會讓前端誤判成「連結無效」
+        raise HTTPException(503, "暫時無法驗證圖片路徑，請稍後再試")
+    if not belongs:
         raise HTTPException(403, "此連結無權存取該路徑")
 
     thumb = request.query_params.get("thumbnail")

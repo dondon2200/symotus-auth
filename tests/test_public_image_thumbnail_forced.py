@@ -46,12 +46,16 @@ class FakeAsyncClient:
 def _fakes(monkeypatch):
     captured.clear()
     public_mod._serial_cache.clear()
+    public_mod._base_path_cache.clear()
     async def fake_get_public_cam(token, db):
         return (FakeInv(), "tok")
     async def fake_serial(camera_id, cam_token):
         return SERIAL
     monkeypatch.setattr(public_mod, "_get_public_cam", fake_get_public_cam)
+    async def fake_listing_base(camera_id, cam_token):
+        return f"/homes/firmness/{SERIAL}"
     monkeypatch.setattr(public_mod, "_camera_serial", fake_serial)
+    monkeypatch.setattr(public_mod, "_listing_base_path", fake_listing_base)
     monkeypatch.setattr(public_mod.httpx, "AsyncClient", FakeAsyncClient)
 
 
@@ -101,3 +105,57 @@ def test_missing_path_rejected():
     with pytest.raises(HTTPException) as e:
         asyncio.run(get_public_nas_image(token="x", request=req, db=None))
     assert e.value.status_code == 400
+
+
+# ── 非 serial 版型（2026-08-21）───────────────────────────────────────────
+# 部分帳號的照片不在 /homes/firmness/{serial}/ 下（實測 camera_id=4 在
+# /homes/james/ipcam/），且有相機用 granter token 查不到 serial。
+# 只認 serial 版型會讓這些相機的公開連結每張圖都 403 → 縮時完全播不出來。
+
+def test_non_serial_layout_allowed(monkeypatch):
+    async def no_serial(camera_id, cam_token):
+        return ""
+    async def listing_base(camera_id, cam_token):
+        return "/homes/james/ipcam"
+    monkeypatch.setattr(public_mod, "_camera_serial", no_serial)
+    monkeypatch.setattr(public_mod, "_listing_base_path", listing_base)
+    req = FakeRequest({"path": "/homes/james/ipcam/10_03_40_020.jpg"})
+    asyncio.run(get_public_nas_image(token="x", request=req, db=None))
+    assert captured["params"]["path"] == "/homes/james/ipcam/10_03_40_020.jpg"
+
+
+def test_non_serial_layout_other_folder_forbidden(monkeypatch):
+    async def no_serial(camera_id, cam_token):
+        return ""
+    async def listing_base(camera_id, cam_token):
+        return "/homes/james/ipcam"
+    monkeypatch.setattr(public_mod, "_camera_serial", no_serial)
+    monkeypatch.setattr(public_mod, "_listing_base_path", listing_base)
+    req = FakeRequest({"path": "/homes/james/other/10_03_40_020.jpg"})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(get_public_nas_image(token="x", request=req, db=None))
+    assert e.value.status_code == 403
+    assert captured == {}
+
+
+def test_unresolvable_base_returns_503(monkeypatch):
+    """判不出根目錄是後端/網路問題，不是越權——回 503，前端才不會顯示成連結無效。"""
+    async def no_serial(camera_id, cam_token):
+        return ""
+    async def no_base(camera_id, cam_token):
+        return ""
+    monkeypatch.setattr(public_mod, "_camera_serial", no_serial)
+    monkeypatch.setattr(public_mod, "_listing_base_path", no_base)
+    req = FakeRequest({"path": "/homes/james/ipcam/a.jpg"})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(get_public_nas_image(token="x", request=req, db=None))
+    assert e.value.status_code == 503
+    assert captured == {}
+
+
+def test_parent_traversal_forbidden():
+    req = FakeRequest({"path": f"/homes/firmness/{SERIAL}/../{OTHER_SERIAL}/x.jpg"})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(get_public_nas_image(token="x", request=req, db=None))
+    assert e.value.status_code == 403
+    assert captured == {}
