@@ -32,7 +32,7 @@ from services.billing_calc import (
     invoice_total, quota_state, period_of, next_period, period_bounds_utc, effective_monthly_fee,
     commission_amount, commission_display,
 )
-from services.billing_usage import run_collection, yesterday_taipei
+from services.billing_usage import run_collection, yesterday_taipei, backfill_all_missing_job_fields
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -696,5 +696,27 @@ async def collect_usage(date: str, db: Session = Depends(get_db), current_user: 
     result = await run_collection(db, date)
     log_action(db, current_user, "billing_collect_usage", "billing_usage", None,
                f"date={date} ok={result['cameras']} failed={result['failed']} unresolved={result['unresolved']}")
+    db.commit()
+    return result
+
+
+@router.post("/admin/usage/backfill-jobs")
+async def backfill_jobs(
+    limit: int = 500,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(ADMIN),
+):
+    """一次性維運操作：把既有 completed 縮時任務缺的 completed_at／
+    video_duration_secs 向 Spark 補齊（計費上線前的舊資料，這兩欄位是後加的）。
+
+    冪等：已有值的欄位不會被覆寫，重複執行只會處理仍然缺值的那些。
+    部署後手動觸發一次即可，見 docs 的部署後一次性操作清單。
+    """
+    result = await backfill_all_missing_job_fields(db, limit=limit)
+    log_action(
+        db, current_user, "billing_backfill_jobs", "timelapse_job", None,
+        f"scanned={result['scanned']} filled_completed_at={result['filled_completed_at']} "
+        f"filled_duration={result['filled_duration']} failed={result['failed']}",
+    )
     db.commit()
     return result

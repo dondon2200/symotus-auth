@@ -244,3 +244,136 @@ def test_採集端點昨天日期可接受(client, admin, auth_headers, monkeypa
     yesterday = usage.yesterday_taipei(datetime.utcnow())
     r = client.post(f"/billing/admin/usage/collect?date={yesterday}", headers=auth_headers(admin))
     assert r.status_code == 200
+
+
+# ── POST /billing/admin/usage/backfill-jobs：舊縮時任務補值（completed_at／video_duration_secs）──
+
+class _FakeBackfillResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def _patch_backfill_spark(monkeypatch, by_job_id):
+    """比照 tests/test_billing_usage_backfill.py 的手法：換掉 httpx.AsyncClient。
+
+    usage.httpx 與 routers/jobs.py 的 httpx 是同一個模組物件，monkeypatch 這裡
+    會同時影響 routers.jobs._query_spark_job（backfill_all_missing_job_fields
+    內部沿用的那個查詢函式），不必分開 patch 兩處。
+    """
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None):
+            job_id = url.rsplit("/", 1)[-1]
+            payload = by_job_id.get(job_id, "missing")
+            if payload is None:
+                raise RuntimeError("spark unreachable")
+            if payload == "missing":
+                return _FakeBackfillResponse(404, {})
+            return _FakeBackfillResponse(200, payload)
+
+    monkeypatch.setattr(usage.httpx, "AsyncClient", _FakeClient)
+
+
+def _backfill_job(db, user_id, job_id, status="completed", completed_at=None,
+                  video_duration_secs=None, image_count=900, fps=30):
+    j = TimelapsJob(user_id=user_id, job_id=job_id, camera_id=1, status=status,
+                    image_count=image_count, fps=fps,
+                    created_at=datetime(2026, 7, 10, 10, 0),
+                    completed_at=completed_at, video_duration_secs=video_duration_secs)
+    db.add(j); db.commit(); db.refresh(j)
+    return j
+
+
+@pytest.mark.anyio
+async def test_補值缺兩欄位的任務都被補上(db, customer, monkeypatch):
+    _backfill_job(db, customer.id, "j1")
+    _patch_backfill_spark(monkeypatch, {
+        "j1": {"status": "completed", "completed_at": "2026-07-10T12:00:00+08:00",
+              "video_duration_secs": 42.0},
+    })
+
+    result = await usage.backfill_all_missing_job_fields(db)
+
+    assert result["scanned"] == 1
+    assert result["filled_completed_at"] == 1
+    assert result["filled_duration"] == 1
+    assert result["failed"] == 0
+    job = db.query(TimelapsJob).filter(TimelapsJob.job_id == "j1").first()
+    assert job.completed_at is not None
+    assert job.video_duration_secs == 42.0
+
+
+@pytest.mark.anyio
+async def test_補值不覆蓋既有值只補NULL的欄位(db, customer, monkeypatch):
+    existing_completed_at = datetime(2026, 7, 11, 3, 0)
+    _backfill_job(db, customer.id, "j2", completed_at=existing_completed_at,
+                 video_duration_secs=None)
+    _patch_backfill_spark(monkeypatch, {
+        "j2": {"status": "completed", "completed_at": "2026-07-20T00:00:00+08:00",
+              "video_duration_secs": 99.0},
+    })
+
+    result = await usage.backfill_all_missing_job_fields(db)
+
+    assert result["filled_completed_at"] == 0  # 已有值，不算補上，也不被覆寫
+    assert result["filled_duration"] == 1
+    job = db.query(TimelapsJob).filter(TimelapsJob.job_id == "j2").first()
+    assert job.completed_at == existing_completed_at  # 完全沒被 Spark 的新值改掉
+    assert job.video_duration_secs == 99.0
+
+
+@pytest.mark.anyio
+async def test_spark查不到某筆計入failed其他筆照常補(db, customer, monkeypatch):
+    _backfill_job(db, customer.id, "ok")
+    _backfill_job(db, customer.id, "gone")
+    _patch_backfill_spark(monkeypatch, {
+        "ok": {"status": "completed", "completed_at": "2026-07-10T12:00:00+08:00",
+              "video_duration_secs": 10.0},
+        "gone": None,  # 模擬查詢失敗（連線例外）
+    })
+
+    result = await usage.backfill_all_missing_job_fields(db)
+
+    assert result["scanned"] == 2
+    assert result["filled_completed_at"] == 1
+    assert result["filled_duration"] == 1
+    assert result["failed"] == 1
+    assert result["failed_jobs"][0]["job_id"] == "gone"
+    ok_job = db.query(TimelapsJob).filter(TimelapsJob.job_id == "ok").first()
+    gone_job = db.query(TimelapsJob).filter(TimelapsJob.job_id == "gone").first()
+    assert ok_job.video_duration_secs == 10.0
+    assert gone_job.video_duration_secs is None
+    assert gone_job.completed_at is None
+
+
+@pytest.mark.anyio
+async def test_補值不處理非completed任務(db, customer, monkeypatch):
+    _backfill_job(db, customer.id, "processing-job", status="processing")
+    called = []
+
+    def _boom(*a, **kw):
+        called.append(1)
+        raise AssertionError("不該查非 completed 的任務")
+    monkeypatch.setattr(usage.httpx, "AsyncClient", _boom)
+
+    result = await usage.backfill_all_missing_job_fields(db)
+
+    assert result["scanned"] == 0
+    assert called == []
+
+
+def test_補值端點非admin回403(client, reseller, auth_headers):
+    r = client.post("/billing/admin/usage/backfill-jobs", headers=auth_headers(reseller))
+    assert r.status_code == 403

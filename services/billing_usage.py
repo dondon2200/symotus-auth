@@ -138,8 +138,20 @@ from config import settings
 
 SPARK_API_URL = settings.SPARK_API_URL
 SPARK_API_KEY = settings.SPARK_API_KEY
-BACKFILL_SPARK_TIMEOUT = 6
 BACKFILL_CONCURRENCY = 4
+
+
+def _spark_job_fetcher():
+    """延遲匯入 routers/jobs 的單筆 Spark 查詢，供本檔兩個補值函式共用。
+
+    在函式內才 import（而非檔案頂層）：避免與 routers/jobs.py 之間在模組載入順序上
+    產生循環匯入風險（routers/jobs.py 本身頗重，牽動 GDrive 相關的一大段程式碼）。
+    兩個補值函式都改用它而不是各自維護一份 httpx 呼叫，是本輪重構的重點——
+    沿用同一個 SPARK_SYNC_TIMEOUT、同一套「查不到／逾時/回錯一律回 None」語意，
+    不要讓兩份 Spark 呼叫邏輯各自漂移。
+    """
+    from routers.jobs import _query_spark_job, parse_spark_completed_at
+    return _query_spark_job, parse_spark_completed_at
 
 
 async def backfill_missing_video_duration_secs(db: Session, day: str) -> int:
@@ -162,26 +174,16 @@ async def backfill_missing_video_duration_secs(db: Session, day: str) -> int:
     if not jobs:
         return 0
 
+    query_spark_job, _ = _spark_job_fetcher()
     sem = asyncio.Semaphore(BACKFILL_CONCURRENCY)
 
     async def fetch(job):
         async with sem:
-            try:
-                async with httpx.AsyncClient(timeout=BACKFILL_SPARK_TIMEOUT) as client:
-                    r = await client.get(
-                        f"{SPARK_API_URL}/jobs/{job.job_id}",
-                        headers={"x-api-key": SPARK_API_KEY},
-                    )
-                if r.status_code == 200:
-                    data = r.json()
-                    val = data.get("video_duration_secs")
-                    if val is not None:
-                        return job, val
-            except Exception:
-                logger.debug(
-                    "billing usage: 補值查 Spark 失敗（沿用 fallback）: job_id=%s",
-                    job.job_id, exc_info=True,
-                )
+            data = await query_spark_job(job.job_id)
+            if data:
+                val = data.get("video_duration_secs")
+                if val is not None:
+                    return job, val
             return job, None
 
     results = await asyncio.gather(*[fetch(j) for j in jobs])
@@ -201,6 +203,95 @@ async def backfill_missing_video_duration_secs(db: Session, day: str) -> int:
             day, filled, len(jobs), missing,
         )
     return filled
+
+
+async def backfill_all_missing_job_fields(db: Session, limit: int = 500) -> dict:
+    """一次性、跨全表的維運補值：把所有 completed 但缺 completed_at 或
+    video_duration_secs 的縮時任務向 Spark 補齊。
+
+    與 backfill_missing_video_duration_secs 的定位不同：那個是「當天採集前」的
+    例行安全網，只掃當天；這個是計費上線後對既有舊資料的一次性維運操作，掃
+    全表，且兩個欄位一起補（completed_at 也是後加欄位，舊資料全部是 NULL）。
+    兩者共用 `_spark_job_fetcher()` 取得的單筆查詢，不重複維護 Spark 呼叫邏輯。
+
+    冪等且安全：
+    - 只補目前是 NULL 的欄位，**絕不覆蓋既有值**——completed_at 一旦有值就不再碰，
+      避免用量的歸日結果被悄悄搬到別的月份。
+    - 單筆查不到／逾時／回錯，或 Spark 回應裡剛好沒有這個任務缺的那個欄位，
+      都不中斷整批，計入 failed 並記原因，其餘任務照常處理。
+    - `limit` 防止一次撈太多筆同時打 Spark（目前實際只有 18 筆，遠低於預設 500）；
+      併發用既有的 BACKFILL_CONCURRENCY（4 路），18 筆最壞情況也只要幾輪
+      SPARK_SYNC_TIMEOUT（6 秒），不需要另外做批次分頁或背景排程。
+
+    回傳 {"scanned", "filled_completed_at", "filled_duration", "failed", "failed_jobs"}，
+    failed_jobs 是 [{"job_id", "reason"}, ...]，供維運判讀「補值後為什麼還有缺值」。
+    """
+    query_spark_job, parse_spark_completed_at = _spark_job_fetcher()
+
+    jobs = db.query(TimelapsJob).filter(
+        TimelapsJob.status == "completed",
+        (TimelapsJob.completed_at.is_(None)) | (TimelapsJob.video_duration_secs.is_(None)),
+    ).order_by(TimelapsJob.id).limit(limit).all()
+
+    scanned = len(jobs)
+    if not jobs:
+        return {"scanned": 0, "filled_completed_at": 0, "filled_duration": 0,
+                "failed": 0, "failed_jobs": []}
+
+    sem = asyncio.Semaphore(BACKFILL_CONCURRENCY)
+
+    async def fetch(job):
+        async with sem:
+            return job, await query_spark_job(job.job_id)
+
+    results = await asyncio.gather(*[fetch(j) for j in jobs])
+
+    filled_completed_at = 0
+    filled_duration = 0
+    failed_jobs: list[dict] = []
+    for job, data in results:
+        if data is None:
+            # 查不到／逾時／回錯：Spark 端這筆任務本身無法查證，計入 failed，
+            # 不影響其他筆——這是一次性維運操作，單筆失敗不該讓整批中止。
+            failed_jobs.append({"job_id": job.job_id, "reason": "Spark 查無此任務／逾時／回應錯誤"})
+            continue
+
+        got_something = False
+        if job.completed_at is None:
+            raw = data.get("completed_at")
+            if raw:
+                job.completed_at = parse_spark_completed_at(raw, datetime.utcnow())
+                filled_completed_at += 1
+                got_something = True
+            # raw 為空：Spark 回應裡沒帶完成時間，不虛構成 now()（那會讓用量
+            # 歸到錯誤的月份），維持 NULL，等下次重跑或人工排查。
+        if job.video_duration_secs is None:
+            val = data.get("video_duration_secs")
+            if val is not None:
+                job.video_duration_secs = val
+                filled_duration += 1
+                got_something = True
+        if not got_something:
+            failed_jobs.append({
+                "job_id": job.job_id,
+                "reason": "Spark 查得到任務，但回應未帶缺失欄位的值",
+            })
+
+    if filled_completed_at or filled_duration:
+        db.commit()
+
+    logger.info(
+        "billing usage: 舊任務補值完成，掃描 %d 筆，補上 completed_at %d 筆、"
+        "video_duration_secs %d 筆，%d 筆失敗",
+        scanned, filled_completed_at, filled_duration, len(failed_jobs),
+    )
+    return {
+        "scanned": scanned,
+        "filled_completed_at": filled_completed_at,
+        "filled_duration": filled_duration,
+        "failed": len(failed_jobs),
+        "failed_jobs": failed_jobs,
+    }
 
 
 def upsert_usage(db: Session, camera_id: int, day: str, timelapse_secs: int, storage_gb: float) -> None:
