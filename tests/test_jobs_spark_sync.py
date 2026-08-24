@@ -238,6 +238,146 @@ def test_spark_unreachable_keeps_db_values(monkeypatch, payload):
     assert db.commits == 0
 
 
+class TestUpdateJobPutVerifiesTerminalStatusWithSpark:
+    """PUT /jobs/{id} 的終態改向 Spark 查證，不再信任呼叫端宣稱的值。
+
+    使用真實的 FastAPI TestClient（而非 FakeJob/FakeDB）：這裡要驗證的是
+    endpoint 本身的分支邏輯（是否真的呼叫 Spark、是否真的沒改 DB），
+    比 _sync_jobs_with_spark 的批次同步更貼近使用者可觸發的路徑。
+    """
+
+    @pytest.fixture()
+    def app(self):
+        from fastapi import FastAPI
+        from routers.jobs import router as jobs_router
+        a = FastAPI()
+        a.include_router(jobs_router)
+        return a
+
+    @pytest.fixture()
+    def user(self, make_user):
+        return make_user("spark_put_user", "spark_put_user@test.com", role="reseller")
+
+    def _make_job(self, db, user_id, job_id, status="processing"):
+        from models import TimelapsJob
+        j = TimelapsJob(user_id=user_id, job_id=job_id, camera_id=1, status=status)
+        db.add(j); db.commit(); db.refresh(j)
+        return j
+
+    def test_spark確認completed採spark的完成時間與影片長度(self, client, user, auth_headers, db, monkeypatch):
+        """呼叫端刻意送假的 completed_at／video_duration_secs，斷言最後存的是 Spark 那個。"""
+        from models import TimelapsJob
+        self._make_job(db, user.id, "put-ok", status="processing")
+        _patch_spark(monkeypatch, {"put-ok": {
+            "status": "completed",
+            "completed_at": "2026-08-19T03:04:05Z",
+            "video_duration_secs": 88.5,
+        }})
+
+        r = client.put("/jobs/put-ok", json={
+            "status": "completed", "percent_complete": 100,
+            "video_duration_secs": 999.0,  # 呼叫端亂送的假值，應被忽略
+        }, headers=auth_headers(user))
+        assert r.status_code == 200
+
+        job = db.query(TimelapsJob).filter(TimelapsJob.job_id == "put-ok").first()
+        assert job.status == "completed"
+        assert job.completed_at == datetime(2026, 8, 19, 3, 4, 5)
+        assert job.video_duration_secs == 88.5
+
+    def test_spark說還在處理中呼叫端宣稱completed不改狀態且有warning(self, client, user, auth_headers, db, monkeypatch, caplog):
+        from models import TimelapsJob
+        self._make_job(db, user.id, "put-lying", status="processing")
+        _patch_spark(monkeypatch, {"put-lying": {"status": "processing", "percent_complete": 40}})
+
+        import logging
+        with caplog.at_level(logging.WARNING, logger="routers.jobs"):
+            r = client.put("/jobs/put-lying", json={"status": "completed", "percent_complete": 100},
+                            headers=auth_headers(user))
+        assert r.status_code == 200
+
+        job = db.query(TimelapsJob).filter(TimelapsJob.job_id == "put-lying").first()
+        assert job.status == "processing"
+        assert job.completed_at is None
+        assert any("疑似偽報" in rec.message for rec in caplog.records)
+
+    def test_spark查不到或逾時狀態不變(self, client, user, auth_headers, db, monkeypatch, caplog):
+        from models import TimelapsJob
+        self._make_job(db, user.id, "put-unreachable", status="processing")
+
+        class _Boom:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **kw):
+                raise RuntimeError("spark unreachable")
+
+        monkeypatch.setattr(jobs_module.httpx, "AsyncClient", _Boom)
+
+        import logging
+        with caplog.at_level(logging.WARNING, logger="routers.jobs"):
+            r = client.put("/jobs/put-unreachable", json={"status": "completed", "percent_complete": 100},
+                            headers=auth_headers(user))
+        assert r.status_code == 200
+
+        job = db.query(TimelapsJob).filter(TimelapsJob.job_id == "put-unreachable").first()
+        assert job.status == "processing"
+        assert job.completed_at is None
+        assert any("無法查證" in rec.message for rec in caplog.records)
+
+    def test_非終態的put不打spark且percent正常更新(self, client, user, auth_headers, db, monkeypatch):
+        from models import TimelapsJob
+        self._make_job(db, user.id, "put-processing", status="processing")
+
+        class _Boom:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **kw):
+                raise AssertionError("非終態 PUT 不該查詢 Spark")
+
+        monkeypatch.setattr(jobs_module.httpx, "AsyncClient", _Boom)
+
+        r = client.put("/jobs/put-processing", json={"status": "processing", "percent_complete": 55},
+                        headers=auth_headers(user))
+        assert r.status_code == 200
+
+        job = db.query(TimelapsJob).filter(TimelapsJob.job_id == "put-processing").first()
+        assert job.status == "processing"
+        assert job.percent_complete == 55
+
+    def test_已經completed的任務再put_completed_at不被覆蓋(self, client, user, auth_headers, db, monkeypatch):
+        from models import TimelapsJob
+        job = self._make_job(db, user.id, "put-already-done", status="completed")
+        original_completed_at = datetime(2026, 1, 1, 0, 0, 0)
+        job.completed_at = original_completed_at
+        db.commit()
+
+        _patch_spark(monkeypatch, {"put-already-done": {
+            "status": "completed",
+            "completed_at": "2026-08-19T03:04:05Z",  # Spark 給的新時間，不該被採用
+        }})
+
+        r = client.put("/jobs/put-already-done", json={"status": "completed", "percent_complete": 100},
+                        headers=auth_headers(user))
+        assert r.status_code == 200
+
+        db.refresh(job)
+        assert job.completed_at == original_completed_at
+
+
 def test_terminal_jobs_are_not_queried(monkeypatch):
     """已完成／已失敗的 job 不該再打 Spark。"""
     called = []

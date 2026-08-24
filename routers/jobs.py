@@ -102,7 +102,7 @@ async def list_jobs(
 
 
 @router.put("/{job_id}", response_model=JobResponse)
-def update_job(
+async def update_job(
     job_id: str,
     body: JobUpdate,
     db: Session = Depends(get_db),
@@ -115,22 +115,44 @@ def update_job(
     if not job:
         raise HTTPException(404, "Job 不存在")
     if body.status is not None:
-        # 只在「從非 completed 轉為 completed」時寫入 completed_at，避免重複
-        # 輪詢到同一個結果時把完成日往後改，導致用量從舊日搬到新日。
-        # 這裡沿用 utcnow() 而非 Spark 回報的真值：這個 endpoint 只在前端浮動
-        # job 卡片開著的時候才會被打，drift 幅度被「使用者盯著看」這件事本身
-        # 限制在頁面停留的時間內（通常幾分鐘），不像背景 list 同步那樣可能拖到幾天，
-        # 可接受。
-        if body.status == "completed" and job.status != "completed":
-            job.completed_at = datetime.utcnow()
-        job.status = body.status
-    # video_duration_secs 不綁在轉態守衛上：這個 PUT 常常是「使用者盯著卡片看」
-    # 那條路徑最先打到的，若跟 completed_at 用同一個守衛，之後任何補值路徑（例如
-    # billing_usage 的補值安全網）都會被「已經轉態過」擋在門外，真值永遠填不進來。
-    # 條件只在「目前是 None 且傳入非 None」才寫，讓後到的真值仍有機會覆蓋先到的
-    # None；completed_at 維持原本語意不變（一旦記錄就不再改，避免用量搬移月份）。
-    if job.video_duration_secs is None and body.video_duration_secs is not None:
-        job.video_duration_secs = body.video_duration_secs
+        if body.status in ("completed", "failed"):
+            # 終態會被計費採計金額，不能信任呼叫端自己宣稱的值（使用者可以直接
+            # PUT {"status":"completed"} 讓任務被計費）。改向 Spark 查證，沿用
+            # _sync_jobs_with_spark 同一套查詢／狀態對照，不要另寫一套。
+            data = await _query_spark_job(job_id)
+            spark_status = _spark_status_to_local(data.get("status")) if data else None
+            if spark_status is None:
+                # 查不到／逾時／回錯／_spark_status_to_local 回 None（未知狀態）
+                # 都算「無法查證」：不寫入無法查證的終態，等使用者之後打開任務
+                # 列表時 _sync_jobs_with_spark 會再處理一次。
+                logger.warning(
+                    "job_id=%s: PUT 宣稱終態 status=%s，但 Spark 無法查證"
+                    "（查不到/逾時/回錯/狀態未知），暫不改狀態",
+                    job_id, body.status,
+                )
+            elif spark_status != body.status:
+                # Spark 說法跟呼叫端宣稱的不一致，可能是偽報，留痕但不改狀態。
+                logger.warning(
+                    "job_id=%s: PUT 宣稱 status=%s，但 Spark 回報 status=%s，"
+                    "疑似偽報，暫不改狀態",
+                    job_id, body.status, spark_status,
+                )
+            else:
+                # Spark 確認一致：終態一律用 Spark 的權威值，忽略呼叫端送的
+                # completed_at／video_duration_secs。
+                # 只在「從非 completed 轉為 completed」時寫入 completed_at，
+                # 避免重複同步到同一結果時把完成日往後改，導致用量從舊日搬到新日。
+                if spark_status == "completed" and job.status != "completed":
+                    job.completed_at = parse_spark_completed_at(
+                        data.get("completed_at"), datetime.utcnow())
+                job.status = spark_status
+                # video_duration_secs 只在目前為 None 時才寫，讓後到的真值仍能
+                # 補上先到的 None；一旦有值就不再被（Spark 的）新值覆蓋。
+                spark_duration = data.get("video_duration_secs")
+                if job.video_duration_secs is None and spark_duration is not None:
+                    job.video_duration_secs = spark_duration
+        else:
+            job.status = body.status
     if body.percent_complete is not None:
         job.percent_complete = body.percent_complete
     job.updated_at = datetime.utcnow()
@@ -300,6 +322,25 @@ def parse_spark_completed_at(raw, now: datetime) -> datetime:
         except (ValueError, TypeError):
             pass
     return now
+
+
+async def _query_spark_job(job_id: str) -> Optional[dict]:
+    """查詢單一 Spark job 現況，供 PUT /jobs/{id} 查證終態用。
+
+    查不到／逾時／回錯一律回 None（呼叫端須視為「無法查證」，不得因此寫入
+    無法查證的終態）。刻意獨立於 _sync_jobs_with_spark 之外：後者是批次同步
+    多個 job、靜默略過錯誤且不回傳細節；這裡只查一筆，呼叫端需要拿到 payload
+    本身去比對呼叫端宣稱的值。
+    """
+    try:
+        async with httpx.AsyncClient(timeout=SPARK_SYNC_TIMEOUT) as client:
+            r = await client.get(f"{SPARK_API_URL}/jobs/{job_id}",
+                                 headers={"x-api-key": SPARK_API_KEY})
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        logger.debug("Spark 查詢失敗（PUT 終態查證）: job_id=%s", job_id, exc_info=True)
+    return None
 
 
 async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
