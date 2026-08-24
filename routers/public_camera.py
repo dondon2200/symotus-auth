@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from models import User, CameraInvitation
-from routers.cameras import get_camera_backend_token, CAMERA_BACKEND_URL
+from routers.cameras import get_camera_backend_token, _get_admin_camera_token, CAMERA_BACKEND_URL
 
 import hmac as _hmac, hashlib as _hashlib, time as _time
 from config import settings
@@ -90,7 +90,7 @@ def _live_frame_sig(camera_id: int, exp: int) -> str:
 
 
 async def _get_public_cam(token: str, db: Session):
-    """共用：驗證公開 token，回傳 (invitation, granter_token)"""
+    """共用：驗證公開 token，回傳 (invitation, camera_backend_token)"""
     inv = db.query(CameraInvitation).filter(
         CameraInvitation.token == token,
         CameraInvitation.is_public == True,
@@ -104,7 +104,12 @@ async def _get_public_cam(token: str, db: Session):
     if not granter:
         raise HTTPException(500, "找不到分享者")
 
-    cam_token = await get_camera_backend_token(granter)
+    # NAS 相簿根目錄由 Camera Backend 依「呼叫者帳號的 NAS home」決定，不看 camera_id：
+    # 用分享者 token 會拿到該帳號的雜項資料夾（例：james → /homes/james/ipcam），
+    # 公開頁因此播出別台相機的舊照片（2026-08-24 n15 分享連結回報）。
+    # 一律優先用 admin token，讓路徑落回 /homes/firmness/{serial}；camera_id 仍強制取自邀請，
+    # 不會因此擴大可讀範圍。admin token 取不到才退回分享者 token。
+    cam_token = await _get_admin_camera_token() or await get_camera_backend_token(granter)
     if not cam_token:
         raise HTTPException(502, "無法取得相機存取權")
 
