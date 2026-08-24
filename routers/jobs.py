@@ -115,7 +115,10 @@ async def update_job(
     if not job:
         raise HTTPException(404, "Job 不存在")
     if body.status is not None:
-        if body.status in ("completed", "failed"):
+        # 呼叫端可能送 "Completed"；spark_status 已被 _spark_status_to_local 正規化成
+        # 小寫，兩邊要在同一個大小寫基準上比較，否則真實請求會被誤判成偽報。
+        claimed = body.status.lower()
+        if claimed in ("completed", "failed"):
             # 終態會被計費採計金額，不能信任呼叫端自己宣稱的值（使用者可以直接
             # PUT {"status":"completed"} 讓任務被計費）。改向 Spark 查證，沿用
             # _sync_jobs_with_spark 同一套查詢／狀態對照，不要另寫一套。
@@ -128,21 +131,21 @@ async def update_job(
                 logger.warning(
                     "job_id=%s: PUT 宣稱終態 status=%s，但 Spark 無法查證"
                     "（查不到/逾時/回錯/狀態未知），暫不改狀態",
-                    job_id, body.status,
+                    job_id, claimed,
                 )
-            elif spark_status != body.status:
+            elif spark_status != claimed:
                 # Spark 說法跟呼叫端宣稱的不一致，可能是偽報，留痕但不改狀態。
                 logger.warning(
                     "job_id=%s: PUT 宣稱 status=%s，但 Spark 回報 status=%s，"
                     "疑似偽報，暫不改狀態",
-                    job_id, body.status, spark_status,
+                    job_id, claimed, spark_status,
                 )
             else:
                 # Spark 確認一致：終態一律用 Spark 的權威值，忽略呼叫端送的
                 # completed_at／video_duration_secs。
                 # 只在「從非 completed 轉為 completed」時寫入 completed_at，
                 # 避免重複同步到同一結果時把完成日往後改，導致用量從舊日搬到新日。
-                if spark_status == "completed" and job.status != "completed":
+                if spark_status == "completed" and (job.status or "").lower() != "completed":
                     job.completed_at = parse_spark_completed_at(
                         data.get("completed_at"), datetime.utcnow())
                 job.status = spark_status
