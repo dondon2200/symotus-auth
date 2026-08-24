@@ -377,3 +377,21 @@ async def test_補值不處理非completed任務(db, customer, monkeypatch):
 def test_補值端點非admin回403(client, reseller, auth_headers):
     r = client.post("/billing/admin/usage/backfill-jobs", headers=auth_headers(reseller))
     assert r.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_completed_at格式無法解析時不虛構成今天(db, customer, monkeypatch):
+    """parse_spark_completed_at 對解析不了的值會回退成第二個參數。補值補的是
+    數週前的舊任務，若回退成 now() 會把用量靜默搬到本月、還顯示成功。"""
+    _backfill_job(db, customer.id, "bad")
+    _patch_backfill_spark(monkeypatch, {
+        "bad": {"status": "completed", "completed_at": "not-a-timestamp",
+                "video_duration_secs": None},
+    })
+
+    result = await usage.backfill_all_missing_job_fields(db)
+
+    assert result["filled_completed_at"] == 0
+    job = db.query(TimelapsJob).filter(TimelapsJob.job_id == "bad").first()
+    assert job.completed_at is None
+    assert any("無法解析" in f["reason"] for f in result["failed_jobs"])

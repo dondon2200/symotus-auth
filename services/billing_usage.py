@@ -131,8 +131,8 @@ def collect_timelapse_secs(db: Session, day: str) -> dict[int, int]:
 # 直接呼叫；把 I/O 拆到呼叫端（run_collection）先跑一輪、寫回 DB 後再呼叫
 # collect_timelapse_secs，改動範圍最小，也維持 collect_timelapse_secs 本身可同步測試。
 #
-# 併發模式比照 routers/jobs.py 的 _sync_jobs_with_spark：httpx + Semaphore，逐筆
-# try/except，單筆失敗（逾時/查無/Spark 錯誤）不中斷整批，記 log 後跳過，
+# 併發模式比照 routers/jobs.py 的 _sync_jobs_with_spark：共用其 _query_spark_job
+# （已封裝 httpx 與錯誤處理）+ Semaphore，單筆失敗（逾時/查無/Spark 錯誤）不中斷整批，
 # 沿用 collect_timelapse_secs 既有的 image_count/fps fallback。
 from config import settings
 
@@ -259,10 +259,24 @@ async def backfill_all_missing_job_fields(db: Session, limit: int = 500) -> dict
         got_something = False
         if job.completed_at is None:
             raw = data.get("completed_at")
-            if raw:
-                job.completed_at = parse_spark_completed_at(raw, datetime.utcnow())
+            # parse_spark_completed_at 對「非空但解析不出來」的值會回退成第二個
+            # 參數。在 PUT /jobs 那邊 now() 是合理估計（任務剛完成），但這裡補的是
+            # 數週前的舊任務，回退成 now() 會把用量靜默搬到本月、還顯示成功。改用
+            # 哨兵值辨識解析失敗，失敗就當作沒補到。
+            # 哨兵要用未來時間：函式內部會 min(parsed, 第二參數) 夾制，用過去
+            # 的哨兵會把有效結果一起夾成哨兵。
+            sentinel = datetime(9999, 12, 31)
+            parsed = parse_spark_completed_at(raw, sentinel) if raw else sentinel
+            if parsed != sentinel:
+                # 仍保留原本的未來時間夾制。
+                job.completed_at = min(parsed, datetime.utcnow())
                 filled_completed_at += 1
                 got_something = True
+            elif raw:
+                failed_jobs.append({
+                    "job_id": job.job_id,
+                    "reason": f"Spark completed_at 格式無法解析：{raw!r}",
+                })
             # raw 為空：Spark 回應裡沒帶完成時間，不虛構成 now()（那會讓用量
             # 歸到錯誤的月份），維持 NULL，等下次重跑或人工排查。
         if job.video_duration_secs is None:

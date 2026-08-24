@@ -8,7 +8,7 @@
 import re
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -702,7 +702,9 @@ async def collect_usage(date: str, db: Session = Depends(get_db), current_user: 
 
 @router.post("/admin/usage/backfill-jobs")
 async def backfill_jobs(
-    limit: int = 500,
+    # 加下限：limit<=0 在 sqlite 與 Postgres 行為不一致（前者視為不限制，
+    # 後者對負數直接報錯 500）。
+    limit: int = Query(500, ge=1, le=5000),
     db: Session = Depends(get_db),
     current_user: User = Depends(ADMIN),
 ):
