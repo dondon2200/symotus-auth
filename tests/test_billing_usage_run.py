@@ -85,6 +85,17 @@ async def test_採集在thread內用自己的session不影響外層session(db, c
     """
     monkeypatch.setattr(usage, "collect_storage_gb", lambda serial, base=None: {"SN001": 1.5, "SN002": 2.5}[serial])
 
+    import database
+    opened = []
+    real_session_local = database.SessionLocal
+
+    def _recording_session_local(*a, **kw):
+        sess = real_session_local(*a, **kw)
+        opened.append(sess)
+        return sess
+
+    monkeypatch.setattr(database, "SessionLocal", _recording_session_local)
+
     result = await usage.run_collection(db, DAY)
     assert result["cameras"] == 2
 
@@ -92,6 +103,13 @@ async def test_採集在thread內用自己的session不影響外層session(db, c
     rows = {r.camera_id: r for r in db.query(BillingUsageDaily).all()}
     assert rows[1].storage_gb == 1.5
     assert rows[2].storage_gb == 2.5
+
+    # 上面兩項在 sqlite 上就算實作把外層 db 直接帶進 thread 也會通過，抓不到
+    # 真正要防的 bug。這裡直接把不變量釘住：thread 內每一次取得的 session 都
+    # 必須是新開的，且都不能是外層那一個。
+    assert opened, "採集完全沒開新 session，重活可能還留在事件迴圈上"
+    assert all(sess is not db for sess in opened)
+    assert len(set(map(id, opened))) == len(opened)
 
     # 外層 session 採集後仍可正常寫入（session 本身健康、未被關閉或弄髒）。
     extra = BillingSubscription(camera_id=99, customer_id=customer.id,
