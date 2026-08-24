@@ -173,6 +173,22 @@ async def startup():
                         conn.rollback()
                         logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
 
+            # timelapse_jobs 的切日函式索引（給既有環境用）。models.py 的
+            # __table_args__ 只對「create_all 新建的表」有效，正式庫這張表已存在、
+            # 已有資料，create_all 不會替既有表補索引，所以這裡另外補一次。
+            # 目前表只有 22 列，感覺不到差別；這是為成長預先準備，不是解決現在的
+            # 效能問題。失敗只記警告不擋啟動——沒有索引查詢仍然正確，只是變慢。
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text(
+                        """CREATE INDEX IF NOT EXISTS ix_timelapse_jobs_effective_time
+                            ON timelapse_jobs (COALESCE(completed_at, created_at))"""
+                    ))
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    logger.warning(f"timelapse_jobs 切日函式索引補建失敗（不影響正確性，只是查詢較慢）：{e}")
+
             # 補建 billing 部分唯一索引（給既有環境用）。
             # create_all() 只會對「尚不存在」的表建索引，不會替既有表補建索引；
             # 這個環境目前還沒有 billing_* 表，create_all 會建好一切，這裡是保險。

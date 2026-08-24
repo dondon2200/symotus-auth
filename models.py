@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, ARRAY, UniqueConstraint, Float, Index, text
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, ARRAY, UniqueConstraint, Float, Index, text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
@@ -137,6 +137,23 @@ class TimelapsJob(Base):
     # Spark 依 target_duration_secs 抽樣，實測兩者差 2～6 倍且倍率不固定。
     # 舊資料為 NULL，採集時退回 image_count/fps（高估值，見 billing_usage.py）。
     video_duration_secs = Column(Float, nullable=True)
+
+    # 切日條件 collect_timelapse_secs 用 COALESCE(completed_at, created_at) 過濾，
+    # 普通單欄索引吃不到，要用函式（expression）索引。目前表只有 22 列，感覺不到
+    # 差別；這裡是為相機/任務量成長預先準備，不是在解決現在的效能問題。
+    # PostgreSQL 與 SQLite（3.9+）都支援 expression index，SQLAlchemy 對兩者都能
+    # 產生對應的 CREATE INDEX（測過 sqlite 可以建，不像 BillingSubscription/
+    # BillingInvoice 那兩個部分唯一索引需要 postgresql_where/sqlite_where 分開處理
+    # ——那兩個是「帶 WHERE 條件」的索引，sqlite 的 WHERE 語法與 PG 需要分開給；
+    # 這裡單純是 expression 本身，不帶 WHERE，兩種方言共用同一個宣告即可）。
+    # 既有正式庫（表已存在）另外在 main.py 的啟動 migration 補一次
+    # CREATE INDEX IF NOT EXISTS，create_all 不會替既有表補索引。
+    __table_args__ = (
+        Index(
+            "ix_timelapse_jobs_effective_time",
+            func.coalesce(completed_at, created_at),
+        ),
+    )
 # 注意：下面的欄位需要 ALTER TABLE 或在新環境自動建立
 # TimelapsJob 額外欄位（已在 class 定義，這裡補充說明）
 

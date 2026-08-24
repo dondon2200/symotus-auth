@@ -74,6 +74,35 @@ async def test_採集寫入每台相機一列(db, customer, subs, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_採集在thread內用自己的session不影響外層session(db, customer, subs, monkeypatch):
+    """run_collection 把重活丟進 asyncio.to_thread、thread 內開自己的 SessionLocal
+    （不能沿用呼叫端傳入的 db）。這裡驗證兩件事：
+    1. 呼叫端傳進去的 db（外層 session）採集後仍可正常查詢、寫入——沒有被
+       thread 內的 session 搞壞或意外關掉。
+    2. thread 內各自 session 寫入的資料，外層 session 立刻查得到（同一個
+       sqlite 檔案，commit 後對新 session 可見），代表資料確實落地，不是
+       卡在某個沒 commit/沒關閉的孤兒 session 裡。
+    """
+    monkeypatch.setattr(usage, "collect_storage_gb", lambda serial, base=None: {"SN001": 1.5, "SN002": 2.5}[serial])
+
+    result = await usage.run_collection(db, DAY)
+    assert result["cameras"] == 2
+
+    # 外層 session 採集後仍可正常查詢（沒有被跨執行緒的 session 搞壞）。
+    rows = {r.camera_id: r for r in db.query(BillingUsageDaily).all()}
+    assert rows[1].storage_gb == 1.5
+    assert rows[2].storage_gb == 2.5
+
+    # 外層 session 採集後仍可正常寫入（session 本身健康、未被關閉或弄髒）。
+    extra = BillingSubscription(camera_id=99, customer_id=customer.id,
+                                plan_id=subs.id, status="cancelled", camera_serial="SN099")
+    db.add(extra)
+    db.commit()
+    db.refresh(extra)
+    assert extra.id is not None
+
+
+@pytest.mark.anyio
 async def test_單台失敗不影響其他相機(db, customer, subs, monkeypatch):
     def flaky(serial, base=None):
         if serial == "SN001":

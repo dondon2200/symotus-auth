@@ -419,14 +419,18 @@ async def fetch_collector_token(timeout: float = 15) -> str:
         return tok.json().get("access_token", "")
 
 
-async def resolve_camera_serial(db: Session, sub: BillingSubscription, token: str = "") -> str:
-    """取得相機的 NAS 目錄名，並快取在訂閱列上。
+async def resolve_camera_serial(sub_id: int, camera_id: int, token: str = "") -> str:
+    """向 Camera Backend 查相機的 NAS 目錄名，查到就快取寫回訂閱列。
 
-    已快取就直接回傳——每日採集不該為每台相機重複打 Camera Backend。
-    `token` 由呼叫端（run_collection）先取好傳入，避免每台相機各自 mint 一次。
+    呼叫端（run_collection）應先確認該訂閱尚未快取 camera_serial 才呼叫本函式——
+    已快取就不該為每台相機重複打 Camera Backend。`token` 由呼叫端先取好傳入，
+    避免每台相機各自 mint 一次。
+
+    只接受 `sub_id`/`camera_id` 而非整個 ORM 物件：本函式在 run_collection 的
+    事件迴圈那段執行（httpx 網路 I/O 本就該 await，不搬進 thread），但快取寫回
+    是 DB commit，必須丟進 asyncio.to_thread 用獨立 session 做（見
+    `_cache_camera_serial_sync`），不能沿用呼叫端可能已經跨執行緒的 sub 物件。
     """
-    if sub.camera_serial:
-        return sub.camera_serial
     if not COLLECTOR_CAMERA_EMAIL or not CAMERA_SERVICE_KEY:
         logger.warning("billing usage: 未設定 BILLING_COLLECTOR_CAMERA_EMAIL/CAMERA_SERVICE_KEY，無法解析 serial")
         return ""
@@ -435,7 +439,7 @@ async def resolve_camera_serial(db: Session, sub: BillingSubscription, token: st
 
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(
-            f"{CAMERA_BACKEND_URL}/api/cameras/{sub.camera_id}",
+            f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
             headers={"Authorization": f"Bearer {token}"},
         )
         if r.status_code != 200:
@@ -445,9 +449,86 @@ async def resolve_camera_serial(db: Session, sub: BillingSubscription, token: st
         serial = basic.get("device_serial_id") or basic.get("serial_id") or basic.get("serial") or ""
 
     if serial:
-        sub.camera_serial = serial
-        db.commit()
+        await asyncio.to_thread(_cache_camera_serial_sync, sub_id, serial)
     return serial
+
+
+# ── 以下三個 _*_sync 函式是 run_collection 丟進 asyncio.to_thread 執行的同步 DB
+# 工作。各自在函式內部開自己的 SessionLocal、做完事就關掉——SQLAlchemy Session
+# 不是 thread-safe，絕不能把呼叫端（事件迴圈那條路徑）的 session 傳進 thread 用，
+# 也不讓 session 跨多次 to_thread 呼叫存活（每次都是全新、短命的 session，
+# 用完即丟，避免任何跨執行緒共用 session 的疑慮）。
+
+
+def _query_secs_and_active_subs(day: str) -> tuple[dict[int, int], list[dict]]:
+    """同步重活：查當日縮時秒數（collect_timelapse_secs）與目前生效中的訂閱清單。
+
+    這兩個查詢隨相機/任務數成長會變重（collect_timelapse_secs 若無索引是全表
+    掃描，見 models.py 的 ix_timelapse_jobs_effective_time），是 run_collection
+    最該搬出事件迴圈的部分。
+
+    訂閱列讀成 plain dict 而非直接回傳 ORM 物件：本函式結束就關 session，
+    ORM 物件會變成 detached，呼叫端（事件迴圈那邊）再碰欄位會拋
+    DetachedInstanceError；plain dict 沒有這個問題。
+    """
+    from database import SessionLocal
+    session = SessionLocal()
+    try:
+        secs_by_camera = collect_timelapse_secs(session, day)
+        subs = session.query(BillingSubscription).filter(BillingSubscription.status == "active").all()
+        subs_data = [
+            {"id": s.id, "camera_id": s.camera_id, "camera_serial": s.camera_serial}
+            for s in subs
+        ]
+        return secs_by_camera, subs_data
+    finally:
+        session.close()
+
+
+def _cache_camera_serial_sync(sub_id: int, serial: str) -> None:
+    """把 resolve_camera_serial 解析到的 serial 寫回訂閱列（自己的 session）。"""
+    from database import SessionLocal
+    session = SessionLocal()
+    try:
+        sub = session.query(BillingSubscription).filter(BillingSubscription.id == sub_id).first()
+        if sub:
+            sub.camera_serial = serial
+            session.commit()
+    finally:
+        session.close()
+
+
+def _write_usage_sync(camera_id: int, day: str, timelapse_secs: int, storage_gb: float) -> None:
+    """serial 解析成功分支的寫入（自己的 session）。"""
+    from database import SessionLocal
+    session = SessionLocal()
+    try:
+        upsert_usage(session, camera_id, day, timelapse_secs, storage_gb)
+    finally:
+        session.close()
+
+
+def _write_unresolved_usage_sync(camera_id: int, day: str, timelapse_secs: int) -> tuple[float, int]:
+    """serial 解析不到分支的寫入：沿用舊 storage_gb、算連續沿用天數、寫入（自己的 session）。
+
+    回傳 (沿用的 storage_gb, 連續沿用天數)，供呼叫端（事件迴圈那邊）組 log 訊息用——
+    log 本身不是 DB I/O，留在事件迴圈做即可，不必連 logger.warning/error 都搬進 thread。
+    """
+    from database import SessionLocal
+    session = SessionLocal()
+    try:
+        # 必須限制 date <= day：補跑舊日期時，若不加這個條件，會取到「之後某天」
+        # 的快照寫回較早的日期，等同污染歷史（run_collection docstring 有說明）。
+        prev = session.query(BillingUsageDaily).filter(
+            BillingUsageDaily.camera_id == camera_id,
+            BillingUsageDaily.date <= day,
+        ).order_by(BillingUsageDaily.date.desc()).first()
+        prev_gb = prev.storage_gb if prev else 0.0
+        streak = carried_forward_streak_days(session, camera_id, day, prev_gb)
+        upsert_usage(session, camera_id, day, timelapse_secs, prev_gb)
+        return prev_gb, streak
+    finally:
+        session.close()
 
 
 # serial 解析不到、storage_gb 連續沿用超過這麼多天就把 log 從 warning 升級成
@@ -478,6 +559,13 @@ def carried_forward_streak_days(db: Session, camera_id: int, day: str, carried_v
 async def run_collection(db: Session, day: str) -> dict:
     """採集指定日期（台北）的用量。
 
+    `db`（呼叫端傳入的 session，來自請求或排程自己開的 SessionLocal）只用來跑
+    `backfill_missing_video_duration_secs`——那是網路 I/O（問 Spark），本來就
+    要 await，牽動的 DB 查詢也只侷限在「當天」，不是本函式真正的重活。
+    真正會隨相機/任務數成長變重的 DB 查詢與寫入，全部丟進 asyncio.to_thread，
+    在各自的 thread 內開全新、短命的 SessionLocal 執行（絕不沿用 `db`——
+    SQLAlchemy Session 不是 thread-safe）。細節見各 `_*_sync` 函式的說明。
+
     回傳 {"day", "total", "cameras", "unresolved", "failed"}：
     - total：當日應採集的訂閱數（分母）
     - cameras：storage 與 timelapse 都完整採集成功的台數（unresolved 分支雖然也會
@@ -501,53 +589,53 @@ async def run_collection(db: Session, day: str) -> dict:
     # 補回真值並寫回 DB，collect_timelapse_secs 才能吃到補好的值（同一個 db
     # session，補值的 commit 對接下來的查詢立即可見）。
     await backfill_missing_video_duration_secs(db, day)
-    secs_by_camera = collect_timelapse_secs(db, day)
-    subs = db.query(BillingSubscription).filter(BillingSubscription.status == "active").all()
+    # 重活：全表規模的查詢，丟進 thread、自己開 session（見函式說明）。
+    secs_by_camera, subs_data = await asyncio.to_thread(_query_secs_and_active_subs, day)
 
     # 迴圈外先取一次 token：首次上線時所有訂閱的 camera_serial 都是 NULL，
     # 若在 resolve_camera_serial 內個別 mint，會對 Camera Backend 發 2N 次請求。
     token = await fetch_collector_token()
 
     ok, failed, unresolved = 0, 0, 0
-    for sub in subs:
+    for sub in subs_data:
+        camera_id = sub["camera_id"]
         try:
-            serial = await resolve_camera_serial(db, sub, token)
+            serial = sub["camera_serial"]
+            if not serial:
+                # httpx 網路 I/O，本來就該 await，不搬進 thread（快取寫回那一小段
+                # DB commit 由 resolve_camera_serial 內部自己丟 to_thread 處理）。
+                serial = await resolve_camera_serial(sub["id"], camera_id, token)
             if not serial:
                 # storage_gb 沿用該相機既有列的舊值（沒有就是 0）——timelapse_secs
                 # 仍照寫，不因為 serial 解析不到就連帶漏掉可回填的資料。
-                # 必須限制 date <= day：補跑舊日期（POST .../collect?date=較早日期）時，
-                # 若不加這個條件，會取到「之後某天」的快照寫回這個較早的日期，
-                # 那正是本函式 docstring 說要避免的「永久污染歷史」。
-                prev = db.query(BillingUsageDaily).filter(
-                    BillingUsageDaily.camera_id == sub.camera_id,
-                    BillingUsageDaily.date <= day,
-                ).order_by(BillingUsageDaily.date.desc()).first()
-                prev_gb = prev.storage_gb if prev else 0.0
+                # 查舊值＋算連續沿用天數＋寫入都是 DB I/O，丟進 thread（自己的 session）。
+                prev_gb, streak = await asyncio.to_thread(
+                    _write_unresolved_usage_sync, camera_id, day, secs_by_camera.get(camera_id, 0)
+                )
                 # 相機可能已從 Camera Backend 刪除（resolve 404），這種情況下沿用
                 # 舊值會被每天重寫、永遠不會停——追蹤連續沿用了幾天，超過門檻就
                 # 升級成 error 讓人注意到（例如該補訂閱下架而非繼續累計用量）。
-                streak = carried_forward_streak_days(db, sub.camera_id, day, prev_gb)
+                # 記 log 不是 DB I/O，留在事件迴圈做即可。
                 msg = (
-                    f"billing usage: 相機 {sub.camera_id} 無法解析 serial（{day}），"
+                    f"billing usage: 相機 {camera_id} 無法解析 serial（{day}），"
                     f"storage_gb 沿用舊值 {prev_gb}，已連續沿用 {streak} 天，timelapse_secs 照常寫入"
                 )
                 if streak > CARRY_FORWARD_ALERT_DAYS:
                     logger.error(msg)
                 else:
                     logger.warning(msg)
-                upsert_usage(db, sub.camera_id, day, secs_by_camera.get(sub.camera_id, 0), prev_gb)
                 unresolved += 1
                 continue
             # 阻塞式 I/O 必須丟到 thread，否則會卡住整個 auth 的事件迴圈
             gb = await asyncio.to_thread(collect_storage_gb, serial)
-            upsert_usage(db, sub.camera_id, day, secs_by_camera.get(sub.camera_id, 0), gb)
+            await asyncio.to_thread(_write_usage_sync, camera_id, day, secs_by_camera.get(camera_id, 0), gb)
             ok += 1
         except Exception as e:
             failed += 1
-            logger.warning(f"billing usage: 相機 {sub.camera_id} 採集失敗（{day}）：{e}")
+            logger.warning(f"billing usage: 相機 {camera_id} 採集失敗（{day}）：{e}")
 
     logger.info(f"billing usage: {day} 採集完成，成功 {ok} 台、失敗 {failed} 台、無法解析 {unresolved} 台")
-    return {"day": day, "total": len(subs), "cameras": ok, "failed": failed, "unresolved": unresolved}
+    return {"day": day, "total": len(subs_data), "cameras": ok, "failed": failed, "unresolved": unresolved}
 
 
 # 每日採集時間（台北時區的小時）。03:00 是離峰，且前一天的資料已全部落地。
