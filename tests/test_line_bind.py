@@ -62,6 +62,69 @@ def test_line_callback_bind_writes_user_line_account(client, make_user, db, monk
     assert rows[0].display_name == "Audit Tester"
 
 
+def test_line_callback_bind_succeeds_without_state_cookie(client, make_user, db, monkeypatch):
+    """F2：綁定連結可能在別的裝置/LINE 內建瀏覽器開啟，不會帶 bind-url 當下設的 cookie；
+    只要 state 內的 ticket 能驗證通過，就該放行，不能卡在 cookie round-trip。"""
+    user = make_user("linebindnocookie", "linebindnocookie@example.com", password="oldpassword")
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda *a, **kw: _FakeLineAsyncClient("line-uid-nocookie", "No Cookie"))
+    ticket = auth_mod.create_line_bind_token(user.id, "/notifications")
+    state = f"{secrets_mod.token_urlsafe(16)}:bind:{ticket}"
+
+    r = client.get(
+        f"/auth/line/callback?code=fakecode&state={state}",
+        follow_redirects=False,
+    )
+    assert r.status_code in (302, 307)
+    assert "line_bind=ok" in r.headers["location"]
+
+    rows = db.query(UserLineAccount).filter(UserLineAccount.user_id == user.id).all()
+    assert len(rows) == 1
+    assert rows[0].line_user_id == "line-uid-nocookie"
+
+
+def test_line_callback_bind_succeeds_with_mismatched_cookie(client, make_user, db, monkeypatch):
+    """F2：cookie 存在但與 state 不同（例如另一個瀏覽器分頁殘留舊值）也不該擋下有效 ticket。"""
+    user = make_user("linebindbadcookie", "linebindbadcookie@example.com", password="oldpassword")
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda *a, **kw: _FakeLineAsyncClient("line-uid-badcookie", "Bad Cookie"))
+    ticket = auth_mod.create_line_bind_token(user.id, "/notifications")
+    state = f"{secrets_mod.token_urlsafe(16)}:bind:{ticket}"
+
+    r = client.get(
+        f"/auth/line/callback?code=fakecode&state={state}",
+        cookies={"line_oauth_state": "some-other-stale-state"},
+        follow_redirects=False,
+    )
+    assert r.status_code in (302, 307)
+    assert "line_bind=ok" in r.headers["location"]
+
+
+def test_line_callback_bind_invalid_ticket_redirects_error(client, make_user, monkeypatch):
+    """F2：ticket 無效/過期時仍須導向 line_bind=error，不能因略過 cookie 檢查而放行。"""
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda *a, **kw: _FakeLineAsyncClient("line-uid-bogus", "Bogus"))
+    state = f"{secrets_mod.token_urlsafe(16)}:bind:not-a-real-ticket"
+
+    r = client.get(
+        f"/auth/line/callback?code=fakecode&state={state}",
+        follow_redirects=False,
+    )
+    assert r.status_code in (302, 307)
+    assert "line_bind=error" in r.headers["location"]
+
+
+def test_line_callback_non_bind_state_still_requires_cookie_match(client):
+    """非綁定流程（現只剩 error redirect 路徑）維持原本的 cookie round-trip 驗證。"""
+    state = secrets_mod.token_urlsafe(16)
+    r = client.get(
+        f"/auth/line/callback?code=fakecode&state={state}",
+        follow_redirects=False,
+    )
+    assert r.status_code in (302, 307)
+    assert "error=state_mismatch" in r.headers["location"]
+
+
 def test_line_callback_bind_conflict_when_line_already_bound_to_other_user(
     client, make_user, db, monkeypatch
 ):

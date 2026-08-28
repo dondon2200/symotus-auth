@@ -2,7 +2,7 @@
 import pytest
 
 from models import User, UserLineAccount
-from routers.line_webhook import _resolve_user
+from routers.line_webhook import _resolve_user, _not_bound_reply_text
 import services.camera_notifier as camera_notifier
 
 
@@ -21,6 +21,22 @@ def test_resolve_user_two_line_accounts_same_user(db):
 
 def test_resolve_user_unbound_returns_none(db):
     assert _resolve_user(db, "U-does-not-exist") is None
+
+
+def test_not_bound_reply_text_guides_to_password_login_and_bind(monkeypatch):
+    """F3：LINE 登入已停用，未綁定訪客不該被叫去「用 LINE 登入」，要引導帳密登入 + 個人設定產生綁定連結。"""
+    monkeypatch.setenv("FRONTEND_URL", "https://user.symotus.com")
+    text = _not_bound_reply_text()
+    assert "用 LINE 登入" not in text
+    assert "https://user.symotus.com" in text
+    assert "個人設定" in text
+    assert "綁定" in text
+
+
+def test_not_bound_reply_text_uses_frontend_url_env(monkeypatch):
+    monkeypatch.setenv("FRONTEND_URL", "https://custom.example.com")
+    text = _not_bound_reply_text()
+    assert "https://custom.example.com" in text
 
 
 @pytest.mark.anyio

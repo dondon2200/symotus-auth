@@ -537,6 +537,13 @@ def _resolve_user(db: Session, line_user_id: str) -> User | None:
     return acc.user if acc else None
 
 
+def _not_bound_reply_text() -> str:
+    """LINE 登入已停用，未綁定用戶要被引導去帳密登入 + 個人設定產生綁定連結，而不是（已不存在的）LINE 登入。"""
+    frontend = os.getenv("FRONTEND_URL", "https://user.symotus.com")
+    return (f"您好！請先以帳號密碼登入 {frontend} ，"
+            f"於「個人設定」產生 LINE 綁定連結並用本 LINE 帳號開啟完成綁定，即可使用 AI 助理功能")
+
+
 # ── Webhook endpoint ──────────────────────────────────────────────────────────
 @router.post("/line")
 async def line_webhook(request: Request, db: Session = Depends(get_db)):
@@ -558,8 +565,7 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
         # 找 Symotus 用戶
         user = _resolve_user(db, line_user_id)
         if not user:
-            await line_reply(reply_token, [{"type": "text",
-                "text": f"您好！請先到 {os.getenv('FRONTEND_URL', 'https://user.symotus.com')} 用 LINE 登入，才能使用 AI 助理功能"}])
+            await line_reply(reply_token, [{"type": "text", "text": _not_bound_reply_text()}])
             continue
 
         # 特殊指令：取消相機通知（從 Flex Message 按鈕觸發）

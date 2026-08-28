@@ -321,7 +321,9 @@ def line_bind_url(response: Response, next: str = "/notifications",
     response.set_cookie("line_oauth_state", state, max_age=600,
                         httponly=True, secure=True, samesite="lax", path="/")
     params = f"response_type=code&client_id={settings.LINE_CLIENT_ID}&redirect_uri={settings.LINE_REDIRECT_URI}&state={state}&scope=profile openid email"
-    return {"auth_url": f"https://access.line.me/oauth2/v2.1/authorize?{params}", "state": state}
+    auth_url = f"https://access.line.me/oauth2/v2.1/authorize?{params}"
+    # 前端讀 data.url；保留 auth_url 供舊呼叫端向後相容
+    return {"url": auth_url, "auth_url": auth_url, "state": state}
 
 @router.post("/line/token", response_model=TokenResponse)
 async def line_token(body: OAuthCallbackRequest, request: Request, db: Session = Depends(get_db)):
@@ -431,21 +433,28 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
 async def line_callback(code: str, state: str = "", request: Request = None, db: Session = Depends(get_db)):
     from fastapi.responses import RedirectResponse
     frontend = settings.FRONTEND_URL
-    # round-trip 驗證：LINE 回傳的 state 必須等於 /line/url 時寫入 cookie 的值
-    saved_state = request.cookies.get("line_oauth_state") if request else None
-    if not state or not saved_state or not secrets.compare_digest(state, saved_state):
-        resp = RedirectResponse(f"{frontend}/login?error=state_mismatch")
-        resp.delete_cookie("line_oauth_state", path="/")
-        return resp
-    try:
-        bind_user_id = None
-        bind_next = "/notifications"
-        # A：state 夾帶 bind ticket → 綁定流程（把 LINE 綁到當前登入用戶，而非登入/建帳）
-        if state and ":bind:" in state:
-            decoded = decode_line_bind_token(state.split(":bind:", 1)[1])
-            if decoded:
-                bind_user_id, bind_next = decoded
 
+    bind_user_id = None
+    bind_next = "/notifications"
+    is_bind_state = bool(state) and ":bind:" in state
+    if is_bind_state:
+        # 綁定連結可能在任何裝置/LINE 內建瀏覽器開啟，不會帶 /line/bind-url 當下設的 cookie。
+        # ticket 本身是簽章 JWT（含 user_id、600 秒效期），已足以防偽造，故此分支略過 cookie 比對。
+        decoded = decode_line_bind_token(state.split(":bind:", 1)[1])
+        if not decoded:
+            resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=error")
+            resp.delete_cookie("line_oauth_state", path="/")
+            return resp
+        bind_user_id, bind_next = decoded
+    else:
+        # 非綁定流程（現僅剩 error redirect 路徑）維持原 cookie round-trip 驗證
+        saved_state = request.cookies.get("line_oauth_state") if request else None
+        if not state or not saved_state or not secrets.compare_digest(state, saved_state):
+            resp = RedirectResponse(f"{frontend}/login?error=state_mismatch")
+            resp.delete_cookie("line_oauth_state", path="/")
+            return resp
+
+    try:
         async with httpx.AsyncClient() as client:
             r = await client.post("https://api.line.me/oauth2/v2.1/token", data={
                 "grant_type": "authorization_code", "code": code,

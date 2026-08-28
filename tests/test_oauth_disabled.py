@@ -48,7 +48,11 @@ def test_line_bind_url_still_works(client, make_user, auth_headers):
     user = make_user("lb1", "lb1@example.com", password="oldpassword")
     r = client.get("/auth/line/bind-url", headers=auth_headers(user))
     assert r.status_code == 200
-    assert ":bind:" in r.json()["state"]
+    body = r.json()
+    assert ":bind:" in body["state"]
+    # F1：前端讀 data.url，須與 auth_url 同值（後者保留向後相容）
+    assert body["url"] == body["auth_url"]
+    assert body["url"].startswith("https://access.line.me/oauth2/v2.1/authorize?")
 
 
 class _FakeLineResponse:
