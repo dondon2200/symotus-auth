@@ -93,7 +93,7 @@ def create_line_bind_token(user_id: int, next_path: str = _DEFAULT_BIND_NEXT) ->
         "sub": str(user_id),
         "purpose": "line_bind",
         "next": _safe_next(next_path),
-        "exp": datetime.utcnow() + timedelta(minutes=10),
+        "exp": datetime.utcnow() + timedelta(seconds=600),
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 

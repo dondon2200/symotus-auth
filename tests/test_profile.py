@@ -29,8 +29,11 @@ def test_me_exposes_credential_flags(client, make_user, auth_headers):
     assert body["created_at"] is not None
 
 
-def test_me_flags_oauth_only_account(client, make_user, auth_headers):
-    user = make_user("carol", "carol@example.com", line_id="l-1")
+def test_me_flags_oauth_only_account(client, make_user, auth_headers, db):
+    from models import UserLineAccount
+    user = make_user("carol", "carol@example.com")
+    db.add(UserLineAccount(user_id=user.id, line_user_id="l-1"))
+    db.commit()
     body = client.get("/auth/me", headers=auth_headers(user)).json()
     assert body["has_password"] is False
     assert body["line_linked"] is True
@@ -338,7 +341,7 @@ def test_line_callback_bind_writes_audit_log(client, make_user, db, monkeypatch)
     """N-2: line_callback 的 bind_user_id 分支綁定 LINE 後必須寫入 self_link_line 稽核紀錄。"""
     import secrets as secrets_mod
     import httpx
-    from models import AuditLog
+    from models import AuditLog, UserLineAccount
     import auth as auth_mod
 
     user = make_user("linebind", "linebind@example.com", password="oldpassword")
@@ -355,8 +358,9 @@ def test_line_callback_bind_writes_audit_log(client, make_user, db, monkeypatch)
     assert r.status_code in (302, 307)
     assert "line_bind=ok" in r.headers["location"]
 
-    db.refresh(user)
-    assert user.line_id == "line-uid-audit-1"
+    row = db.query(UserLineAccount).filter(UserLineAccount.user_id == user.id).first()
+    assert row is not None
+    assert row.line_user_id == "line-uid-audit-1"
 
     log = db.query(AuditLog).filter(AuditLog.action == "self_link_line").first()
     assert log is not None

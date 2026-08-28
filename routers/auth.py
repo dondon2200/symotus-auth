@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import httpx, secrets, time
 
 from database import get_db
-from models import User, RefreshToken, InviteToken, CameraAccess
+from models import User, RefreshToken, InviteToken, CameraAccess, UserLineAccount
 from schemas import LoginRequest, TokenResponse, RefreshRequest, OAuthCallbackRequest
 from auth import (hash_password, verify_password, create_access_token,
                   create_refresh_token, decode_token, get_current_user,
@@ -150,13 +150,19 @@ def logout(body: RefreshRequest, db: Session = Depends(get_db)):
 
 def _me_payload(user: User) -> dict:
     """/auth/me 系列端點共用的使用者序列化。"""
+    line_accounts = [
+        {"id": a.id, "display_name": a.display_name,
+         "created_at": a.created_at.isoformat() if a.created_at else None}
+        for a in user.line_accounts
+    ]
     return {"id": user.id, "username": user.username,
             "email": user.email, "full_name": user.full_name,
             "role": user.role, "reseller_id": user.reseller_id,
             "is_active": user.is_active,
             "has_password": user.hashed_password is not None,
             "google_linked": user.google_id is not None,
-            "line_linked": user.line_id is not None,
+            "line_accounts": line_accounts,
+            "line_linked": len(line_accounts) > 0,
             "created_at": user.created_at.isoformat() if user.created_at else None}
 
 
@@ -268,6 +274,23 @@ def unlink_provider(provider: str, db: Session = Depends(get_db),
         current_user.line_id = None
 
     log_action(db, current_user, f"self_unlink_{provider}", "user", current_user.id, provider)
+    db.commit()
+    db.refresh(current_user)
+    return _me_payload(current_user)
+
+
+@router.delete("/me/line/{line_account_id}")
+def unlink_line_account(line_account_id: int, db: Session = Depends(get_db),
+                        current_user: User = Depends(get_current_user)):
+    """解除單一 LINE 綁定（user_line_accounts 逐筆解綁，一帳號可綁多個 LINE）。"""
+    row = db.query(UserLineAccount).filter(
+        UserLineAccount.id == line_account_id,
+        UserLineAccount.user_id == current_user.id,
+    ).first()
+    if not row:
+        raise HTTPException(404, "找不到該 LINE 綁定")
+    db.delete(row)
+    log_action(db, current_user, "self_unlink_line", "user", current_user.id, "user_line_accounts")
     db.commit()
     db.refresh(current_user)
     return _me_payload(current_user)
@@ -636,13 +659,17 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
         if bind_user_id is not None:
             line_uid = profile["userId"]
             target = db.query(User).filter(User.id == bind_user_id).first()
-            existing = db.query(User).filter(User.line_id == line_uid).first()
+            existing = db.query(UserLineAccount).filter_by(line_user_id=line_uid).first()
             if not target:
                 resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=error")
-            elif existing and existing.id != target.id:
+            elif existing and existing.user_id != target.id:
                 resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=conflict")
             else:
-                target.line_id = line_uid
+                if not existing:
+                    db.add(UserLineAccount(
+                        user_id=target.id, line_user_id=line_uid,
+                        display_name=profile.get("displayName"),
+                        picture_url=profile.get("pictureUrl")))
                 log_action(db, target, "self_link_line", "user", target.id, "line_id")
                 db.commit()
                 resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=ok")
@@ -655,16 +682,12 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
 
         user = db.query(User).filter(User.line_id == profile["userId"]).first()
 
-        # 換取 camera token：優先用 camera_email，否則用 line_{userId}@symotus.com 自動建帳號
+        # 換取 camera token：僅在使用者已有 camera_email 時嘗試
+        # （不再合成 line_{userId}@symotus.com 佔位帳號；LINE-only 使用者的相機存取見 Task 6）
         camera_tokens = {}
-        if user:
-            cam_email = user.camera_email or f"line_{profile['userId']}@symotus.com"
+        if user and user.camera_email:
             try:
-                camera_tokens = await get_camera_token(user.id, cam_email, user.role)
-                # 如果成功且原本沒有 camera_email，存起來
-                if camera_tokens and not user.camera_email:
-                    user.camera_email = cam_email
-                    db.commit()
+                camera_tokens = await get_camera_token(user.id, user.camera_email, user.role)
             except Exception as cam_err:
                 print(f"[LINE callback] camera token error: {cam_err}")
 
