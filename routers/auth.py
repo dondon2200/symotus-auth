@@ -159,7 +159,6 @@ def _me_payload(user: User) -> dict:
             "role": user.role, "reseller_id": user.reseller_id,
             "is_active": user.is_active,
             "has_password": user.hashed_password is not None,
-            "google_linked": user.google_id is not None,
             "line_accounts": line_accounts,
             "line_linked": len(line_accounts) > 0,
             "created_at": user.created_at.isoformat() if user.created_at else None}

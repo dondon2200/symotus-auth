@@ -79,7 +79,6 @@ def list_resellers(
             "full_name": u.full_name,
             "email": u.email,
             "role": u.role,
-            "line_id": u.line_id,
             "camera_email": u.camera_email,
             "is_active": u.is_active,
             "camera_count": cam_count,
@@ -208,10 +207,10 @@ def list_all_users(
         raise HTTPException(status_code=403, detail="Invalid service key")
     users = db.query(User).all()
     return [{"id": u.id, "username": u.username, "email": u.email,
-             "role": u.role, "line_id": u.line_id, "camera_email": u.camera_email,
+             "role": u.role, "camera_email": u.camera_email,
              "is_active": u.is_active,
              "full_name": u.full_name, "reseller_id": u.reseller_id,
-             "has_google": bool(u.google_id), "has_password": bool(u.hashed_password),
+             "has_password": bool(u.hashed_password),
              "created_at": u.created_at.isoformat() if u.created_at else None} for u in users]
 
 

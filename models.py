@@ -24,10 +24,6 @@ class User(Base):
     camera_email = Column(String, nullable=True)      # Camera Backend 對應帳號 email
     camera_user_id = Column(Integer, nullable=True)   # Camera Backend 的真實 user_id
 
-    # OAuth
-    google_id = Column(String, nullable=True, unique=True)
-    line_id = Column(String, nullable=True, unique=True)
-
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

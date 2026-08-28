@@ -38,7 +38,7 @@ def test_line_token_disabled(client):
 
 
 def test_me_unlink_disabled(client, make_user, auth_headers):
-    user = make_user("ul1", "ul1@example.com", password="oldpassword", google_id="g-ul1")
+    user = make_user("ul1", "ul1@example.com", password="oldpassword")
     r = client.post("/auth/me/unlink/google", headers=auth_headers(user))
     assert r.status_code == 410
 

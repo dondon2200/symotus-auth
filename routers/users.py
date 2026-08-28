@@ -106,7 +106,6 @@ def managed_users(
     return [{
         "id": u.id, "username": u.username, "full_name": u.full_name,
         "email": u.email, "role": u.role, "is_active": u.is_active,
-        "line_id": u.line_id,
         "is_subordinate": u.reseller_id == current_user.id,  # true=旗下；false=僅被我授權
     } for u in sorted(users, key=lambda x: x.id)]
 

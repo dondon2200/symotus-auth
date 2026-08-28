@@ -65,7 +65,7 @@ def client(app, db):
 
 @pytest.fixture()
 def make_user(db):
-    def _make(username, email, password=None, google_id=None, line_id=None, role="end_user"):
+    def _make(username, email, password=None, role="end_user"):
         user = User(
             username=username,
             email=email,
@@ -73,8 +73,6 @@ def make_user(db):
             hashed_password=hash_password(password) if password else None,
             role=role,
             is_active=True,
-            google_id=google_id,
-            line_id=line_id,
         )
         db.add(user)
         db.commit()

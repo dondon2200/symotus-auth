@@ -21,10 +21,9 @@ def test_me_requires_token(client):
 
 
 def test_me_exposes_credential_flags(client, make_user, auth_headers):
-    user = make_user("bob", "bob@example.com", password="oldpassword", google_id="g-1")
+    user = make_user("bob", "bob@example.com", password="oldpassword")
     body = client.get("/auth/me", headers=auth_headers(user)).json()
     assert body["has_password"] is True
-    assert body["google_linked"] is True
     assert body["line_linked"] is False
     assert body["created_at"] is not None
 
@@ -107,7 +106,7 @@ def test_change_password_requires_current_when_password_exists(client, make_user
 
 
 def test_oauth_only_account_sets_password_without_current(client, make_user, auth_headers, db):
-    user = make_user("jack", "jack@example.com", google_id="g-jack")
+    user = make_user("jack", "jack@example.com")
     r = client.post("/auth/me/password", headers=auth_headers(user), json={
         "new_password": "brandnewpass"})
     assert r.status_code == 200
@@ -165,19 +164,19 @@ def test_revoked_refresh_token_cannot_refresh(client, make_user, auth_headers, d
 
 def test_unlink_google_disabled(client, make_user, auth_headers, db):
     """Task 3：第三方登入停用後，舊式 /me/unlink/{provider} 一律 410。"""
-    user = make_user("quinn", "quinn@example.com", password="oldpassword", google_id="g-q")
+    user = make_user("quinn", "quinn@example.com", password="oldpassword")
     r = client.post("/auth/me/unlink/google", headers=auth_headers(user))
     assert r.status_code == 410
 
 
 def test_unlink_line_disabled(client, make_user, auth_headers, db):
-    user = make_user("rita", "rita@example.com", google_id="g-r", line_id="l-r")
+    user = make_user("rita", "rita@example.com")
     r = client.post("/auth/me/unlink/line", headers=auth_headers(user))
     assert r.status_code == 410
 
 
 def test_unlink_unknown_provider_disabled(client, make_user, auth_headers):
-    user = make_user("tina", "tina@example.com", password="oldpassword", google_id="g-t")
+    user = make_user("tina", "tina@example.com", password="oldpassword")
     r = client.post("/auth/me/unlink/facebook", headers=auth_headers(user))
     assert r.status_code == 410
 
@@ -196,7 +195,7 @@ def test_link_google_disabled(client, make_user, auth_headers, db):
                     json={"code": "c", "state": state})
     assert r.status_code == 410
     db.refresh(user)
-    assert user.google_id is None
+    assert user.hashed_password is not None
 
 
 def test_line_bind_token_round_trips_next_path():

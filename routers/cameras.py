@@ -196,21 +196,6 @@ async def list_cameras(
         # reseller 看自己的相機；如果有 allowed_ids 限制再過濾
         if allowed_ids is not None:
             cameras = [c for c in cameras if c["id"] in allowed_ids]
-        # ⚠️ 安全過濾：LINE 合成 email 的帳號在 Camera Backend 可能混用
-        # 必須以 Symotus camera_access 表為唯一授權依據，
-        # 防止 Camera Backend 帳號共用導致看到他人相機
-        is_line_email = (
-            current_user.camera_email and
-            current_user.camera_email.startswith("line_") and
-            current_user.camera_email.endswith("@symotus.com")
-        )
-        if is_line_email:
-            auth_cam_ids = set(
-                a.camera_id for a in db.query(CameraAccess).filter(
-                    CameraAccess.user_id == current_user.id
-                ).all()
-            )
-            cameras = [c for c in cameras if c.get("id") in auth_cam_ids]
     else:
         # 沒有 camera token（end_user、reseller 沒有 camera_email）：
         # 走 camera_access 路徑。allowed_ids=None(reseller) 表示無自有相機，但仍可有分享相機
@@ -371,14 +356,6 @@ async def create_camera(
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token，請確認 camera_email 設定")
     used_admin_fallback = not current_user.camera_email
-    # LINE 合成 email 的帳號在 list_cameras 會被「只信任 camera_access」的安全過濾擋下
-    # （見 list_cameras 的 is_line_email 區塊）。因此即使用自己的 token 配對成功，
-    # 也必須補一筆 camera_access，否則自己配對的相機不會出現在首頁。
-    is_line_email = bool(
-        current_user.camera_email
-        and current_user.camera_email.startswith("line_")
-        and current_user.camera_email.endswith("@symotus.com")
-    )
     body = await request.body()
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
@@ -392,9 +369,8 @@ async def create_camera(
             return JSONResponse(status_code=resp.status_code, content={"detail": resp.text})
 
     # 自動幫 reseller 建立 camera_access（full 權限）：
-    # - admin fallback 配對（無 camera_email）→ 沒有後端帳號，靠 camera_access 才看得到
-    # - LINE 合成 email reseller → 會被 list_cameras 的 LINE 安全過濾擋下，同樣需要 grant
-    if resp.status_code in (200, 201) and current_user.role == "reseller" and (used_admin_fallback or is_line_email):
+    # admin fallback 配對（無 camera_email）→ 沒有後端帳號，靠 camera_access 才看得到
+    if resp.status_code in (200, 201) and current_user.role == "reseller" and used_admin_fallback:
         camera_id = resp_data.get("id") or resp_data.get("basic_info", {}).get("id")
         if camera_id:
             existing = db.query(CameraAccess).filter(
@@ -590,10 +566,11 @@ async def subscribe_online_notification(
             and not level_allows(db, "notify.subscribe", _acc.permission_level)):
         raise HTTPException(403, "此操作需要更高的授權等級（notify.subscribe）")
 
-    if not current_user.line_id:
+    line_accounts = current_user.line_accounts
+    if not line_accounts:
         return {"subscribed": False, "needs_line": True, "is_following": False,
                 "message": "請先綁定 LINE 帳號"}
-    if not await _is_following_oa(current_user.line_id):
+    if not await _is_following_oa(line_accounts[0].line_user_id):
         return {"subscribed": False, "needs_line": True, "is_following": False,
                 "message": "請先加入官方 LINE 帳號以接收通知"}
 
@@ -621,7 +598,7 @@ async def get_notify_status(
     db: Session = Depends(get_db),
 ):
     """查詢此相機的通知訂閱狀態"""
-    if not current_user.line_id:
+    if not current_user.line_accounts:
         return {"subscribed": False, "needs_line": True}
     return {"subscribed": _is_subscribed(db, camera_id, current_user)}
 
@@ -633,7 +610,7 @@ async def notify_settings(
 ):
     """集中式通知設定：回傳此用戶已訂閱 / 已退訂的相機清單（P1）。
     相機名稱由前端從 /cameras 取得，這裡只回訂閱狀態，避免重複打 Camera Backend。"""
-    if not current_user.line_id:
+    if not current_user.line_accounts:
         return {"needs_line": True, "role": current_user.role, "subscribed": [], "suppressed": []}
     rows = db.query(CameraAccess).filter(CameraAccess.user_id == current_user.id).all()
     subscribed = sorted({a.camera_id for a in rows if getattr(a, "notify_on_online", False)})
@@ -660,9 +637,10 @@ async def notify_bulk(
         camera_ids = [c for c in camera_ids if c in allowed_set]
 
     if subscribe:
-        if not current_user.line_id:
+        line_accounts = current_user.line_accounts
+        if not line_accounts:
             return {"needs_line": True, "message": "請先綁定 LINE 帳號"}
-        if not await _is_following_oa(current_user.line_id):
+        if not await _is_following_oa(line_accounts[0].line_user_id):
             return {"needs_line": True, "message": "請先加入官方 LINE 帳號以接收通知"}
         # notify.subscribe 政策：略過等級不足的被分享相機（退訂不受限）
         if current_user.role != "symotus_admin":

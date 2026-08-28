@@ -59,8 +59,6 @@ class UserResponse(BaseModel):
     role: str
     is_active: bool
     reseller_id: Optional[int]
-    google_id: Optional[str]
-    line_id: Optional[str]
     created_at: UtcDatetime
 
     class Config:
