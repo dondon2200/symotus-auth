@@ -2,8 +2,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
 from models import User, CameraAccess, TechSupportGrant, CameraInvitation, InviteToken, AuditLog
-from schemas import UserResponse, TechSupportGrantResponse
-from auth import require_role, decode_token
+from schemas import UserResponse, TechSupportGrantResponse, AdminUserCreate
+from auth import require_role, decode_token, hash_password
 from audit import log_action
 from config import settings
 from datetime import datetime
@@ -31,6 +31,37 @@ def _actor_user(authorization: str, db: Session):
         except Exception:
             pass
     return None
+
+@router.post("/users", response_model=UserResponse, status_code=201)
+def create_user(
+    body: AdminUserCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("symotus_admin")),
+):
+    """後台直接建帳（symotus_admin/reseller/end_user 皆可）。role 由 Pydantic
+    Literal 限制在三個合法值，非法值 422；username/email 重複回 409。"""
+    if db.query(User).filter(User.username == body.username).first():
+        raise HTTPException(status_code=409, detail="username 已存在")
+    if db.query(User).filter(User.email == body.email).first():
+        raise HTTPException(status_code=409, detail="email 已存在")
+    user = User(
+        username=body.username,
+        email=body.email,
+        full_name=body.full_name,
+        hashed_password=hash_password(body.password),
+        role=body.role,
+        is_active=True,
+        camera_email=body.camera_email,
+        reseller_id=body.reseller_id,
+        created_by=current_user.id,
+    )
+    db.add(user)
+    db.flush()
+    log_action(db, current_user, "user.create", "user", user.id, f"role={body.role}")
+    db.commit()
+    db.refresh(user)
+    return user
+
 
 @router.get("/resellers")
 def list_resellers(

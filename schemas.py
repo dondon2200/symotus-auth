@@ -72,6 +72,26 @@ class UserUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
+class AdminUserCreate(BaseModel):
+    """symotus_admin 直接後台建帳（POST /admin/users）。"""
+    username: str
+    email: EmailStr
+    password: str = Field(min_length=8)
+    full_name: Optional[str] = None
+    role: Literal["symotus_admin", "reseller", "end_user"]
+    camera_email: Optional[str] = None
+    reseller_id: Optional[int] = None
+
+
+class ResellerUserCreate(BaseModel):
+    """reseller 直接建 end_user（POST /users）。刻意不收 role/reseller_id——
+    後端一律強制 role=end_user、reseller_id=current_user.id，避免 body 夾帶越權。"""
+    username: str
+    email: EmailStr
+    password: str = Field(min_length=8)
+    full_name: Optional[str] = None
+
+
 # ── Invite ──────────────────────────────────────────
 class InviteCreate(BaseModel):
     camera_ids: Optional[List[int]] = None

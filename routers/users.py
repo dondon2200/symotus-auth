@@ -2,11 +2,45 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
 from models import User, CameraAccess
-from schemas import UserResponse, UserUpdate
-from auth import get_current_user, require_role
+from schemas import UserResponse, UserUpdate, ResellerUserCreate
+from auth import get_current_user, require_role, hash_password
 from audit import log_action
 
 router = APIRouter(prefix="/reseller", tags=["reseller"])
+
+# 不掛 /reseller 前綴：spec 要求 POST /users（根路徑），另建一個 router 由
+# main.py 單獨掛載，避免 prefix 混進去變成 /reseller/users。
+users_router = APIRouter(tags=["users"])
+
+
+@users_router.post("/users", response_model=UserResponse, status_code=201)
+def reseller_create_user(
+    body: ResellerUserCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("reseller")),
+):
+    """reseller 直接建 end_user。role/reseller_id 一律強制，schema 本身也不收
+    這兩個欄位，body 夾帶什麼都不影響結果。"""
+    if db.query(User).filter(User.username == body.username).first():
+        raise HTTPException(status_code=409, detail="username 已存在")
+    if db.query(User).filter(User.email == body.email).first():
+        raise HTTPException(status_code=409, detail="email 已存在")
+    user = User(
+        username=body.username,
+        email=body.email,
+        full_name=body.full_name,
+        hashed_password=hash_password(body.password),
+        role="end_user",
+        is_active=True,
+        reseller_id=current_user.id,
+        created_by=current_user.id,
+    )
+    db.add(user)
+    db.flush()
+    log_action(db, current_user, "user.create", "user", user.id, "role=end_user")
+    db.commit()
+    db.refresh(user)
+    return user
 
 @router.get("/users", response_model=list[UserResponse])
 def list_end_users(

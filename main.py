@@ -392,6 +392,7 @@ from routers import auth, invites, users, support, admin, jobs, cameras, line_we
 app.include_router(auth.router)
 app.include_router(invites.router)
 app.include_router(users.router)
+app.include_router(users.users_router)
 app.include_router(support.router)
 app.include_router(admin.router)
 app.include_router(jobs.router)
