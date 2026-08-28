@@ -11,7 +11,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
 from database import SessionLocal
-from models import User, CameraAccess
+from models import User, UserLineAccount, CameraAccess
 from policies import level_allows
 
 logger = logging.getLogger(__name__)
@@ -123,10 +123,11 @@ def get_notify_line_ids(camera_id: int, db: Session) -> list[str]:
         ).all()
     }
     # admin 預設通知，但尊重其對本相機的退訂
-    for u in db.query(User).filter(User.role == "symotus_admin", User.line_id.isnot(None)).all():
+    for u in db.query(User).filter(User.role == "symotus_admin").all():
         if u.id not in opted_out:
-            ids.add(u.line_id)
-    # camera_access 裡有 line_id 且 notify_on_online=True 的用戶
+            for acc in u.line_accounts:
+                ids.add(acc.line_user_id)
+    # camera_access 裡有綁定 LINE 且 notify_on_online=True 的用戶
     for acc in db.query(CameraAccess).filter(CameraAccess.camera_id == camera_id).all():
         # 只通知有訂閱的用戶（notify_on_online 預設 True）
         notify = getattr(acc, "notify_on_online", True)
@@ -138,9 +139,10 @@ def get_notify_line_ids(camera_id: int, db: Session) -> list[str]:
         if (acc.granted_by and acc.granted_by != acc.user_id
                 and not level_allows(db, "notify.subscribe", acc.permission_level)):
             continue
-        u = db.query(User).filter(User.id == acc.user_id, User.line_id.isnot(None)).first()
+        u = db.query(User).filter(User.id == acc.user_id).first()
         if u:
-            ids.add(u.line_id)
+            for line_acc in u.line_accounts:
+                ids.add(line_acc.line_user_id)
     return list(ids)
 
 

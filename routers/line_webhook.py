@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 import httpx
 
 from database import get_db
-from models import User, CameraAccess
+from models import User, UserLineAccount, CameraAccess
 from auth import create_access_token, create_refresh_token
 from models import RefreshToken
 from config import settings
@@ -531,6 +531,12 @@ async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: s
         {"type": "image", "originalContentUrl": public_url, "previewImageUrl": public_url}
     ])
 
+def _resolve_user(db: Session, line_user_id: str) -> User | None:
+    """依 user_line_accounts 表解析 LINE userId 對應的 Symotus 用戶（支援一帳號綁多個 LINE）。"""
+    acc = db.query(UserLineAccount).filter(UserLineAccount.line_user_id == line_user_id).first()
+    return acc.user if acc else None
+
+
 # ── Webhook endpoint ──────────────────────────────────────────────────────────
 @router.post("/line")
 async def line_webhook(request: Request, db: Session = Depends(get_db)):
@@ -550,7 +556,7 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
         text         = event["message"]["text"]
 
         # 找 Symotus 用戶
-        user = db.query(User).filter(User.line_id == line_user_id).first()
+        user = _resolve_user(db, line_user_id)
         if not user:
             await line_reply(reply_token, [{"type": "text",
                 "text": f"您好！請先到 {os.getenv('FRONTEND_URL', 'https://user.symotus.com')} 用 LINE 登入，才能使用 AI 助理功能"}])
