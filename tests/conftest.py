@@ -24,7 +24,7 @@ from models import (
     User, RefreshToken, AuditLog, CameraAccess,
     BillingPlan, BillingCustomer, BillingSubscription,
     BillingInvoice, BillingInvoiceLine, BillingUsageDaily,
-    TimelapsJob,
+    TimelapsJob, UserLineAccount,
 )
 from auth import hash_password, create_access_token
 from routers.auth import router as auth_router
@@ -33,7 +33,7 @@ _TABLES = [
     User.__table__, RefreshToken.__table__, AuditLog.__table__, CameraAccess.__table__,
     BillingPlan.__table__, BillingCustomer.__table__, BillingSubscription.__table__,
     BillingInvoice.__table__, BillingInvoiceLine.__table__, BillingUsageDaily.__table__,
-    TimelapsJob.__table__,
+    TimelapsJob.__table__, UserLineAccount.__table__,
 ]
 
 

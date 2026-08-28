@@ -15,7 +15,7 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     full_name = Column(String, nullable=True)
     hashed_password = Column(String, nullable=True)  # nullable for OAuth-only users
-    role = Column(String, nullable=False, default="reseller")  # symotus_admin | reseller | end_user
+    role = Column(String, nullable=False, default="end_user")  # symotus_admin | reseller | end_user
     is_active = Column(Boolean, default=True)
     reseller_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # end_user -> reseller
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
@@ -35,6 +35,20 @@ class User(Base):
     camera_accesses = relationship("CameraAccess", foreign_keys="CameraAccess.user_id", back_populates="user")
     granted_accesses = relationship("CameraAccess", foreign_keys="CameraAccess.granted_by", back_populates="granter")
     sent_invites = relationship("InviteToken", foreign_keys="InviteToken.reseller_id", back_populates="reseller")
+
+
+class UserLineAccount(Base):
+    """一個 User 可綁定多個 LINE 帳號（多 LINE 綁定）"""
+    __tablename__ = "user_line_accounts"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    line_user_id = Column(String, nullable=False, unique=True)
+    display_name = Column(String, nullable=True)
+    picture_url = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", backref="line_accounts")
 
 
 class CameraAccess(Base):
