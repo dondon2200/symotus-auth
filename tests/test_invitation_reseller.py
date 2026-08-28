@@ -160,6 +160,13 @@ def test_accept_invitation_respects_admin_inviter_for_reseller_fill(
     assert end_user_without_reseller.reseller_id == admin.id, \
         f"Expected reseller_id to be filled with {admin.id}, but got {end_user_without_reseller.reseller_id}"
 
+    # 驗證：camera_access 正確建立（佐證邀請確實被接受）
+    acc = db.query(CameraAccess).filter_by(
+        user_id=end_user_without_reseller.id, camera_id=9
+    ).one()
+    assert acc.permission_level == "stream_only"
+    assert acc.granted_by == admin.id
+
 
 def test_accept_invitation_no_fill_if_inviter_is_end_user(db):
     """
@@ -194,3 +201,10 @@ def test_accept_invitation_no_fill_if_inviter_is_end_user(db):
     db.refresh(user_a)
     assert user_a.reseller_id is None, \
         f"Expected reseller_id to remain None (inviter is end_user), but got {user_a.reseller_id}"
+
+    # 驗證：camera_access 正確建立（佐證邀請確實被接受）
+    acc = db.query(CameraAccess).filter_by(
+        user_id=user_a.id, camera_id=10
+    ).one()
+    assert acc.permission_level == "stream_only"
+    assert acc.granted_by == user_b.id
