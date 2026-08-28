@@ -10,8 +10,7 @@ from models import User, RefreshToken, InviteToken, CameraAccess, UserLineAccoun
 from schemas import LoginRequest, TokenResponse, RefreshRequest, OAuthCallbackRequest
 from auth import (hash_password, verify_password, create_access_token,
                   create_refresh_token, decode_token, get_current_user,
-                  to_backend_role, create_line_bind_token, decode_line_bind_token,
-                  create_google_bind_token, decode_google_bind_token)
+                  to_backend_role, create_line_bind_token, decode_line_bind_token)
 from config import settings
 from audit import log_action
 
@@ -248,35 +247,10 @@ def logout_all_devices(db: Session = Depends(get_db),
 
 
 @router.post("/me/unlink/{provider}")
-def unlink_provider(provider: str, db: Session = Depends(get_db),
-                    current_user: User = Depends(get_current_user)):
-    """解除 OAuth 綁定。解完必須至少還剩一種登入方式，否則使用者會鎖在門外。"""
-    if provider not in ("google", "line"):
-        raise HTTPException(400, "不支援的登入方式")
-
-    # 檢查目標 provider 是否已綁定
-    if provider == "google" and current_user.google_id is None:
-        raise HTTPException(400, "尚未綁定該登入方式")
-    elif provider == "line" and current_user.line_id is None:
-        raise HTTPException(400, "尚未綁定該登入方式")
-
-    remaining = [
-        current_user.hashed_password is not None,
-        current_user.google_id is not None and provider != "google",
-        current_user.line_id is not None and provider != "line",
-    ]
-    if not any(remaining):
-        raise HTTPException(400, "解除後將無法登入，請先設定密碼")
-
-    if provider == "google":
-        current_user.google_id = None
-    else:
-        current_user.line_id = None
-
-    log_action(db, current_user, f"self_unlink_{provider}", "user", current_user.id, provider)
-    db.commit()
-    db.refresh(current_user)
-    return _me_payload(current_user)
+def unlink_provider(provider: str, current_user: User = Depends(get_current_user)):
+    """已停用：google_id/line_id 舊式綁定已無登入用途；LINE 逐筆解綁見
+    `DELETE /auth/me/line/{id}`（Task 2）。"""
+    raise HTTPException(410, "第三方登入已停用")
 
 
 @router.delete("/me/line/{line_account_id}")
@@ -314,118 +288,29 @@ def exchange_login_code(body: ExchangeRequest, request: Request):
 
 @router.get("/google/url")
 def google_url(invite_token: str = None):
-    state = secrets.token_urlsafe(16)
-    if invite_token:
-        state = f"{state}:{invite_token}"
-    params = f"client_id={settings.GOOGLE_CLIENT_ID}&redirect_uri={settings.GOOGLE_REDIRECT_URI}&response_type=code&scope=openid email profile&state={state}"
-    return {"auth_url": f"https://accounts.google.com/o/oauth2/v2/auth?{params}", "state": state}
+    raise HTTPException(410, "第三方登入已停用")
 
 @router.post("/google/token", response_model=TokenResponse)
 async def google_token(body: OAuthCallbackRequest, request: Request, db: Session = Depends(get_db)):
-    invite_token_str = body.invite_token
-    if body.state and ":" in body.state:
-        _, invite_token_str = body.state.split(":", 1)
-    async with httpx.AsyncClient() as client:
-        r = await client.post("https://oauth2.googleapis.com/token", data={
-            "code": body.code, "client_id": settings.GOOGLE_CLIENT_ID,
-            "client_secret": settings.GOOGLE_CLIENT_SECRET,
-            "redirect_uri": settings.GOOGLE_REDIRECT_URI, "grant_type": "authorization_code"})
-        td = r.json()
-        r2 = await client.get("https://www.googleapis.com/oauth2/v3/userinfo",
-                              headers={"Authorization": f"Bearer {td['access_token']}"})
-        ui = r2.json()
-    return _oauth_finish(db, "google_id", ui["sub"], ui.get("email"), ui.get("name"),
-                         invite_token_str, host=_get_host(request))
-
-async def _fetch_google_profile(code: str, state: str) -> dict:
-    """以授權碼向 Google 換取 userinfo。抽成模組層函式以便測試 monkeypatch。"""
-    async with httpx.AsyncClient() as client:
-        r = await client.post("https://oauth2.googleapis.com/token", data={
-            "code": code, "client_id": settings.GOOGLE_CLIENT_ID,
-            "client_secret": settings.GOOGLE_CLIENT_SECRET,
-            "redirect_uri": settings.GOOGLE_REDIRECT_URI,
-            "grant_type": "authorization_code"})
-        td = r.json()
-        if "access_token" not in td:
-            raise HTTPException(400, "Google 授權失敗，請重新嘗試")
-        r2 = await client.get("https://www.googleapis.com/oauth2/v3/userinfo",
-                              headers={"Authorization": f"Bearer {td['access_token']}"})
-        return r2.json()
+    raise HTTPException(410, "第三方登入已停用")
 
 
 @router.get("/google/bind-url")
 def google_bind_url(current_user: User = Depends(get_current_user)):
-    """綁定用授權 URL。沿用登入的 redirect URI，靠 state 內的 ticket 區分綁定與登入，
-    因此不必到 Google Console 另外登記網址。"""
-    ticket = create_google_bind_token(current_user.id)
-    state = f"{secrets.token_urlsafe(16)}:gbind:{ticket}"
-    params = (f"client_id={settings.GOOGLE_CLIENT_ID}"
-              f"&redirect_uri={settings.GOOGLE_REDIRECT_URI}"
-              f"&response_type=code&scope=openid email profile&state={state}")
-    return {"auth_url": f"https://accounts.google.com/o/oauth2/v2/auth?{params}", "state": state}
+    """已停用：Google OAuth 僅保留 LINE 綁定用途，Google 綁定/登入一律關閉。"""
+    raise HTTPException(410, "第三方登入已停用")
 
 
 @router.post("/me/link/google")
 async def link_google(body: OAuthCallbackRequest, db: Session = Depends(get_db),
                       current_user: User = Depends(get_current_user)):
-    state = body.state or ""
-    if ":gbind:" not in state:
-        raise HTTPException(400, "綁定連結無效或已過期，請重新操作")
-    ticket = state.split(":gbind:", 1)[1]
-    bind_user_id = decode_google_bind_token(ticket)
-    if bind_user_id is None or bind_user_id != current_user.id:
-        raise HTTPException(400, "綁定連結無效或已過期，請重新操作")
-
-    if current_user.google_id is not None:
-        raise HTTPException(400, "已綁定 Google 帳號，請先解除後再重新綁定")
-
-    ui = await _fetch_google_profile(body.code, body.state or "")
-    google_id = ui.get("sub")
-    if not google_id:
-        raise HTTPException(400, "無法取得 Google 帳號資訊")
-
-    taken = db.query(User).filter(User.google_id == google_id,
-                                  User.id != current_user.id).first()
-    if taken:
-        raise HTTPException(409, "此 Google 帳號已綁定其他使用者")
-
-    current_user.google_id = google_id
-    log_action(db, current_user, "self_link_google", "user", current_user.id, "google_id")
-    db.commit()
-    db.refresh(current_user)
-    return _me_payload(current_user)
-
-
-async def _line_email(client: httpx.AsyncClient, td: dict) -> Optional[str]:
-    """從 LINE token 回應取 email。
-
-    C：LINE 的 email 藏在 `id_token`(JWT) 內，不是 token 回應頂層欄位，
-    需呼叫 verify 端點解出。缺這步時「相同 email 的 LINE 登入」無法併回原帳號，
-    會另開 {userId}@oauth.local 分裂帳號。email scope 未授權時回 None。"""
-    idt = td.get("id_token")
-    if not idt:
-        return None
-    try:
-        vr = await client.post("https://api.line.me/oauth2/v2.1/verify",
-                               data={"id_token": idt, "client_id": settings.LINE_CLIENT_ID})
-        if vr.is_success:
-            return vr.json().get("email")
-    except Exception:
-        pass
-    return None
+    raise HTTPException(410, "第三方登入已停用")
 
 
 @router.get("/line/url")
 def line_url(response: Response, invite_token: str = None):
-    state = secrets.token_urlsafe(16)
-    if invite_token:
-        state = f"{state}:{invite_token}"
-    # 綁定 state 到短效 HttpOnly cookie，/line/callback 比對以防 CSRF。
-    # SameSite=Lax 才會在 LINE 導回（top-level GET）時帶上此 cookie。
-    response.set_cookie("line_oauth_state", state, max_age=600,
-                        httponly=True, secure=True, samesite="lax", path="/")
-    params = f"response_type=code&client_id={settings.LINE_CLIENT_ID}&redirect_uri={settings.LINE_REDIRECT_URI}&state={state}&scope=profile openid email"
-    return {"auth_url": f"https://access.line.me/oauth2/v2.1/authorize?{params}", "state": state}
+    """已停用：LINE 登入關閉，OAuth 只保留 /line/bind-url 綁定流程。"""
+    raise HTTPException(410, "第三方登入已停用")
 
 @router.get("/line/bind-url")
 def line_bind_url(response: Response, next: str = "/notifications",
@@ -441,80 +326,8 @@ def line_bind_url(response: Response, next: str = "/notifications",
 
 @router.post("/line/token", response_model=TokenResponse)
 async def line_token(body: OAuthCallbackRequest, request: Request, db: Session = Depends(get_db)):
-    invite_token_str = body.invite_token
-    if body.state and ":" in body.state:
-        _, invite_token_str = body.state.split(":", 1)
-    async with httpx.AsyncClient() as client:
-        r = await client.post("https://api.line.me/oauth2/v2.1/token", data={
-            "grant_type": "authorization_code", "code": body.code,
-            "redirect_uri": settings.LINE_REDIRECT_URI,
-            "client_id": settings.LINE_CLIENT_ID, "client_secret": settings.LINE_CLIENT_SECRET})
-        td = r.json()
-        r2 = await client.get("https://api.line.me/v2/profile",
-                               headers={"Authorization": f"Bearer {td['access_token']}"})
-        profile = r2.json()
-        email = await _line_email(client, td)   # C：從 id_token 取 email 以支援併帳
-    return _oauth_finish(db, "line_id", profile["userId"], email, profile.get("displayName"),
-                         invite_token_str, host=_get_host(request))
-
-def _oauth_finish(db, oauth_field, oauth_id, email, full_name, invite_token_str=None, host: str = ""):
-    user = db.query(User).filter_by(**{oauth_field: oauth_id}).first()
-    if not user and email:
-        user = db.query(User).filter(User.email == email).first()
-        if user:
-            setattr(user, oauth_field, oauth_id); db.commit()
-    if not user:
-        invite = None
-        role = "end_user"   # F-2 修補：OAuth 自助註冊預設最低權限；reseller 僅由 admin 指派
-        reseller_id = None
-        if invite_token_str:
-            invite = db.query(InviteToken).filter(
-                InviteToken.token == invite_token_str,
-                InviteToken.status == "pending",
-                InviteToken.expires_at > datetime.utcnow()).first()
-            if not invite:
-                raise HTTPException(400, "邀請連結無效或已過期")
-            if invite.email and invite.email != email:
-                raise HTTPException(400, "此邀請連結限定特定 Email 使用")
-            # 角色依邀請指定；「reseller」需再確認發邀請者為 platform admin（縱深防禦）
-            if invite.intended_role == "reseller":
-                inviter = db.query(User).filter(User.id == invite.reseller_id).first()
-                if inviter and inviter.role == "symotus_admin":
-                    role = "reseller"
-            reseller_id = invite.reseller_id
-        base = (email or "").split("@")[0] or oauth_id[:8]
-        username = base
-        i = 1
-        while db.query(User).filter(User.username == username).first():
-            username = f"{base}{i}"; i += 1
-        user = User(username=username, email=email or f"{oauth_id}@oauth.local",
-                    full_name=full_name, role=role, reseller_id=reseller_id)
-        setattr(user, oauth_field, oauth_id)
-        db.add(user); db.flush()
-        if invite:
-            # 預綁 Camera Backend 帳號（reseller 邀請）：接受者一登入即可換 camera token
-            if invite.camera_email:
-                user.camera_email = invite.camera_email
-            if invite.camera_user_id:
-                user.camera_user_id = invite.camera_user_id
-            if invite.camera_ids:
-                for cam_id in invite.camera_ids:
-                    db.add(CameraAccess(camera_id=cam_id, user_id=user.id, granted_by=invite.reseller_id,
-                                        invitation_id=0))  # 非邀請連結來源（哨兵，避免撤銷連結時 NULL fallback 誤刪）
-            invite.status = "accepted"; invite.accepted_by = user.id; invite.accepted_at = datetime.utcnow()
-        db.commit(); db.refresh(user)
-    if not user.is_active:
-        raise HTTPException(403, "帳號已停用")
-
-    # admin.symotus.com 入口僅限平台管理員
-    _check_admin_host(host, user.role)
-
-    refresh = create_refresh_token()
-    db.add(RefreshToken(user_id=user.id, token=refresh,
-        expires_at=datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)))
-    db.commit()
-    return TokenResponse(access_token=create_access_token(user, db), refresh_token=refresh,
-                         expires_in=settings.JWT_EXPIRE_MINUTES * 60)
+    """已停用：LINE 登入關閉，OAuth 只保留 /line/bind-url 綁定流程。"""
+    raise HTTPException(410, "第三方登入已停用")
 
 
 class UserCreateInternal(BaseModel):
@@ -618,9 +431,7 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
 @router.get("/line/callback")
 async def line_callback(code: str, state: str = "", request: Request = None, db: Session = Depends(get_db)):
     from fastapi.responses import RedirectResponse
-    from urllib.parse import quote
     frontend = settings.FRONTEND_URL
-    host = _get_host(request) if request else ""
     # round-trip 驗證：LINE 回傳的 state 必須等於 /line/url 時寫入 cookie 的值
     saved_state = request.cookies.get("line_oauth_state") if request else None
     if not state or not saved_state or not secrets.compare_digest(state, saved_state):
@@ -628,7 +439,6 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
         resp.delete_cookie("line_oauth_state", path="/")
         return resp
     try:
-        invite_token_str = None
         bind_user_id = None
         bind_next = "/notifications"
         # A：state 夾帶 bind ticket → 綁定流程（把 LINE 綁到當前登入用戶，而非登入/建帳）
@@ -636,8 +446,6 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
             decoded = decode_line_bind_token(state.split(":bind:", 1)[1])
             if decoded:
                 bind_user_id, bind_next = decoded
-        elif state and ":" in state:
-            _, invite_token_str = state.split(":", 1)
 
         async with httpx.AsyncClient() as client:
             r = await client.post("https://api.line.me/oauth2/v2.1/token", data={
@@ -653,7 +461,6 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
             r2 = await client.get("https://api.line.me/v2/profile",
                                    headers={"Authorization": f"Bearer {td['access_token']}"})
             profile = r2.json()
-            email = await _line_email(client, td)   # C：從 id_token 取 email 以支援併帳
 
         # A：綁定流程 —— 把 LINE userId 綁到 ticket 指定的既有用戶
         if bind_user_id is not None:
@@ -676,30 +483,8 @@ async def line_callback(code: str, state: str = "", request: Request = None, db:
             resp.delete_cookie("line_oauth_state", path="/")
             return resp
 
-        token_resp = _oauth_finish(db, "line_id", profile["userId"],
-                                   email, profile.get("displayName"),
-                                   invite_token_str, host=host)
-
-        user = db.query(User).filter(User.line_id == profile["userId"]).first()
-
-        # 換取 camera token：僅在使用者已有 camera_email 時嘗試
-        # （不再合成 line_{userId}@symotus.com 佔位帳號；LINE-only 使用者的相機存取見 Task 6）
-        camera_tokens = {}
-        if user and user.camera_email:
-            try:
-                camera_tokens = await get_camera_token(user.id, user.camera_email, user.role)
-            except Exception as cam_err:
-                print(f"[LINE callback] camera token error: {cam_err}")
-
-        # F-7：token 不放 URL —— 存一次性 code，前端 /auth/callback 再 POST /auth/exchange 取回
-        code_handoff = _store_login_handoff({
-            "access_token": token_resp.access_token,
-            "refresh_token": token_resp.refresh_token,
-            "expires_in": settings.JWT_EXPIRE_MINUTES * 60,
-            "camera_access_token": camera_tokens.get("access_token") or None,
-            "camera_refresh_token": camera_tokens.get("refresh_token") or None,
-        })
-        resp = RedirectResponse(f"{frontend}/auth/callback?code={code_handoff}")
+        # Task 3：LINE 登入已停用，非 bind 分支一律導回登入頁，不建帳、不發 token
+        resp = RedirectResponse(f"{frontend}/login?error=oauth_disabled")
         resp.delete_cookie("line_oauth_state", path="/")
         return resp
     except HTTPException as he:

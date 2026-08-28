@@ -163,133 +163,40 @@ def test_revoked_refresh_token_cannot_refresh(client, make_user, auth_headers, d
     assert r.status_code == 401
 
 
-def test_unlink_google_when_password_exists(client, make_user, auth_headers, db):
+def test_unlink_google_disabled(client, make_user, auth_headers, db):
+    """Task 3：第三方登入停用後，舊式 /me/unlink/{provider} 一律 410。"""
     user = make_user("quinn", "quinn@example.com", password="oldpassword", google_id="g-q")
     r = client.post("/auth/me/unlink/google", headers=auth_headers(user))
-    assert r.status_code == 200
-    assert r.json()["google_linked"] is False
-    db.refresh(user)
-    assert user.google_id is None
+    assert r.status_code == 410
 
 
-def test_unlink_line_when_google_still_linked(client, make_user, auth_headers, db):
+def test_unlink_line_disabled(client, make_user, auth_headers, db):
     user = make_user("rita", "rita@example.com", google_id="g-r", line_id="l-r")
     r = client.post("/auth/me/unlink/line", headers=auth_headers(user))
-    assert r.status_code == 200
-    db.refresh(user)
-    assert user.line_id is None
+    assert r.status_code == 410
 
 
-def test_unlink_last_login_method_rejected(client, make_user, auth_headers, db):
-    user = make_user("sam", "sam@example.com", google_id="g-s")
-    r = client.post("/auth/me/unlink/google", headers=auth_headers(user))
-    assert r.status_code == 400
-    db.refresh(user)
-    assert user.google_id == "g-s"
-
-
-def test_unlink_unknown_provider_rejected(client, make_user, auth_headers):
+def test_unlink_unknown_provider_disabled(client, make_user, auth_headers):
     user = make_user("tina", "tina@example.com", password="oldpassword", google_id="g-t")
     r = client.post("/auth/me/unlink/facebook", headers=auth_headers(user))
-    assert r.status_code == 400
+    assert r.status_code == 410
 
 
-def test_unlink_unlinked_provider_rejected(client, make_user, auth_headers):
-    user = make_user("uuid", "uuid@example.com", password="oldpassword")
-    r = client.post("/auth/me/unlink/google", headers=auth_headers(user))
-    assert r.status_code == 400
-    assert "尚未綁定該登入方式" in r.json()["detail"]
-
-
-def test_google_bind_url_contains_bind_ticket(client, make_user, auth_headers):
+def test_google_bind_url_disabled(client, make_user, auth_headers):
+    """Task 3：Google OAuth 全面停用，含綁定用途。"""
     user = make_user("ulla", "ulla@example.com", password="oldpassword")
     r = client.get("/auth/google/bind-url", headers=auth_headers(user))
-    assert r.status_code == 200
-    assert ":gbind:" in r.json()["state"]
+    assert r.status_code == 410
 
 
-def test_link_google_writes_google_id(client, make_user, auth_headers, db, monkeypatch):
-    import routers.auth as auth_router_mod
-    import auth
+def test_link_google_disabled(client, make_user, auth_headers, db):
     user = make_user("vera", "vera@example.com", password="oldpassword")
-
-    async def fake_profile(code, state):
-        return {"sub": "g-vera", "email": "vera@gmail.com"}
-    monkeypatch.setattr(auth_router_mod, "_fetch_google_profile", fake_profile)
-
-    state = f"r:gbind:{auth.create_google_bind_token(user.id)}"
+    state = "r:gbind:whatever"
     r = client.post("/auth/me/link/google", headers=auth_headers(user),
                     json={"code": "c", "state": state})
-    assert r.status_code == 200
-    assert r.json()["google_linked"] is True
-    db.refresh(user)
-    assert user.google_id == "g-vera"
-
-
-def test_link_google_rejects_id_owned_by_someone_else(client, make_user, auth_headers, db, monkeypatch):
-    import routers.auth as auth_router_mod
-    import auth
-    make_user("wendy", "wendy@example.com", google_id="g-taken")
-    user = make_user("xavier", "xavier@example.com", password="oldpassword")
-
-    async def fake_profile(code, state):
-        return {"sub": "g-taken", "email": "taken@gmail.com"}
-    monkeypatch.setattr(auth_router_mod, "_fetch_google_profile", fake_profile)
-
-    state = f"r:gbind:{auth.create_google_bind_token(user.id)}"
-    r = client.post("/auth/me/link/google", headers=auth_headers(user),
-                    json={"code": "c", "state": state})
-    assert r.status_code == 409
+    assert r.status_code == 410
     db.refresh(user)
     assert user.google_id is None
-
-
-def test_link_google_rejects_state_without_gbind_marker(client, make_user, auth_headers, db, monkeypatch):
-    import routers.auth as auth_router_mod
-    user = make_user("yara", "yara@example.com", password="oldpassword")
-
-    async def fake_profile(code, state):
-        return {"sub": "g-yara", "email": "yara@gmail.com"}
-    monkeypatch.setattr(auth_router_mod, "_fetch_google_profile", fake_profile)
-
-    r = client.post("/auth/me/link/google", headers=auth_headers(user),
-                    json={"code": "c", "state": "just-some-random-state"})
-    assert r.status_code == 400
-    db.refresh(user)
-    assert user.google_id is None
-
-
-def test_link_google_rejects_ticket_owned_by_another_user(client, make_user, auth_headers, db, monkeypatch):
-    import routers.auth as auth_router_mod
-    import auth
-    other = make_user("zack", "zack@example.com", password="oldpassword")
-    user = make_user("amelia", "amelia@example.com", password="oldpassword")
-
-    async def fake_profile(code, state):
-        return {"sub": "g-amelia", "email": "amelia@gmail.com"}
-    monkeypatch.setattr(auth_router_mod, "_fetch_google_profile", fake_profile)
-
-    # ticket 是為 other 簽發的，但拿去打 user 的 access token
-    state = f"r:gbind:{auth.create_google_bind_token(other.id)}"
-    r = client.post("/auth/me/link/google", headers=auth_headers(user),
-                    json={"code": "c", "state": state})
-    assert r.status_code == 400
-    db.refresh(other)
-    assert other.google_id is None
-    db.refresh(user)
-    assert user.google_id is None
-
-
-def test_link_google_rejects_when_already_linked(client, make_user, auth_headers, db):
-    import auth
-    user = make_user("bianca", "bianca@example.com", password="oldpassword", google_id="g-existing")
-
-    state = f"r:gbind:{auth.create_google_bind_token(user.id)}"
-    r = client.post("/auth/me/link/google", headers=auth_headers(user),
-                    json={"code": "c", "state": state})
-    assert r.status_code == 400
-    db.refresh(user)
-    assert user.google_id == "g-existing"
 
 
 def test_line_bind_token_round_trips_next_path():
