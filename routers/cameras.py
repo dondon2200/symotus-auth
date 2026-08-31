@@ -310,13 +310,7 @@ async def get_thumbnails(
                 CameraAccess.user_id == current_user.id).all()}
             fb_ids = [i for i in missing if i in granted]
         if fb_ids:
-            async with httpx.AsyncClient(timeout=10) as client:
-                tok_r = await client.post(
-                    f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                    headers={"x-service-key": CAMERA_SERVICE_KEY},
-                    json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
-                )
-            admin_tok = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+            admin_tok = await _get_admin_camera_token()
             if admin_tok:
                 async with httpx.AsyncClient(timeout=15) as client:
                     fb_resp = await client.get(
@@ -347,13 +341,7 @@ async def create_camera(
     cam_token = await get_camera_backend_token(current_user)
     # 若沒有自己的 token（reseller 尚未設 camera_email），用 admin fallback
     if not cam_token:
-        async with httpx.AsyncClient(timeout=10) as client:
-            tok_r = await client.post(
-                f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
-            )
-        cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+        cam_token = await _get_admin_camera_token()
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token，請確認 camera_email 設定")
     body = await request.body()
@@ -418,13 +406,7 @@ async def get_camera(
             cam_token = await get_camera_backend_token(owner)
     # 最後 fallback admin（僅 grant/admin）
     if not cam_token and allow_fallback:
-        async with httpx.AsyncClient(timeout=10) as client:
-            tok_r = await client.post(
-                f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
-            )
-        cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+        cam_token = await _get_admin_camera_token()
     if not cam_token:
         raise HTTPException(403, "無此相機的存取權限")
     async with httpx.AsyncClient(timeout=15) as client:
@@ -442,13 +424,7 @@ async def get_camera(
                     headers={"Authorization": f"Bearer {gtok}"},
                 )
     if resp.status_code in (403, 404) and allow_fallback:
-        async with httpx.AsyncClient(timeout=10) as client:
-            tok_r = await client.post(
-                f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
-            )
-        admin_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+        admin_token = await _get_admin_camera_token()
         if admin_token:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
@@ -857,13 +833,9 @@ async def nas_images(
             if gtok:
                 cam_token = gtok
             else:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    tok_r = await client.post(
-                        f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                        headers={"x-service-key": CAMERA_SERVICE_KEY},
-                        json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
-                    )
-                cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else cam_token
+                adm_tok = await _get_admin_camera_token()
+                if adm_tok:
+                    cam_token = adm_tok
 
     return await list_nas_images_backend(cam_token, camera_id, params)
 
@@ -1089,13 +1061,7 @@ async def delete_project(
         raise HTTPException(403, "沒有刪除專案的權限")
     cam_token = await get_camera_backend_token(current_user)
     if not cam_token:
-        async with httpx.AsyncClient(timeout=10) as client:
-            tok_r = await client.post(
-                f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
-            )
-        cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+        cam_token = await _get_admin_camera_token()
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token")
     async with httpx.AsyncClient(timeout=15) as client:
@@ -1182,13 +1148,7 @@ async def proxy_camera_api(
             cam_token = await get_camera_backend_token(owner)
     # 最後 fallback 到 admin token（僅 grant/admin）
     if not cam_token and allow_fallback:
-        async with httpx.AsyncClient(timeout=10) as client:
-            tok_r = await client.post(
-                f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
-            )
-        cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+        cam_token = await _get_admin_camera_token()
     body = await request.body()
     headers = {"Authorization": f"Bearer {cam_token}", "Content-Type": "application/json"}
     target_url = f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}" + (f"/{path}" if path else "")
@@ -1214,13 +1174,7 @@ async def proxy_camera_api(
                     params=dict(request.query_params),
                 )
     if resp.status_code in (403, 404) and allow_fallback:
-        async with httpx.AsyncClient(timeout=10) as client:
-            tok_r = await client.post(
-                f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
-            )
-        admin_tok = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+        admin_tok = await _get_admin_camera_token()
         if admin_tok:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.request(
@@ -1263,13 +1217,7 @@ async def create_project(
     cam_token = await get_camera_backend_token(current_user)
     # 若沒有自己的 token（reseller 尚未設 camera_email），用 admin fallback
     if not cam_token:
-        async with httpx.AsyncClient(timeout=10) as client:
-            tok_r = await client.post(
-                f"{CAMERA_BACKEND_URL}/internal/auth/token",
-                headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
-            )
-        cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
+        cam_token = await _get_admin_camera_token()
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token，請確認 camera_email 設定")
     body = await request.body()

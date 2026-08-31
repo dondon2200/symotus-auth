@@ -328,16 +328,11 @@ async def live_camera_frame(camera_id: int, exp: int = 0, sig: str = "", db: Ses
         raise HTTPException(403, "連結無效或已過期")
     # 查 camera ip 推導 stream name
     import httpx as _httpx
-    from routers.cameras import get_camera_backend_token, CAMERA_BACKEND_URL, CAMERA_SERVICE_KEY
     from models import User
-    
+
     # 用 admin token 查 camera ip
-    async with _httpx.AsyncClient(timeout=8) as cl:
-        tok_r = await cl.post(f"{CAMERA_BACKEND_URL}/internal/auth/token",
-            headers={"x-service-key": CAMERA_SERVICE_KEY},
-            json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"})
-    admin_tok = tok_r.json().get("access_token","") if tok_r.status_code == 200 else ""
-    
+    admin_tok = await _get_admin_camera_token()
+
     stream_name = None
     if admin_tok:
         async with _httpx.AsyncClient(timeout=8) as cl:
