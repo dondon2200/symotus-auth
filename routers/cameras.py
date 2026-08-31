@@ -73,12 +73,13 @@ async def get_camera_backend_token(user: User) -> str:
 def get_allowed_camera_ids(user: User, db: Session) -> Optional[list[int]]:
     """
     取得用戶可存取的 camera_id 列表
-    - reseller/symotus_admin: None (不限制，Camera Backend 自己管)
-    - end_user: 只能看 camera_access 表裡授權的相機
+    - symotus_admin: None（不限制，Camera Backend 自己管）
+    - reseller/end_user: 只能看 camera_access 表裡授權的相機（範圍由 camera_access 統一控管；
+      reseller 配對相機時 create_camera 會自動建對應 grant，見下方）
     """
-    if user.role in ("reseller", "symotus_admin"):
+    if user.role == "symotus_admin":
         return None  # 不限制
-    # end_user 只能看被授權的相機
+    # reseller/end_user 只能看被授權的相機
     accesses = db.query(CameraAccess).filter(CameraAccess.user_id == user.id).all()
     return [a.camera_id for a in accesses]
 
@@ -355,7 +356,6 @@ async def create_camera(
         cam_token = tok_r.json().get("access_token", "") if tok_r.status_code == 200 else ""
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token，請確認 camera_email 設定")
-    used_admin_fallback = not current_user.camera_email
     body = await request.body()
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
@@ -369,8 +369,10 @@ async def create_camera(
             return JSONResponse(status_code=resp.status_code, content={"detail": resp.text})
 
     # 自動幫 reseller 建立 camera_access（full 權限）：
-    # admin fallback 配對（無 camera_email）→ 沒有後端帳號，靠 camera_access 才看得到
-    if resp.status_code in (200, 201) and current_user.role == "reseller" and used_admin_fallback:
+    # get_allowed_camera_ids 現在對 reseller 也是靠 camera_access 控管範圍，
+    # 所以無論有沒有自己的 camera_email（有自有 token 或走 admin fallback），
+    # 配對成功都要建這筆 grant，否則自己剛配的相機在 list_cameras 等端點會直接消失。
+    if resp.status_code in (200, 201) and current_user.role == "reseller":
         camera_id = resp_data.get("id") or resp_data.get("basic_info", {}).get("id")
         if camera_id:
             existing = db.query(CameraAccess).filter(

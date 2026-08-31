@@ -104,19 +104,26 @@ def test_line_account_empty_200_falls_back_to_admin_for_granted_ids():
     """自己 token 回 200 {}：有 grant 的 id 全部走 admin 補查。"""
     FakeAsyncClient.user_result = {}
     FakeAsyncClient.admin_result = {"37": THUMB, "7": THUMB}
-    user = FakeUser(role="reseller")  # reseller → allowed_ids 不限制
+    # reseller 範圍現由 camera_access 控管（Task 1），兩台都要有 grant 才會被請求
+    user = FakeUser(role="reseller")
     db = FakeDb(granted_ids=[37, 7])
     result = asyncio.run(get_thumbnails(ids="37,7", current_user=user, db=db))
     assert set(result.keys()) == {"37", "7"}
 
 
 def test_partial_result_backfills_only_missing_ids():
-    """自己 token 拿到一部分：只對缺漏且有 grant 的 id 補查，且不覆蓋原結果。"""
+    """自己 token 拿到一部分：只對缺漏且有 grant 的 id 補查，且不覆蓋原結果。
+
+    reseller 範圍現由 camera_access 控管（Task 1）：即便相機 37 是自己 token
+    直接拿到的（自己配對的相機），也要有 grant 列才會留在 allowed_ids 內
+    ——這正是 create_camera 現在無條件建 grant 的原因，此處用 grant=[37,7]
+    模擬「兩台都已配對過、都有 grant」。
+    """
     mine = dict(THUMB, path="/mine.jpg")
     FakeAsyncClient.user_result = {"37": mine}
     FakeAsyncClient.admin_result = {"7": THUMB}
     user = FakeUser(role="reseller")
-    db = FakeDb(granted_ids=[7])
+    db = FakeDb(granted_ids=[37, 7])
     result = asyncio.run(get_thumbnails(ids="37,7", current_user=user, db=db))
     assert result["37"]["path"] == "/mine.jpg"
     assert result["7"] == THUMB
