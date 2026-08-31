@@ -104,6 +104,33 @@ async def _get_admin_camera_token(user_id: int = 0) -> str:
         return ""
 
 
+async def _admin_camera_project_map(admin_tok: str) -> dict[int, set[int]]:
+    """用 admin token 取得完整相機清單，回傳 {project_id: {camera_id, ...}}。
+
+    緣由：CB 的 `GET /api/projects`（ProjectResponse）不含相機清單，只能反查
+    `GET /api/cameras` 各相機的 `project_id` 欄位來重建 project→camera 對應，
+    供 timer-status/projects 的靜默降級回應過濾、與 DELETE project 的歸屬檢查共用。
+    受 `/api/cameras` 分頁限制（單次抓 1000 筆），相機總數若超過此上限會有遺漏風險。"""
+    mapping: dict[int, set[int]] = {}
+    if not admin_tok:
+        return mapping
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{CAMERA_BACKEND_URL}/api/cameras",
+                headers={"Authorization": f"Bearer {admin_tok}"},
+                params={"limit": 1000},
+            )
+        if resp.status_code == 200:
+            for c in resp.json().get("cameras", []):
+                pid, cid = c.get("project_id"), c.get("id")
+                if pid is not None and cid is not None:
+                    mapping.setdefault(pid, set()).add(cid)
+    except Exception as e:
+        logger.warning("admin_camera_project_map 取得失敗: %s", e)
+    return mapping
+
+
 async def _try_granter_token(camera_id: int, access, current_user: "User", db: Session) -> str:
     """F-13：相機可能由非 admin 的 granter 帳號擁有。
     若該 user 對此相機有 grant（且 granter≠自己），回傳「能存取該相機」的 granter token，否則回 ""。
@@ -254,7 +281,12 @@ async def get_timer_status(
     db: Session = Depends(get_db),
 ):
     """取得所有相機定時開關機倒數狀態"""
+    allowed_ids = get_allowed_camera_ids(current_user, db)
     cam_token = await get_camera_backend_token(current_user)
+    if not cam_token:
+        # 無自有 token（如 reseller 未設 camera_email）：退回 admin token，
+        # 下方仍會依 allowed_ids 過濾，不會洩漏非授權相機的排程。
+        cam_token = await _get_admin_camera_token()
     if not cam_token:
         return {"timers": []}
     async with httpx.AsyncClient(timeout=15) as client:
@@ -263,7 +295,12 @@ async def get_timer_status(
             headers={"Authorization": f"Bearer {cam_token}"},
         )
     if resp.status_code == 200:
-        return resp.json()
+        data = resp.json()
+        if allowed_ids is not None and isinstance(data, dict) and isinstance(data.get("cameras"), list):
+            allowed_set = set(allowed_ids)
+            data["cameras"] = [c for c in data["cameras"] if c.get("camera_id") in allowed_set]
+            data["total"] = len(data["cameras"])
+        return data
     return {"timers": []}
 
 
@@ -1083,6 +1120,14 @@ async def delete_project(
 ):
     if current_user.role not in ("reseller", "symotus_admin"):
         raise HTTPException(403, "沒有刪除專案的權限")
+    if current_user.role != "symotus_admin":
+        # 歸屬檢查：project 內至少一台相機在自己的 allowed_ids 才准刪，避免 admin
+        # fallback token 被用來刪除不相干 reseller 的 project。查不到 project 內容
+        # （admin token 拿不到、或 project 底下查無相機）一律保守 403。
+        allowed_ids = set(get_allowed_camera_ids(current_user, db) or [])
+        pmap = await _admin_camera_project_map(await _get_admin_camera_token())
+        if not (pmap.get(project_id, set()) & allowed_ids):
+            raise HTTPException(403, "此專案不在你的相機授權範圍")
     cam_token = await get_camera_backend_token(current_user)
     if not cam_token:
         cam_token = await _get_admin_camera_token()
@@ -1217,7 +1262,11 @@ async def list_projects(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    allowed_ids = get_allowed_camera_ids(current_user, db)
     cam_token = await get_camera_backend_token(current_user)
+    if not cam_token:
+        # 無自有 token：退回 admin token，下方仍依 allowed_ids 過濾 project 清單。
+        cam_token = await _get_admin_camera_token()
     if not cam_token:
         return {"projects": []}
     async with httpx.AsyncClient(timeout=15) as client:
@@ -1226,7 +1275,19 @@ async def list_projects(
             headers={"Authorization": f"Bearer {cam_token}"},
         )
         if resp.status_code == 200:
-            return resp.json()
+            data = resp.json()
+            if allowed_ids is not None and isinstance(data, dict) and isinstance(data.get("projects"), list):
+                # ProjectResponse 不含相機清單，反查 project→camera 對應後只留「至少
+                # 一台相機在 allowed_ids」的 project；admin token 另抓一次（cam_token
+                # 可能是 reseller 自己的 token，不能拿來查全量相機）。
+                admin_tok = await _get_admin_camera_token()
+                pmap = await _admin_camera_project_map(admin_tok)
+                allowed_set = set(allowed_ids)
+                data["projects"] = [
+                    p for p in data["projects"] if pmap.get(p.get("id"), set()) & allowed_set
+                ]
+                data["total"] = len(data["projects"])
+            return data
     return {"projects": []}
 
 
