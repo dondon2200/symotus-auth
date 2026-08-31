@@ -1130,7 +1130,12 @@ async def delete_project(
             raise HTTPException(403, "此專案不在你的相機授權範圍")
     cam_token = await get_camera_backend_token(current_user)
     if not cam_token:
-        cam_token = await _get_admin_camera_token()
+        # camera-delete-backend-500 雷區：project DELETE 對 CB 也是寫入操作，user_id=0
+        # 的假造 token 會 500。查 admin@timelapse.com 在 CB 的真實 camera_user_id
+        # （無值 fallback 1），與 DELETE /cameras/{id} 同一套處理。
+        admin_user = db.query(User).filter(User.camera_email == "admin@timelapse.com").first()
+        admin_camera_user_id = (admin_user.camera_user_id if admin_user and admin_user.camera_user_id else 1)
+        cam_token = await _get_admin_camera_token(user_id=admin_camera_user_id)
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token")
     async with httpx.AsyncClient(timeout=15) as client:

@@ -34,8 +34,9 @@ def db():
     s.close()
 
 
-def _user(db, id, role, camera_email=None):
-    u = User(id=id, username=f"u{id}", email=f"u{id}@x.com", role=role, camera_email=camera_email)
+def _user(db, id, role, camera_email=None, camera_user_id=None):
+    u = User(id=id, username=f"u{id}", email=f"u{id}@x.com", role=role,
+             camera_email=camera_email, camera_user_id=camera_user_id)
     db.add(u)
     db.commit()
     return u
@@ -95,6 +96,7 @@ class FakeAsyncClient:
     """依 URL 分流回應；delete_status 供 DELETE 測試調整。"""
     delete_status = 200
     delete_calls: list = []
+    post_payloads: list = []
 
     def __init__(self, *a, **k):
         pass
@@ -119,6 +121,9 @@ class FakeAsyncClient:
         return FakeResp(FakeAsyncClient.delete_status, {"success": True})
 
     async def post(self, url, headers=None, json=None):
+        # _get_admin_camera_token 用真正的實作（本檔未 monkeypatch），會經這裡打
+        # /internal/auth/token；記下 payload 供斷言 project DELETE fallback 的 user_id。
+        FakeAsyncClient.post_payloads.append(json)
         return FakeResp(200, {"access_token": "admin-token"})
 
 
@@ -127,6 +132,7 @@ def patch_httpx(monkeypatch):
     monkeypatch.setattr(cameras_mod.httpx, "AsyncClient", FakeAsyncClient)
     FakeAsyncClient.delete_status = 200
     FakeAsyncClient.delete_calls = []
+    FakeAsyncClient.post_payloads = []
 
     async def fake_token(user):
         # 模擬「沒有自有 camera_email 就沒有自己的 CB token」
@@ -202,3 +208,45 @@ def test_delete_project_admin_unaffected(db):
     admin = _user(db, 3, "symotus_admin")
     result = asyncio.run(delete_project(1, current_user=admin, db=db))
     assert result.status_code == 200
+
+
+def test_delete_project_fallback_uses_real_camera_user_id(db):
+    """camera-delete-backend-500 雷區：project DELETE 的 admin fallback 是寫入操作，
+    不可用假造 user_id=0 的 token；必須查 admin@timelapse.com 的真實 camera_user_id。"""
+    reseller = _user(db, 15, "reseller")
+    _grant(db, camera_id=99, user_id=reseller.id)  # project 2 的相機
+    _user(db, 4, "symotus_admin", camera_email="admin@timelapse.com", camera_user_id=7)
+
+    result = asyncio.run(delete_project(2, current_user=reseller, db=db))
+    assert result.status_code == 200
+    # 最後一次 /internal/auth/token 呼叫（實際打去做 DELETE 的那顆 token）帶真實 user_id，
+    # 而非讀取歸屬用的 user_id=0
+    assert FakeAsyncClient.post_payloads[-1]["user_id"] == 7
+
+
+def test_delete_project_fallback_defaults_to_one_without_seeded_row(db):
+    """DB 裡找不到 admin@timelapse.com（或其 camera_user_id 未設）時 fallback 到 1，
+    仍不可退回 0。"""
+    reseller = _user(db, 16, "reseller")
+    _grant(db, camera_id=99, user_id=reseller.id)
+    # 刻意不建立 admin@timelapse.com 這筆 User
+
+    result = asyncio.run(delete_project(2, current_user=reseller, db=db))
+    assert result.status_code == 200
+    assert FakeAsyncClient.post_payloads[-1]["user_id"] == 1
+
+
+# ── 邊角：allowed_ids=[]（reseller 無任何 grant）───────────────────────────────
+
+def test_timer_status_reseller_no_grants_returns_empty(db):
+    reseller = _user(db, 17, "reseller")  # 無任何 CameraAccess
+    result = asyncio.run(get_timer_status(current_user=reseller, db=db))
+    assert result["cameras"] == []
+    assert result["total"] == 0
+
+
+def test_projects_list_reseller_no_grants_returns_empty(db):
+    reseller = _user(db, 18, "reseller")  # 無任何 CameraAccess
+    result = asyncio.run(list_projects(current_user=reseller, db=db))
+    assert result["projects"] == []
+    assert result["total"] == 0
