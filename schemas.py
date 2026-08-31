@@ -77,7 +77,6 @@ class AdminUserCreate(BaseModel):
     password: str = Field(min_length=8)
     full_name: Optional[str] = None
     role: Literal["symotus_admin", "reseller", "end_user"]
-    camera_email: Optional[str] = None
     reseller_id: Optional[int] = None
 
 
@@ -97,9 +96,6 @@ class InviteCreate(BaseModel):
     expires_hours: int = 168  # 7 days default
     # 接受後賦予的角色（僅 symotus_admin 發的邀請可指定 reseller，其餘一律 end_user）
     intended_role: str = "end_user"
-    # 發 reseller 邀請時可預綁 Camera Backend 帳號，接受者一登入即可管理相機
-    camera_email: Optional[str] = None
-    camera_user_id: Optional[int] = None
 
 class InviteResponse(BaseModel):
     id: int
@@ -109,7 +105,6 @@ class InviteResponse(BaseModel):
     camera_ids: Optional[List[int]]
     email: Optional[str]
     intended_role: str = "end_user"
-    camera_email: Optional[str] = None
     status: str
     expires_at: UtcDatetime
     accepted_by: Optional[int]

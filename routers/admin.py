@@ -51,7 +51,6 @@ def create_user(
         hashed_password=hash_password(body.password),
         role=body.role,
         is_active=True,
-        camera_email=body.camera_email,
         reseller_id=body.reseller_id,
         created_by=current_user.id,
     )
@@ -79,7 +78,6 @@ def list_resellers(
             "full_name": u.full_name,
             "email": u.email,
             "role": u.role,
-            "camera_email": u.camera_email,
             "is_active": u.is_active,
             "camera_count": cam_count,
         })
@@ -207,7 +205,7 @@ def list_all_users(
         raise HTTPException(status_code=403, detail="Invalid service key")
     users = db.query(User).all()
     return [{"id": u.id, "username": u.username, "email": u.email,
-             "role": u.role, "camera_email": u.camera_email,
+             "role": u.role,
              "is_active": u.is_active,
              "full_name": u.full_name, "reseller_id": u.reseller_id,
              "has_password": bool(u.hashed_password),
@@ -239,17 +237,14 @@ def update_user_admin(
     authorization: str = Header(None),
     db: Session = Depends(get_db),
 ):
-    """更新用戶屬性：camera_email、role、is_active（service key 或 symotus_admin JWT 保護）"""
+    """更新用戶屬性：role、is_active（service key 或 symotus_admin JWT 保護）。
+    camera_email/camera_user_id 已移除可寫欄位（Task 5：非 admin 不再綁 Camera Backend）。"""
     if not _is_admin(x_service_key, authorization):
         raise HTTPException(status_code=403, detail="Invalid service key")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    changes = {k: body[k] for k in ("camera_email", "camera_user_id", "role", "is_active", "reseller_id") if k in body}
-    if "camera_email" in body:
-        user.camera_email = body["camera_email"]
-    if "camera_user_id" in body:
-        user.camera_user_id = body["camera_user_id"]
+    changes = {k: body[k] for k in ("role", "is_active", "reseller_id") if k in body}
     if "role" in body:
         if body["role"] not in ("symotus_admin", "reseller", "end_user"):
             raise HTTPException(status_code=400, detail="role 僅能是 symotus_admin/reseller/end_user")
@@ -262,8 +257,7 @@ def update_user_admin(
                f"{user.username} -> {changes}")
     db.commit()
     return {"id": user.id, "username": user.username, "email": user.email,
-            "role": user.role, "camera_email": user.camera_email,
-            "camera_user_id": user.camera_user_id, "is_active": user.is_active,
+            "role": user.role, "is_active": user.is_active,
             "reseller_id": user.reseller_id}
 
 

@@ -137,3 +137,59 @@ def test_admin建帳role非法值回422(client, admin, auth_headers):
         "password": "secretpw1", "role": "superuser",
     })
     assert r.status_code == 422
+
+
+def test_admin建帳夾帶camera_email被忽略(client, admin, auth_headers, db):
+    """Task 5：後台建帳不再綁 Camera Backend 帳號。camera_email 已從
+    AdminUserCreate 移除，body 夾帶時應被 Pydantic 靜默忽略（不 422），
+    建出的 user.camera_email 一律為 None。"""
+    r = client.post("/admin/users", headers=auth_headers(admin), json={
+        "username": "no_camera_email", "email": "no_camera_email@test.com",
+        "password": "secretpw1", "role": "end_user",
+        "camera_email": "hacker@evil.com",
+    })
+    assert r.status_code == 201
+    assert "camera_email" not in r.json()
+
+    from models import User
+    user = db.query(User).filter(User.username == "no_camera_email").first()
+    assert user.camera_email is None
+
+
+def test_admin_PUT夾帶camera_email與camera_user_id不生效(client, admin, reseller, auth_headers, db):
+    """Task 5：PUT /admin/users/{id} 移除 camera_email/camera_user_id 可寫欄位，
+    夾帶時原值不應被改動。"""
+    from models import User
+    target = db.query(User).filter(User.id == reseller.id).first()
+    target.camera_email = "existing@symotus.com"
+    target.camera_user_id = 7
+    db.commit()
+
+    r = client.put(f"/admin/users/{reseller.id}", headers=auth_headers(admin), json={
+        "camera_email": "hacker@evil.com",
+        "camera_user_id": 999,
+        "is_active": True,
+    })
+    assert r.status_code == 200
+    assert "camera_email" not in r.json()
+    assert "camera_user_id" not in r.json()
+
+    db.refresh(target)
+    assert target.camera_email == "existing@symotus.com"
+    assert target.camera_user_id == 7
+
+
+def test_admin清單輸出不含camera_email(client, admin, reseller, auth_headers, db):
+    """GET /admin/resellers 與 GET /admin/users 輸出移除 camera_email。"""
+    from models import User
+    target = db.query(User).filter(User.id == reseller.id).first()
+    target.camera_email = "existing@symotus.com"
+    db.commit()
+
+    r1 = client.get("/admin/resellers", headers=auth_headers(admin))
+    assert r1.status_code == 200
+    assert all("camera_email" not in row for row in r1.json())
+
+    r2 = client.get("/admin/users", headers=auth_headers(admin))
+    assert r2.status_code == 200
+    assert all("camera_email" not in row for row in r2.json())

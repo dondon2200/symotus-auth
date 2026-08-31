@@ -337,7 +337,6 @@ class UserCreateInternal(BaseModel):
     full_name: Optional[str] = None
     password: str
     role: str = "end_user"          # 預設最低權限；公開註冊一律強制 end_user
-    camera_email: Optional[str] = None
     invite_token: Optional[str] = None
 
 @router.post("/register")
@@ -346,7 +345,8 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
                    authorization: str = Header(None)):
     """建立帳號。
     F-1 修補：公開註冊一律需「有效邀請連結」，且角色強制 end_user（杜絕外部指定 role 提權）。
-    內部建帳號（指定 role / camera_email）需帶正確 x-service-key 或 symotus_admin JWT。
+    內部建帳號（指定 role）需帶正確 x-service-key 或 symotus_admin JWT。
+    Task 5：不論公開邀請或內部建帳，建出的帳號一律不綁 Camera Backend（camera_email 為 None）。
     """
     is_internal = bool(CAMERA_SERVICE_KEY) and x_service_key == CAMERA_SERVICE_KEY
     if not is_internal and authorization:
@@ -396,16 +396,15 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
         role=body.role if is_internal else invite_role,
         is_active=True,
         reseller_id=invite.reseller_id if invite else None,
-        camera_email=(body.camera_email if is_internal else (invite.camera_email if invite else None)),
     )
     db.add(user)
     db.commit()
     db.refresh(user)
 
     # 邀請帶相機 → 建立 camera_access（與 OAuth _oauth_finish 行為一致；同時修掉 email 邀請註冊不掛相機的舊 bug）
+    # Task 5：register 不再繼承 invite.camera_email/camera_user_id——公開邀請/內部建帳路徑
+    # 建出的帳號 camera_email 一律 None（非 admin 不再綁 Camera Backend）。
     if invite:
-        if invite.camera_user_id:
-            user.camera_user_id = invite.camera_user_id
         if invite.camera_ids:
             for cam_id in invite.camera_ids:
                 db.add(CameraAccess(camera_id=cam_id, user_id=user.id, granted_by=invite.reseller_id,
