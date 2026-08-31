@@ -721,10 +721,15 @@ async def delete_camera(
     安全閘：
     1. 擁有者（reseller / symotus_admin，end_user 一律拒）；被分享者需政策允許（D5：預設
        full 授權）才能刪除，其餘等級（photos_stream/stream_only）一律拒。
+       非 admin（reseller）的「擁有者路徑」現在還要求真的持有這台相機的 CameraAccess
+       記錄，不再是「角色是 reseller 就放行任意 camera_id」（Task 3：補 admin fallback
+       同時把可寫範圍收斂到 camera_access 為界）。symotus_admin 維持現行不受此限制。
     2. 需 ?confirm=true，防誤觸。
-    3. token：擁有者用「自己的」真實 Camera Backend token；被分享者（full）借用 granter
-       的 token —— Camera Backend 只認擁有者 token，被分享者無法用自己的 token 刪除。
-       （刻意避開 camera-delete-backend-500 雷區：不使用 admin@timelapse user_id=0 token。）
+    3. token 依序：自己的真實 Camera Backend token → 借 granter token（F-13，排除自我
+       授權）→ admin fallback（涵蓋無 camera_email 但持自我 grant 的擁有者）。
+       admin fallback 為正式簽發 token，理論可用；仍需留意 camera-delete-backend-500
+       雷區（歷史上 500 疑似源自假 user_id=0 token，非 cascade bug，真 token 沒事）——
+       部署後請以此路徑實測驗證。
     4. 刪除／換機皆記 audit log（定案③配套：刪除權隨授權鏈外擴，必留稽核）。
     """
     if not confirm:
@@ -736,20 +741,23 @@ async def delete_camera(
     ).first()
     shared = bool(access and access.granted_by and access.granted_by != current_user.id)
 
-    # D5：被分享者需政策允許（預設 full）才能刪；擁有者路徑維持 reseller/symotus_admin
+    # D5：被分享者需政策允許（預設 full）才能刪；擁有者路徑 reseller 現在要求持有 grant，
+    # symotus_admin 維持現行（不受此限制）
     if shared:
         if not level_allows(db, "camera.delete", access.permission_level):
             raise HTTPException(403, "此相機為他人分享，需「全功能管理」授權才能刪除")
-    elif current_user.role not in ("reseller", "symotus_admin"):
+    elif current_user.role == "reseller":
+        if access is None:
+            raise HTTPException(403, "無此相機的存取權限")
+    elif current_user.role != "symotus_admin":
         raise HTTPException(403, "僅系統管理員或相機擁有者可刪除相機")
 
-    # token：擁有者用自己的；被分享者（D5）借 granter 的——Camera Backend 只認擁有者 token
-    token_user = current_user
-    if shared:
-        token_user = db.query(User).filter(User.id == access.granted_by).first()
-        if not token_user:
-            raise HTTPException(500, "找不到相機擁有者")
-    cam_token = await get_camera_backend_token(token_user)
+    # token：自己的 → 借 granter token（F-13，排除自我授權）→ admin fallback
+    cam_token = await get_camera_backend_token(current_user)
+    if not cam_token:
+        cam_token = await _try_granter_token(camera_id, access, current_user, db)
+    if not cam_token:
+        cam_token = await _get_admin_camera_token()
     if not cam_token:
         raise HTTPException(403, "無法取得可刪除此相機的有效憑證")
 
@@ -814,6 +822,10 @@ async def nas_images(
         owner = db.query(User).filter(User.id == access.granted_by).first()
         if owner:
             cam_token = await get_camera_backend_token(owner)
+
+    # 仍無 token 且有 grant/admin：admin fallback（涵蓋自我 grant 但無 camera_email 的擁有者）
+    if not cam_token and allow_fallback:
+        cam_token = await _get_admin_camera_token()
 
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token")
@@ -1035,6 +1047,9 @@ async def nas_image(
                     cam_token = await get_camera_backend_token(owner)
                     if cam_token:
                         break
+        # 仍無 token 且（本人持有可視 grant，或本身是 admin）：admin fallback
+        if not cam_token and (viewable or current_user.role == "symotus_admin"):
+            cam_token = await _get_admin_camera_token()
     if not cam_token:
         raise HTTPException(502, "無法取得 Camera Backend token")
     from fastapi.responses import StreamingResponse

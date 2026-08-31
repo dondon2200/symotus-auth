@@ -197,13 +197,19 @@ async def grant_access_to_managed_user(
                                      headers={"Authorization": f"Bearer {tok}"})
             ok = r.status_code == 200
         if not ok:
-            # 或者：我對此相機持有他人授予的 full（轉分享）
+            # 或者：本人已把此相機掛在自己名下（自我授權列，granted_by==self，不論
+            # permission_level）；或持有他人授予的 full（轉分享）
+            self_access = db.query(CameraAccess).filter(
+                CameraAccess.camera_id == camera_id,
+                CameraAccess.user_id == current_user.id,
+                CameraAccess.granted_by == current_user.id,
+            ).first()
             my_access = db.query(CameraAccess).filter(
                 CameraAccess.camera_id == camera_id,
                 CameraAccess.user_id == current_user.id,
                 CameraAccess.permission_level == "full",
             ).first()
-            if not my_access:
+            if not (self_access or my_access):
                 raise HTTPException(403, "無此相機的授權資格")
 
     existing = db.query(CameraAccess).filter(

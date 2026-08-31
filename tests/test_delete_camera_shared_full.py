@@ -55,6 +55,7 @@ class FakeClient:
     async def __aenter__(self): return self
     async def __aexit__(self, *a): return False
     async def delete(self, *a, **k): return FakeResp()
+    async def get(self, *a, **k): return FakeResp()  # _try_granter_token 的存取驗證
 
 
 @pytest.fixture(autouse=True)

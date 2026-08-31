@@ -44,6 +44,8 @@ def _no_own_token(monkeypatch):
     invalidate_cache()
     async def _none(user): return ""   # 被分享者沒有自己的 backend token
     monkeypatch.setattr(cameras_mod, "get_camera_backend_token", _none)
+    async def _no_admin(): return ""   # admin fallback 也拿不到（避免測試打真的網路）
+    monkeypatch.setattr(cameras_mod, "_get_admin_camera_token", _no_admin)
 
 
 def test_original_image_forbidden_for_stream_only():
