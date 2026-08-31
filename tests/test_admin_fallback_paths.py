@@ -5,7 +5,9 @@
 - GET /cameras/nas/images：有 grant（含自我配對）才允許 admin fallback，否則 502。
 - GET /cameras/nas/image：viewable grant（含自我配對）才允許 admin fallback。
 - DELETE /cameras/{id}：非 admin 必須持有 CameraAccess，否則 403；有則可用 admin fallback token 刪除。
-  symotus_admin 不受此限制。
+  symotus_admin 不受此限制。DELETE 是寫入操作，fallback 必須帶 admin@timelapse.com 在
+  Camera Backend 的真實 camera_user_id（避開 camera-delete-backend-500 雷區——手造
+  user_id=0 的 token 做寫入會 500）；讀取端點（nas/images）payload 的 user_id 維持 0 不變。
 - POST /users/camera-access：除既有 full 列外，granted_by==self 的自我授權列（任何等級）
   也視為有資格轉授權。
 """
@@ -23,6 +25,9 @@ from routers.cameras import nas_images, nas_image, delete_camera
 import routers.users as users_mod
 from routers.users import grant_access_to_managed_user
 
+# 在任何 autouse fixture monkeypatch 之前抓住真正的實作，供 payload 斷言測試使用
+_REAL_GET_ADMIN_TOKEN = cameras_mod._get_admin_camera_token
+
 
 # ── db fixture：獨立 in-memory sqlite，只建本測試需要的表 ─────────────────────
 
@@ -35,9 +40,9 @@ def db():
     s.close()
 
 
-def _user(db, id, role, camera_email=None, reseller_id=None):
+def _user(db, id, role, camera_email=None, reseller_id=None, camera_user_id=None):
     u = User(id=id, username=f"u{id}", email=f"u{id}@x.com", role=role,
-             camera_email=camera_email, reseller_id=reseller_id)
+             camera_email=camera_email, reseller_id=reseller_id, camera_user_id=camera_user_id)
     db.add(u)
     db.commit()
     return u
@@ -91,6 +96,16 @@ class FakeAsyncClient:
         return FakeResp(status_code=FakeAsyncClient.delete_status)
 
 
+class CapturingAsyncClient(FakeAsyncClient):
+    """繼承 FakeAsyncClient 的 get/delete；額外把 post() 送出的 json payload 記下來，
+    供斷言 _get_admin_camera_token 實際打給 CB 的 /internal/auth/token body 內容。"""
+    captured_payloads: list = []
+
+    async def post(self, url, headers=None, json=None, **k):
+        CapturingAsyncClient.captured_payloads.append(json)
+        return FakeResp(status_code=200, json_data={"access_token": "admin-token"})
+
+
 @pytest.fixture(autouse=True)
 def _patch(monkeypatch):
     # reseller/end_user 一律無自有 camera token（新模型下無 camera_email）
@@ -98,7 +113,7 @@ def _patch(monkeypatch):
         return ""
     monkeypatch.setattr(cameras_mod, "get_camera_backend_token", _no_own_token)
 
-    async def _admin_token():
+    async def _admin_token(user_id: int = 0):
         return "admin-token"
     monkeypatch.setattr(cameras_mod, "_get_admin_camera_token", _admin_token)
 
@@ -179,6 +194,57 @@ def test_delete_camera_admin_unaffected(db):
     admin = _user(db, 1, "symotus_admin")
     result = asyncio.run(delete_camera(999, confirm=True, current_user=admin, db=db))
     assert result["success"] is True
+
+
+def test_delete_camera_admin_fallback_uses_real_camera_user_id(db, monkeypatch):
+    """camera-delete-backend-500 雷區：DELETE 的 admin fallback 是寫入操作，
+    不可用假造 user_id=0 的 token；必須查 admin@timelapse.com 的真實 camera_user_id。"""
+    reseller = _user(db, 40, "reseller")
+    _grant(db, camera_id=60, user_id=reseller.id, granted_by=reseller.id, level="full")
+    # 模擬 admin.py migrate_add_camera_user_id 已把 admin@timelapse.com 種好 camera_user_id=1
+    _user(db, 2, "symotus_admin", camera_email="admin@timelapse.com", camera_user_id=1)
+
+    monkeypatch.setattr(cameras_mod, "_get_admin_camera_token", _REAL_GET_ADMIN_TOKEN)
+    monkeypatch.setattr(cameras_mod.httpx, "AsyncClient", CapturingAsyncClient)
+    CapturingAsyncClient.captured_payloads = []
+
+    result = asyncio.run(delete_camera(60, confirm=True, current_user=reseller, db=db))
+    assert result["success"] is True
+    assert CapturingAsyncClient.captured_payloads[-1]["user_id"] == 1
+
+
+def test_delete_camera_admin_fallback_defaults_to_one_without_seeded_row(db, monkeypatch):
+    """DB 裡找不到 admin@timelapse.com（或其 camera_user_id 未設）時 fallback 到 1，
+    仍不可退回 0。"""
+    reseller = _user(db, 41, "reseller")
+    _grant(db, camera_id=62, user_id=reseller.id, granted_by=reseller.id, level="full")
+    # 刻意不建立 admin@timelapse.com 這筆 User
+
+    monkeypatch.setattr(cameras_mod, "_get_admin_camera_token", _REAL_GET_ADMIN_TOKEN)
+    monkeypatch.setattr(cameras_mod.httpx, "AsyncClient", CapturingAsyncClient)
+    CapturingAsyncClient.captured_payloads = []
+
+    result = asyncio.run(delete_camera(62, confirm=True, current_user=reseller, db=db))
+    assert result["success"] is True
+    assert CapturingAsyncClient.captured_payloads[-1]["user_id"] == 1
+
+
+def test_nas_images_admin_fallback_payload_user_id_unchanged(db, monkeypatch):
+    """讀取端點行為零改動：nas/images 的 admin fallback payload user_id 仍是 0。"""
+    reseller = _user(db, 42, "reseller")
+    _grant(db, camera_id=61, user_id=reseller.id, granted_by=reseller.id, level="full")
+
+    monkeypatch.setattr(cameras_mod, "_get_admin_camera_token", _REAL_GET_ADMIN_TOKEN)
+    monkeypatch.setattr(cameras_mod.httpx, "AsyncClient", CapturingAsyncClient)
+    CapturingAsyncClient.captured_payloads = []
+
+    async def _fake_backend(cam_token, camera_id, params):
+        return JSONResponse(status_code=200, content={"success": True, "data": {"files": []}})
+    monkeypatch.setattr(cameras_mod, "list_nas_images_backend", _fake_backend)
+
+    result = asyncio.run(nas_images(FakeRequest({"camera_id": "61"}), current_user=reseller, db=db))
+    assert result.status_code == 200
+    assert CapturingAsyncClient.captured_payloads[-1]["user_id"] == 0
 
 
 # ── POST /users/camera-access（轉授權）────────────────────────────────────────

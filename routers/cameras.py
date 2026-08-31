@@ -84,14 +84,19 @@ def get_allowed_camera_ids(user: User, db: Session) -> Optional[list[int]]:
     return [a.camera_id for a in accesses]
 
 
-async def _get_admin_camera_token() -> str:
-    """取得 Camera Backend 的 admin 備用 token（granted_by 非真正擁有者時 fallback 用）"""
+async def _get_admin_camera_token(user_id: int = 0) -> str:
+    """取得 Camera Backend 的 admin 備用 token（granted_by 非真正擁有者時 fallback 用）。
+
+    user_id 預設 0（讀取路徑沿用既有行為不變）。camera-delete-backend-500 雷區：
+    對 CB 的寫入操作（DELETE 等）若帶假造 user_id=0 的 token 會 500——admin@timelapse.com
+    在 Camera Backend 的真實 user_id 需由呼叫端（如 DELETE /cameras/{id}）查 DB
+    User.camera_user_id 後傳入，避免手造 user_id=0 做寫入。"""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(
                 f"{CAMERA_BACKEND_URL}/internal/auth/token",
                 headers={"x-service-key": CAMERA_SERVICE_KEY},
-                json={"user_id": 0, "email": "admin@timelapse.com", "role": "admin"},
+                json={"user_id": user_id, "email": "admin@timelapse.com", "role": "admin"},
             )
             return r.json().get("access_token", "") if r.status_code == 200 else ""
     except Exception as e:
@@ -757,7 +762,11 @@ async def delete_camera(
     if not cam_token:
         cam_token = await _try_granter_token(camera_id, access, current_user, db)
     if not cam_token:
-        cam_token = await _get_admin_camera_token()
+        # camera-delete-backend-500 雷區：DELETE 對 CB 是寫入操作，user_id=0 的假造 token
+        # 會 500。查 admin@timelapse.com 在 CB 的真實 camera_user_id（無值 fallback 1）。
+        admin_user = db.query(User).filter(User.camera_email == "admin@timelapse.com").first()
+        admin_camera_user_id = (admin_user.camera_user_id if admin_user and admin_user.camera_user_id else 1)
+        cam_token = await _get_admin_camera_token(user_id=admin_camera_user_id)
     if not cam_token:
         raise HTTPException(403, "無法取得可刪除此相機的有效憑證")
 
