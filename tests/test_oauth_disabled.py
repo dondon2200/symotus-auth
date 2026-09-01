@@ -1,7 +1,6 @@
-"""Task 3：第三方「登入」停用 — Google/LINE 登入端點一律 410，OAuth 只保留 LINE 綁定。"""
-import secrets as secrets_mod
-
-from models import User
+"""Task 3：第三方「登入」停用 — Google/LINE 登入端點一律 410。
+LINE 綁定（原 OAuth /line/bind-url、/line/callback）另於 Task「LINE 綁定改官方帳號綁定碼流程」
+一併停用，改走 POST /auth/me/line/bind-code + webhook；見本檔下方 410 斷言。"""
 
 
 def test_google_url_disabled(client):
@@ -43,61 +42,15 @@ def test_me_unlink_disabled(client, make_user, auth_headers):
     assert r.status_code == 410
 
 
-def test_line_bind_url_still_works(client, make_user, auth_headers):
-    """Task 2 的綁定端點不受影響。"""
+def test_line_bind_url_disabled(client, make_user, auth_headers):
+    """LINE 綁定改用官方帳號綁定碼流程，舊 OAuth 綁定連結端點停用。"""
     user = make_user("lb1", "lb1@example.com", password="oldpassword")
     r = client.get("/auth/line/bind-url", headers=auth_headers(user))
-    assert r.status_code == 200
-    body = r.json()
-    assert ":bind:" in body["state"]
-    # F1：前端讀 data.url，須與 auth_url 同值（後者保留向後相容）
-    assert body["url"] == body["auth_url"]
-    assert body["url"].startswith("https://access.line.me/oauth2/v2.1/authorize?")
+    assert r.status_code == 410
 
 
-class _FakeLineResponse:
-    def __init__(self, data, is_success=True):
-        self._data = data
-        self.is_success = is_success
-
-    def json(self):
-        return self._data
-
-
-class _FakeLineAsyncClient:
-    """假 httpx.AsyncClient：模擬 line_callback 的 login（非 bind）分支。"""
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    async def post(self, url, **kwargs):
-        assert "api.line.me/oauth2/v2.1/token" in url
-        return _FakeLineResponse({"access_token": "fake-line-token"})
-
-    async def get(self, url, **kwargs):
-        assert "api.line.me/v2/profile" in url
-        return _FakeLineResponse({"userId": "line-uid-disabled-1", "displayName": "Nobody"})
-
-
-def test_line_callback_login_path_does_not_create_account(client, db, monkeypatch):
-    """非 bind 分支（純登入）改為 redirect 帶 error=oauth_disabled，不得建帳。"""
-    import httpx
-
-    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: _FakeLineAsyncClient())
-
-    before_count = db.query(User).count()
-
-    state = secrets_mod.token_urlsafe(16)
-    r = client.get(
-        f"/auth/line/callback?code=fakecode&state={state}",
-        cookies={"line_oauth_state": state},
-        follow_redirects=False,
-    )
-    assert r.status_code in (302, 307)
-    assert "error=oauth_disabled" in r.headers["location"]
-
-    after_count = db.query(User).count()
-    assert after_count == before_count
+def test_line_callback_disabled(client):
+    """LINE OAuth callback（登入與舊綁定分支皆已停用）一律 410，不建帳、不綁定。"""
+    r = client.get("/auth/line/callback?code=fakecode&state=whatever",
+                    follow_redirects=False)
+    assert r.status_code == 410

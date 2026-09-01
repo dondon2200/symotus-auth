@@ -10,7 +10,7 @@ from models import User, RefreshToken, InviteToken, CameraAccess, UserLineAccoun
 from schemas import LoginRequest, TokenResponse, RefreshRequest, OAuthCallbackRequest
 from auth import (hash_password, verify_password, create_access_token,
                   create_refresh_token, decode_token, get_current_user,
-                  to_backend_role, create_line_bind_token, decode_line_bind_token)
+                  to_backend_role)
 from config import settings
 from audit import log_action
 
@@ -345,18 +345,10 @@ def line_url(response: Response, invite_token: str = None):
     raise HTTPException(410, "第三方登入已停用")
 
 @router.get("/line/bind-url")
-def line_bind_url(response: Response, next: str = "/notifications",
-                  current_user: User = Depends(get_current_user)):
-    """A：已登入用戶取得「綁定 LINE」授權連結。state 夾帶簽章 ticket 標識當前用戶，
-    /line/callback 依 ticket 把 LINE 綁到「這個帳號」，而非以 email 比對或另開新帳號。"""
-    ticket = create_line_bind_token(current_user.id, next)
-    state = f"{secrets.token_urlsafe(16)}:bind:{ticket}"
-    response.set_cookie("line_oauth_state", state, max_age=600,
-                        httponly=True, secure=True, samesite="lax", path="/")
-    params = f"response_type=code&client_id={settings.LINE_CLIENT_ID}&redirect_uri={settings.LINE_REDIRECT_URI}&state={state}&scope=profile openid email"
-    auth_url = f"https://access.line.me/oauth2/v2.1/authorize?{params}"
-    # 前端讀 data.url；保留 auth_url 供舊呼叫端向後相容
-    return {"url": auth_url, "auth_url": auth_url, "state": state}
+def line_bind_url(current_user: User = Depends(get_current_user)):
+    """已停用：LINE 綁定改用官方帳號綁定碼流程（見 POST /auth/me/line/bind-code）——
+    使用者加官方帳號好友後在聊天輸入綁定碼，由 webhook 完成綁定，不再走 LINE OAuth 授權連結。"""
+    raise HTTPException(410, "LINE 綁定已改用官方帳號綁定碼流程")
 
 @router.post("/line/token", response_model=TokenResponse)
 async def line_token(body: OAuthCallbackRequest, request: Request, db: Session = Depends(get_db)):
@@ -463,74 +455,6 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
 
 @router.get("/line/callback")
 async def line_callback(code: str, state: str = "", request: Request = None, db: Session = Depends(get_db)):
-    from fastapi.responses import RedirectResponse
-    frontend = settings.FRONTEND_URL
-
-    bind_user_id = None
-    bind_next = "/notifications"
-    is_bind_state = bool(state) and ":bind:" in state
-    if is_bind_state:
-        # 綁定連結可能在任何裝置/LINE 內建瀏覽器開啟，不會帶 /line/bind-url 當下設的 cookie。
-        # ticket 本身是簽章 JWT（含 user_id、600 秒效期），已足以防偽造，故此分支略過 cookie 比對。
-        decoded = decode_line_bind_token(state.split(":bind:", 1)[1])
-        if not decoded:
-            resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=error")
-            resp.delete_cookie("line_oauth_state", path="/")
-            return resp
-        bind_user_id, bind_next = decoded
-    else:
-        # 非綁定流程（現僅剩 error redirect 路徑）維持原 cookie round-trip 驗證
-        saved_state = request.cookies.get("line_oauth_state") if request else None
-        if not state or not saved_state or not secrets.compare_digest(state, saved_state):
-            resp = RedirectResponse(f"{frontend}/login?error=state_mismatch")
-            resp.delete_cookie("line_oauth_state", path="/")
-            return resp
-
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.post("https://api.line.me/oauth2/v2.1/token", data={
-                "grant_type": "authorization_code", "code": code,
-                "redirect_uri": settings.LINE_REDIRECT_URI,
-                "client_id": settings.LINE_CLIENT_ID,
-                "client_secret": settings.LINE_CLIENT_SECRET,
-            })
-            td = r.json()
-            if "access_token" not in td:
-                print(f"[LINE callback] token error: {td}")
-                return RedirectResponse(f"{frontend}/login?error=line_failed")
-            r2 = await client.get("https://api.line.me/v2/profile",
-                                   headers={"Authorization": f"Bearer {td['access_token']}"})
-            profile = r2.json()
-
-        # A：綁定流程 —— 把 LINE userId 綁到 ticket 指定的既有用戶
-        if bind_user_id is not None:
-            line_uid = profile["userId"]
-            target = db.query(User).filter(User.id == bind_user_id).first()
-            existing = db.query(UserLineAccount).filter_by(line_user_id=line_uid).first()
-            if not target:
-                resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=error")
-            elif existing and existing.user_id != target.id:
-                resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=conflict")
-            else:
-                if not existing:
-                    db.add(UserLineAccount(
-                        user_id=target.id, line_user_id=line_uid,
-                        display_name=profile.get("displayName"),
-                        picture_url=profile.get("pictureUrl")))
-                log_action(db, target, "self_link_line", "user", target.id, "line_id")
-                db.commit()
-                resp = RedirectResponse(f"{frontend}{bind_next}?line_bind=ok")
-            resp.delete_cookie("line_oauth_state", path="/")
-            return resp
-
-        # Task 3：LINE 登入已停用，非 bind 分支一律導回登入頁，不建帳、不發 token
-        resp = RedirectResponse(f"{frontend}/login?error=oauth_disabled")
-        resp.delete_cookie("line_oauth_state", path="/")
-        return resp
-    except HTTPException as he:
-        if he.status_code == 403 and "管理員" in he.detail:
-            return RedirectResponse(f"{frontend}/login?error=admin_only")
-        return RedirectResponse(f"{frontend}/login?error=line_failed")
-    except Exception as e:
-        print(f"[LINE callback] unexpected error: {e}")
-        return RedirectResponse(f"{frontend}/login?error=line_failed")
+    """已停用：LINE 登入與 LINE 綁定的 OAuth callback 一併停用——
+    綁定改用官方帳號綁定碼流程（見 POST /auth/me/line/bind-code），登入僅剩帳密。"""
+    raise HTTPException(410, "LINE 綁定已改用官方帳號綁定碼流程")

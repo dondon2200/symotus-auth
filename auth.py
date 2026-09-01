@@ -75,40 +75,6 @@ def decode_token(token: str) -> TokenPayload:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-_DEFAULT_BIND_NEXT = "/notifications"
-
-
-def _safe_next(path: Optional[str]) -> str:
-    """只接受站內絕對路徑，擋掉 open redirect。"""
-    if not path or not path.startswith("/") or path.startswith("//"):
-        return _DEFAULT_BIND_NEXT
-    return path
-
-
-def create_line_bind_token(user_id: int, next_path: str = _DEFAULT_BIND_NEXT) -> str:
-    """短效簽章 ticket：讓已登入用戶把 LINE 帳號綁到「當前這個 user」。
-    夾帶在 LINE OAuth 的 state 裡經 callback 帶回，10 分鐘有效。
-    next_path 是綁定完成後前端要回到的站內路徑。"""
-    payload = {
-        "sub": str(user_id),
-        "purpose": "line_bind",
-        "next": _safe_next(next_path),
-        "exp": datetime.utcnow() + timedelta(seconds=600),
-    }
-    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
-
-
-def decode_line_bind_token(token: str) -> Optional[tuple]:
-    """驗證綁定 ticket，回傳 (user_id, next_path)；無效/過期/用途不符回 None。"""
-    try:
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
-        if payload.get("purpose") != "line_bind":
-            return None
-        return int(payload["sub"]), _safe_next(payload.get("next"))
-    except Exception:
-        return None
-
-
 def create_google_bind_token(user_id: int) -> str:
     """短效簽章 ticket：讓已登入用戶把 Google 帳號綁到「當前這個 user」。
     夾帶在 Google OAuth 的 state 裡經 callback 帶回，10 分鐘有效。"""
