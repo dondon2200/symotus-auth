@@ -41,23 +41,31 @@ async def get_camera_backend_token(user: User) -> str:
     - 必須有 camera_email 才能換 token（代表該帳號有在 Camera Backend 配對過相機）
     - LINE 自動合成的 camera_email（line_xxx@symotus.com）Camera Backend 會自動建立帳號，正常換 token
     - 沒有 camera_email 的用戶無法直接存取 Camera Backend，只能透過 camera_access 看授權相機
+    - 例外：symotus_admin 沒有 camera_email 時免手動綁定，自動以 admin@timelapse.com
+      身分換 token（見 memory「symotus_admin needs camera_email」），免去手改 DB。
+      user_id 用真實 camera_user_id（未設時 fallback 1），不可用 0——這顆 token
+      也會被 DELETE 等寫入路徑共用，假造 user_id=0 做寫入會被 Camera Backend 打 500
+      （camera-delete-backend-500 雷區）。
     - 快取鍵含 role：同帳號換角色不會拿到舊權限的 token
     """
-    if not user.camera_email:
+    if user.camera_email:
+        email, role, uid = user.camera_email, to_backend_role(user.role), 0
+    elif user.role == "symotus_admin":
+        email, role, uid = "admin@timelapse.com", "admin", (user.camera_user_id or 1)
+    else:
         return ""  # 沒有 camera_email = 沒有 Camera Backend 帳號，不給 token
 
-    key = (user.camera_email, to_backend_role(user.role))
+    key = (email, role)
     now = _time.monotonic()
     hit = _cam_token_cache.get(key)
     if hit and hit[1] > now:
         return hit[0]
 
-    # user_id=0 讓 Camera Backend 純用 email 查帳號，避免 user_id 不一致問題
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
             f"{CAMERA_BACKEND_URL}/internal/auth/token",
             headers={"x-service-key": CAMERA_SERVICE_KEY},
-            json={"user_id": 0, "email": user.camera_email, "role": to_backend_role(user.role)},
+            json={"user_id": uid, "email": email, "role": role},
         )
         if resp.status_code == 200:
             token = resp.json().get("access_token", "")
