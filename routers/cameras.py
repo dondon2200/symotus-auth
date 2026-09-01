@@ -43,10 +43,14 @@ async def get_camera_backend_token(user: User) -> str:
     - 沒有 camera_email 的用戶無法直接存取 Camera Backend，只能透過 camera_access 看授權相機
     - 例外：symotus_admin 沒有 camera_email 時免手動綁定，自動以 admin@timelapse.com
       身分換 token（見 memory「symotus_admin needs camera_email」），免去手改 DB。
-      user_id 用真實 camera_user_id（未設時 fallback 1），不可用 0——這顆 token
-      也會被 DELETE 等寫入路徑共用，假造 user_id=0 做寫入會被 Camera Backend 打 500
-      （camera-delete-backend-500 雷區）。
-    - 快取鍵含 role：同帳號換角色不會拿到舊權限的 token
+      user_id 用真實 camera_user_id（未設時 fallback 1；0 在 Camera Backend 不是合法
+      的 camera_user_id，只是「不驗 user_id、純用 email 查帳號」的暗號，不可誤用於
+      這條路徑），不可用 0——這顆 token 也會被 DELETE 等寫入路徑共用，假造 user_id=0
+      做寫入會被 Camera Backend 打 500（camera-delete-backend-500 雷區）。
+    - 快取鍵含 role 與 uid：同帳號換角色不會拿到舊權限的 token；同 email+role 但
+      不同 camera_user_id（例如多個無 email 的 admin 各自 fallback 到不同 uid，或
+      巧遇某帳號恰好 camera_email=admin@timelapse.com 而 uid=0）不會互撞拿到彼此的
+      token——那樣寫入時會帶錯 uid，重現 user_id 不一致的 500 雷區。
     """
     if user.camera_email:
         email, role, uid = user.camera_email, to_backend_role(user.role), 0
@@ -55,7 +59,7 @@ async def get_camera_backend_token(user: User) -> str:
     else:
         return ""  # 沒有 camera_email = 沒有 Camera Backend 帳號，不給 token
 
-    key = (email, role)
+    key = (email, role, uid)
     now = _time.monotonic()
     hit = _cam_token_cache.get(key)
     if hit and hit[1] > now:

@@ -92,6 +92,44 @@ def test_admin_with_camera_email_payload_unchanged():
     assert calls[-1] == {"user_id": 0, "email": "admin@timelapse.com", "role": "admin"}
 
 
+def test_cache_key_includes_uid_no_cross_identity_collision():
+    """P0 回歸：TTL 內兩個無 camera_email 的 admin（不同 camera_user_id）連續換 token，
+    快取鍵若只有 (email, role) 會互撞、其中一個會拿到對方 uid 的 token，寫入時重現
+    user_id 誤帶的 500 雷區。此測試刻意不 clear cache，驗證兩者各自換發、各自命中。"""
+    admin_a = FakeUser(email=None, role="symotus_admin", camera_user_id=7)
+    admin_b = FakeUser(email=None, role="symotus_admin", camera_user_id=12)
+
+    token_a = asyncio.run(get_camera_backend_token(admin_a))
+    token_b = asyncio.run(get_camera_backend_token(admin_b))
+
+    assert len(calls) == 2, "不同 uid 不可共用快取，應各自換一次 token"
+    assert calls[0] == {"user_id": 7, "email": "admin@timelapse.com", "role": "admin"}
+    assert calls[1] == {"user_id": 12, "email": "admin@timelapse.com", "role": "admin"}
+    assert token_a != token_b
+
+    # TTL 內重複呼叫（未 clear cache）應各自命中自己的快取，不互撞也不重新換發
+    token_a_again = asyncio.run(get_camera_backend_token(admin_a))
+    token_b_again = asyncio.run(get_camera_backend_token(admin_b))
+    assert len(calls) == 2, "TTL 內重複呼叫應命中快取，不重新換發"
+    assert token_a_again == token_a
+    assert token_b_again == token_b
+
+
+def test_cache_key_distinguishes_legacy_email_bound_admin_from_fallback():
+    """同 email(admin@timelapse.com)、同 role(admin)，但 uid 不同（舊 email 綁定路徑
+    uid=0 vs 免綁定 fallback 預設 uid=1）不可共用快取，否則寫入時彼此互相冒用 uid。"""
+    legacy_admin = FakeUser(email="admin@timelapse.com", role="symotus_admin", camera_user_id=None)
+    fallback_admin = FakeUser(email=None, role="symotus_admin", camera_user_id=None)
+
+    token_legacy = asyncio.run(get_camera_backend_token(legacy_admin))
+    token_fallback = asyncio.run(get_camera_backend_token(fallback_admin))
+
+    assert len(calls) == 2
+    assert calls[0] == {"user_id": 0, "email": "admin@timelapse.com", "role": "admin"}
+    assert calls[1] == {"user_id": 1, "email": "admin@timelapse.com", "role": "admin"}
+    assert token_legacy != token_fallback
+
+
 # ── 整合測試：GET /cameras（無 camera_email 的 admin）──────────────────────────
 
 class FakeListClient(FakeClient):

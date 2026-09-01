@@ -66,7 +66,7 @@ def test_expiry_forces_refresh(monkeypatch):
     u = FakeUser()
     asyncio.run(get_camera_backend_token(u))
     # 讓快取過期
-    key = (u.camera_email, cameras_mod.to_backend_role(u.role))
+    key = (u.camera_email, cameras_mod.to_backend_role(u.role), 0)
     token, _exp = cameras_mod._cam_token_cache[key]
     cameras_mod._cam_token_cache[key] = (token, cameras_mod._time.monotonic() - 1)
     asyncio.run(get_camera_backend_token(u))
