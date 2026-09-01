@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import httpx, secrets, time
 
 from database import get_db
-from models import User, RefreshToken, InviteToken, CameraAccess, UserLineAccount
+from models import User, RefreshToken, InviteToken, CameraAccess, UserLineAccount, LineBindCode
 from schemas import LoginRequest, TokenResponse, RefreshRequest, OAuthCallbackRequest
 from auth import (hash_password, verify_password, create_access_token,
                   create_refresh_token, decode_token, get_current_user,
@@ -267,6 +267,39 @@ def unlink_line_account(line_account_id: int, db: Session = Depends(get_db),
     db.commit()
     db.refresh(current_user)
     return _me_payload(current_user)
+
+
+BIND_CODE_TTL_MINUTES = 10
+
+@router.post("/me/line/bind-code")
+def create_line_bind_code(db: Session = Depends(get_db),
+                          current_user: User = Depends(get_current_user)):
+    """產生 LINE 官方帳號綁定碼：6 位數、10 分鐘效期、單次使用。
+    產新碼即作廢本人舊碼；使用者加官方帳號好友後在聊天輸入此碼完成綁定（webhook 處理）。"""
+    db.query(LineBindCode).filter(LineBindCode.user_id == current_user.id).delete()
+    code = None
+    for _ in range(20):  # 撞碼重試：同時有效碼約莫個位數，20 次必然足夠
+        candidate = f"{secrets.randbelow(1_000_000):06d}"
+        clash = db.query(LineBindCode).filter(
+            LineBindCode.code == candidate,
+            LineBindCode.used_at == None,
+            LineBindCode.expires_at > datetime.utcnow()).first()
+        if not clash:
+            code = candidate
+            break
+    if code is None:
+        raise HTTPException(500, "無法產生綁定碼，請稍後再試")
+    row = LineBindCode(code=code, user_id=current_user.id,
+                       expires_at=datetime.utcnow() + timedelta(minutes=BIND_CODE_TTL_MINUTES))
+    db.add(row)
+    log_action(db, current_user, "self_line_bind_code", "user", current_user.id, "line_bind_codes")
+    db.commit()
+    oa = settings.LINE_OA_BASIC_ID
+    return {
+        "code": code,
+        "expires_at": row.expires_at.isoformat() + "Z",
+        "oa_add_url": f"https://line.me/R/ti/p/{oa}" if oa else None,
+    }
 
 
 class ExchangeRequest(BaseModel):
