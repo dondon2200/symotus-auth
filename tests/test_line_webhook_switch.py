@@ -55,3 +55,32 @@ def test_switch_out_of_range(db):
     _bind(db, "r-a", "U-r", active=True)
     reply = _handle_switch_command(db, "U-r", "切換帳號 5")
     assert "超出範圍" in reply
+
+
+def test_switch_clears_chat_history(db):
+    """FIX 4：成功切換帳號後，AI 對話歷史要清空——否則模型仍握著舊帳號
+    的相機名稱/id，即使工具呼叫會用新 token 正確 403，助理仍會誤答舊帳號的資料。"""
+    from routers.line_webhook import _get_history, _save_history
+
+    _bind(db, "hist-a", "U-hist", active=True)
+    _bind(db, "hist-b", "U-hist", active=False)
+
+    _save_history("U-hist", [{"role": "user", "content": "帳號 A 的相機"}])
+    assert _get_history("U-hist")  # 切換前確實有歷史
+
+    _handle_switch_command(db, "U-hist", "切換帳號 2")
+
+    assert _get_history("U-hist") == []
+
+
+def test_switch_listing_does_not_clear_history(db):
+    """只是列清單（沒帶編號），並未真的切換帳號，歷史不該被清掉。"""
+    from routers.line_webhook import _get_history, _save_history
+
+    _bind(db, "list-a", "U-list", active=True)
+    _bind(db, "list-b", "U-list", active=False)
+
+    _save_history("U-list", [{"role": "user", "content": "hi"}])
+    _handle_switch_command(db, "U-list", "切換帳號")
+
+    assert _get_history("U-list") != []

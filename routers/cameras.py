@@ -522,6 +522,16 @@ async def _is_following_oa(line_id: str) -> bool:
         return True
 
 
+async def _is_following_oa_any(line_accounts) -> bool:
+    """通過任一已綁定 LINE 帳號即算「已加好友」（多對多下不能只看 [0]，
+    遷移期常見「舊 OAuth 綁的那支沒加好友，新綁定碼加的那支才有加」）。
+    找到第一個 True 就短路，避免對每支 LINE 帳號都打一次 LINE API。"""
+    for acc in line_accounts:
+        if await _is_following_oa(acc.line_user_id):
+            return True
+    return False
+
+
 def _set_notify(db: Session, camera_id: int, user: User, value: bool) -> None:
     """設定某用戶對某相機的開機通知；更新所有符合列，無列則建一列（0-c/0-d）。
     建列讓 admin（原本無 camera_access 列、以全域權限收通知）也能留下退訂標記。
@@ -606,7 +616,7 @@ async def subscribe_online_notification(
     if not line_accounts:
         return {"subscribed": False, "needs_line": True, "is_following": False,
                 "message": "請先綁定 LINE 帳號"}
-    if not await _is_following_oa(line_accounts[0].line_user_id):
+    if not await _is_following_oa_any(line_accounts):
         return {"subscribed": False, "needs_line": True, "is_following": False,
                 "message": "請先加入官方 LINE 帳號以接收通知"}
 
@@ -680,7 +690,7 @@ async def notify_bulk(
         line_accounts = current_user.line_accounts
         if not line_accounts:
             return {"needs_line": True, "message": "請先綁定 LINE 帳號"}
-        if not await _is_following_oa(line_accounts[0].line_user_id):
+        if not await _is_following_oa_any(line_accounts):
             return {"needs_line": True, "message": "請先加入官方 LINE 帳號以接收通知"}
         # notify.subscribe 政策：略過等級不足的被分享相機（退訂不受限）
         if current_user.role != "symotus_admin":

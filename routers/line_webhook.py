@@ -16,6 +16,7 @@ from models import User, UserLineAccount, CameraAccess, LineBindCode
 from auth import create_access_token, create_refresh_token
 from models import RefreshToken
 from config import settings
+from audit import log_action
 
 router = APIRouter(prefix="/webhook", tags=["line-webhook"])
 
@@ -85,6 +86,29 @@ def _save_history(uid: str, msgs: list):
 
 def _clear_history(uid: str):
     _chat_history.pop(uid, None)
+
+
+# ── 綁定碼猜測節流（per LINE 帳號，仿照上面 _chat_history 的 TTL 作法；單一
+#    process 就夠，猜中就等於永久綁到陌生人帳號，不能放任無限次嘗試）──────────
+_BIND_ATTEMPT_WINDOW = 600  # 10 分鐘
+_BIND_ATTEMPT_MAX = 5
+_bind_attempts: dict[str, list] = {}  # {line_user_id: [失敗時間戳, ...]}
+
+
+def _bind_attempts_exceeded(uid: str) -> bool:
+    now = _time.time()
+    hits = [t for t in _bind_attempts.get(uid, []) if now - t < _BIND_ATTEMPT_WINDOW]
+    _bind_attempts[uid] = hits
+    return len(hits) >= _BIND_ATTEMPT_MAX
+
+
+def _record_bind_failure(uid: str) -> None:
+    now = _time.time()
+    _bind_attempts.setdefault(uid, []).append(now)
+
+
+def _reset_bind_attempts(uid: str) -> None:
+    _bind_attempts.pop(uid, None)
 
 
 LINE_TOOLS = [
@@ -551,15 +575,21 @@ async def _handle_bind_code(db: Session, line_user_id: str, text: str) -> str | 
     code = text.strip()
     if not BIND_CODE_RE.match(code):
         return None
+    # FIX 5(a)：猜碼節流——同一 LINE 帳號 10 分鐘內累積 5 次失敗就先擋，
+    # 不再去比對現存綁定碼（成功綁定會重置計數）。
+    if _bind_attempts_exceeded(line_user_id):
+        return "嘗試次數過多，請稍後再試。"
     row = (db.query(LineBindCode)
              .filter(LineBindCode.code == code,
                      LineBindCode.used_at == None,
                      LineBindCode.expires_at > datetime.utcnow())
              .first())
     if not row:
+        _record_bind_failure(line_user_id)
         return "綁定碼無效或已過期，請回到網頁「個人設定」重新產生綁定碼。"
 
     row.used_at = datetime.utcnow()
+    _reset_bind_attempts(line_user_id)
     # 同一 LINE 的作用中帳號移到本次綁定的帳號（含「已綁過再輸碼」＝切換 active）
     db.query(UserLineAccount).filter(
         UserLineAccount.line_user_id == line_user_id).update({"is_active": False})
@@ -568,6 +598,8 @@ async def _handle_bind_code(db: Session, line_user_id: str, text: str) -> str | 
     if existing:
         existing.is_active = True
         db.commit()
+        # FIX 4：作用中帳號變了，AI 對話歷史不能沿用舊帳號的資料
+        _clear_history(line_user_id)
         return f"這個 LINE 已綁定帳號 {row.user.username}，已切換為作用中帳號。"
     profile = await _fetch_line_profile(line_user_id)
     db.add(UserLineAccount(
@@ -575,9 +607,15 @@ async def _handle_bind_code(db: Session, line_user_id: str, text: str) -> str | 
         display_name=profile.get("displayName"),
         picture_url=profile.get("pictureUrl"),
         is_active=True))
+    # FIX 5(b)：成功綁定是稀有且高風險的操作（猜中＝永久綁到陌生人帳號），
+    # 比照舊 OAuth 流程的 self_link_line 寫一筆稽核紀錄。
+    log_action(db, row.user, "self_link_line", "user", row.user.id, "line_id")
     db.commit()
+    # FIX 4：新綁定也代表作用中帳號變了（原本可能無帳號或是另一個帳號）
+    _clear_history(line_user_id)
     return (f"✅ 綁定成功！目前作用帳號：{row.user.username}\n"
-            f"相機開機通知與 AI 助理已可使用。若綁定多個帳號，輸入「切換帳號」可切換。")
+            f"AI 助理已可直接使用；相機開機通知還需到網頁「通知設定」逐台開啟訂閱。"
+            f"若綁定多個帳號，輸入「切換帳號」可切換。")
 
 def _resolve_user(db: Session, line_user_id: str) -> User | None:
     """依 user_line_accounts 解析作用中帳號（多對多）：優先 is_active 列；
@@ -618,7 +656,34 @@ def _handle_switch_command(db: Session, line_user_id: str, text: str) -> str | N
     for r in rows:
         r.is_active = (r is rows[idx - 1])
     db.commit()
+    # FIX 4：切換成功＝作用中帳號變了，AI 對話歷史不能沿用前一個帳號的相機資料
+    _clear_history(line_user_id)
     return f"✅ 已切換作用帳號：{rows[idx - 1].user.username}"
+
+
+def _silence_camera_for_all_bound_accounts(db: Session, line_user_id: str, cam_id: int) -> None:
+    """關閉某相機的開機通知，套用到「這支 LINE 綁定的每一個 Symotus 帳號」，
+    而不只是目前作用中那一個（FIX 3）——推播是送給所有綁定帳號的聯集，
+    只關掉 active 帳號的話，其餘帳號名下若也有這台相機的存取，開機時仍會推播，
+    使用者收到的「已取消」回覆就會是錯的。每個帳號沿用原本 0-c/0-d 的邏輯：
+    有列就全部關閉，沒有列（例如 admin 全域收通知）就補一列退訂標記。"""
+    user_ids = {r.user_id for r in db.query(UserLineAccount)
+                .filter(UserLineAccount.line_user_id == line_user_id).all()}
+    for uid in user_ids:
+        rows = db.query(CameraAccess).filter(
+            CameraAccess.camera_id == cam_id,
+            CameraAccess.user_id == uid,
+        ).all()
+        if rows:
+            for access in rows:
+                access.notify_on_online = False
+        else:
+            db.add(CameraAccess(
+                camera_id=cam_id, user_id=uid,
+                granted_by=uid, permission_level="stream_only",
+                notify_on_online=False,
+                invitation_id=0,  # 非邀請來源（哨兵，避免撤銷連結時 NULL fallback 誤刪）
+            ))
 
 
 def _not_bound_reply_text() -> str:
@@ -674,21 +739,10 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
         if text.startswith("取消相機通知 "):
             try:
                 cam_id = int(text.split(" ")[1])
-                # 0-c：關閉所有符合列；0-d：若無存取列（admin 全域收通知）建一列作退訂標記
-                rows = db.query(CameraAccess).filter(
-                    CameraAccess.camera_id == cam_id,
-                    CameraAccess.user_id == user.id,
-                ).all()
-                if rows:
-                    for access in rows:
-                        access.notify_on_online = False
-                else:
-                    db.add(CameraAccess(
-                        camera_id=cam_id, user_id=user.id,
-                        granted_by=user.id, permission_level="stream_only",
-                        notify_on_online=False,
-                        invitation_id=0,  # 非邀請來源（哨兵，避免撤銷連結時 NULL fallback 誤刪）
-                    ))
+                # FIX 3：通知是推給「這支 LINE 綁定的所有帳號」的聯集，只關掉
+                # user（_resolve_user 解出的作用中帳號）名下那一列，其餘綁定帳號
+                # 若也有這台相機的存取，下次開機還是會推播——要對所有綁定帳號生效。
+                _silence_camera_for_all_bound_accounts(db, line_user_id, cam_id)
                 db.commit()
                 await line_reply(reply_token, [{"type": "text",
                     "text": f"✅ 已取消相機 #{cam_id} 的開機通知。如需重新訂閱，請至網頁開機通知設定。"}])

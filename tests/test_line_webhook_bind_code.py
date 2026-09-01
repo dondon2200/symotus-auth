@@ -91,3 +91,81 @@ async def test_rebind_same_pair_sets_active_no_duplicate(db):
     assert len(rows) == 2
     active = [r for r in rows if r.is_active]
     assert len(active) == 1 and active[0].user_id == a.id
+
+
+@pytest.mark.anyio
+async def test_switching_via_bind_code_clears_chat_history(db):
+    """FIX 4：用綁定碼切到已綁過的帳號，也是「作用中帳號變了」，歷史要清。"""
+    from routers.line_webhook import _handle_bind_code, _get_history, _save_history
+    a, b = _mk_user(db, "hist-bind-a"), _mk_user(db, "hist-bind-b")
+    _mk_code(db, a, "444555")
+    await _handle_bind_code(db, "U-hist-bind", "444555")
+    _mk_code(db, b, "555666")
+    await _handle_bind_code(db, "U-hist-bind", "555666")  # active -> b
+
+    _save_history("U-hist-bind", [{"role": "user", "content": "b 的相機"}])
+    _mk_code(db, a, "666777")
+    await _handle_bind_code(db, "U-hist-bind", "666777")  # 切回 a
+
+    assert _get_history("U-hist-bind") == []
+
+
+# ── FIX 5：猜碼節流 + 成功綁定稽核 ──────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def _reset_bind_throttle():
+    """節流用的是 module-level dict，跨測試互相污染要清乾淨。"""
+    import routers.line_webhook as wh
+    wh._bind_attempts.clear()
+    yield
+    wh._bind_attempts.clear()
+
+
+@pytest.mark.anyio
+async def test_repeated_bad_codes_get_throttled(db):
+    from routers.line_webhook import _handle_bind_code, _BIND_ATTEMPT_MAX
+    u = _mk_user(db, "throttle-victim")
+    _mk_code(db, u, "999000")  # 正確碼存在，但攻擊者一直亂猜別的碼
+
+    replies = []
+    for i in range(_BIND_ATTEMPT_MAX + 2):
+        replies.append(await _handle_bind_code(db, "U-attacker", f"{100000 + i}"))
+
+    # 前 _BIND_ATTEMPT_MAX 次是「無效或已過期」，之後被節流擋下
+    for r in replies[:_BIND_ATTEMPT_MAX]:
+        assert "無效或已過期" in r
+    for r in replies[_BIND_ATTEMPT_MAX:]:
+        assert "嘗試次數過多" in r
+
+    # 節流生效後，就算這次猜對了也應該被擋，不能真的綁定
+    reply = await _handle_bind_code(db, "U-attacker", "999000")
+    assert "嘗試次數過多" in reply
+    assert db.query(UserLineAccount).filter_by(line_user_id="U-attacker").count() == 0
+
+
+@pytest.mark.anyio
+async def test_success_resets_throttle_counter(db):
+    from routers.line_webhook import _handle_bind_code
+    u = _mk_user(db, "reset-victim")
+    _mk_code(db, u, "121212")
+
+    await _handle_bind_code(db, "U-reset", "000000")  # 1 次失敗
+    await _handle_bind_code(db, "U-reset", "111111")  # 2 次失敗
+    reply = await _handle_bind_code(db, "U-reset", "121212")  # 成功
+    assert "綁定成功" in reply
+
+    import routers.line_webhook as wh
+    assert wh._bind_attempts.get("U-reset", []) == []
+
+
+@pytest.mark.anyio
+async def test_successful_bind_writes_audit_log(db):
+    from routers.line_webhook import _handle_bind_code
+    from models import AuditLog
+    u = _mk_user(db, "audited")
+    _mk_code(db, u, "777888")
+
+    await _handle_bind_code(db, "U-audit", "777888")
+
+    log = db.query(AuditLog).filter(AuditLog.target_id == u.id).first()
+    assert log is not None
+    assert log.actor_id == u.id

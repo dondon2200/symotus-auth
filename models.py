@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, ARRAY, UniqueConstraint, Float, Index, text, func
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship, declarative_base
+from sqlalchemy.orm import relationship, backref, declarative_base
 from datetime import datetime
 import uuid
 
@@ -49,7 +49,9 @@ class UserLineAccount(Base):
     is_active = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    user = relationship("User", backref="line_accounts")
+    # order_by：id 遞增，讓 User.line_accounts[0] 這類存取有穩定、可預期的順序
+    # （原本是無序 backref，同一 line_user_id 底下哪列排第一是不確定的）。
+    user = relationship("User", backref=backref("line_accounts", order_by="UserLineAccount.id"))
 
 
 class LineBindCode(Base):
