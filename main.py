@@ -173,6 +173,28 @@ async def startup():
                         conn.rollback()
                         logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
 
+            # user_line_accounts 多對多改版（2026-09-01）：
+            # 1) 拆掉 line_user_id 全域唯一（SQLAlchemy unique=True 在 PG 的預設約束名）
+            # 2) 補 is_active（作用中帳號；無 active 列時由 webhook _resolve_user 執行期自動遞補，
+            #    故不需要資料回填 UPDATE）
+            # 3) 補 (user_id, line_user_id) 複合唯一與 line_user_id 查詢索引
+            # 失敗只記警告不擋啟動，與其他區塊同慣例。
+            with engine.connect() as conn:
+                for stmt in [
+                    "ALTER TABLE user_line_accounts DROP CONSTRAINT IF EXISTS user_line_accounts_line_user_id_key",
+                    "ALTER TABLE user_line_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT FALSE",
+                    """CREATE UNIQUE INDEX IF NOT EXISTS uq_user_line_accounts_user_line
+                        ON user_line_accounts (user_id, line_user_id)""",
+                    """CREATE INDEX IF NOT EXISTS ix_user_line_accounts_line_user_id
+                        ON user_line_accounts (line_user_id)""",
+                ]:
+                    try:
+                        conn.execute(text(stmt))
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning(f"user_line_accounts 多對多 migration 失敗（略過）：{e}")
+
             # timelapse_jobs 的切日函式索引（給既有環境用）。models.py 的
             # __table_args__ 只對「create_all 新建的表」有效，正式庫這張表已存在、
             # 已有資料，create_all 不會替既有表補索引，所以這裡另外補一次。
