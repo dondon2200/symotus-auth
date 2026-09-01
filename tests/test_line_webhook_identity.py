@@ -23,14 +23,14 @@ def test_resolve_user_unbound_returns_none(db):
     assert _resolve_user(db, "U-does-not-exist") is None
 
 
-def test_not_bound_reply_text_guides_to_password_login_and_bind(monkeypatch):
-    """F3：LINE 登入已停用，未綁定訪客不該被叫去「用 LINE 登入」，要引導帳密登入 + 個人設定產生綁定連結。"""
+def test_not_bound_reply_text_guides_to_bind_code(monkeypatch):
+    """未綁定引導：帳密登入 + 個人設定產生「綁定碼」並在聊天輸入，不再提綁定連結/LINE 登入。"""
     monkeypatch.setenv("FRONTEND_URL", "https://user.symotus.com")
     text = _not_bound_reply_text()
     assert "用 LINE 登入" not in text
     assert "https://user.symotus.com" in text
     assert "個人設定" in text
-    assert "綁定" in text
+    assert "綁定碼" in text
 
 
 def test_not_bound_reply_text_uses_frontend_url_env(monkeypatch):
@@ -71,3 +71,22 @@ async def test_notify_pushes_to_all_bound_line_accounts(db, monkeypatch):
 
     assert {p[0] for p in pushed} == {"U111", "U222"}
     assert len(pushed) == 2
+
+
+def test_notify_dedups_shared_line_across_users(db):
+    """同一 LINE 綁兩個帳號、兩帳號都對同相機有通知權：只推一次（set 去重）。"""
+    from models import CameraAccess
+    a = User(username="dd-a", email="dd-a@x.com", hashed_password="h", role="end_user")
+    b = User(username="dd-b", email="dd-b@x.com", hashed_password="h", role="end_user")
+    db.add_all([a, b]); db.flush()
+    db.add_all([
+        UserLineAccount(user_id=a.id, line_user_id="U-dup-notify", is_active=True),
+        UserLineAccount(user_id=b.id, line_user_id="U-dup-notify", is_active=False),
+    ])
+    for u in (a, b):
+        db.add(CameraAccess(camera_id=7, user_id=u.id, granted_by=u.id,
+                            permission_level="full", notify_on_online=True, invitation_id=0))
+    db.commit()
+
+    line_ids = camera_notifier.get_notify_line_ids(7, db)
+    assert line_ids == ["U-dup-notify"]

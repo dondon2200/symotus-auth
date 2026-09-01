@@ -622,10 +622,11 @@ def _handle_switch_command(db: Session, line_user_id: str, text: str) -> str | N
 
 
 def _not_bound_reply_text() -> str:
-    """LINE 登入已停用，未綁定用戶要被引導去帳密登入 + 個人設定產生綁定連結，而不是（已不存在的）LINE 登入。"""
+    """未綁定引導：帳密登入網頁 → 個人設定產生綁定碼 → 回聊天室輸入 6 位數完成綁定。"""
     frontend = os.getenv("FRONTEND_URL", "https://user.symotus.com")
     return (f"您好！請先以帳號密碼登入 {frontend} ，"
-            f"於「個人設定」產生 LINE 綁定連結並用本 LINE 帳號開啟完成綁定，即可使用 AI 助理功能")
+            f"於「個人設定」產生 LINE 綁定碼，再回到此聊天室輸入 6 位數綁定碼即可完成綁定，"
+            f"開始接收相機通知並使用 AI 助理。")
 
 
 # ── Webhook endpoint ──────────────────────────────────────────────────────────
@@ -639,17 +640,34 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
 
     data = json.loads(body)
     for event in data.get("events", []):
-        if event.get("type") != "message": continue
+        etype = event.get("type")
+        # 加好友：引導產生綁定碼
+        if etype == "follow" and event.get("replyToken"):
+            await line_reply(event["replyToken"], [{"type": "text", "text": _not_bound_reply_text()}])
+            continue
+        if etype != "message": continue
         if event["message"]["type"] != "text": continue
 
         line_user_id = event["source"]["userId"]
         reply_token  = event["replyToken"]
         text         = event["message"]["text"]
 
-        # 找 Symotus 用戶
+        # 綁定碼（6 位數）：未綁定者也會輸入，必須排在身分解析之前
+        bind_reply = await _handle_bind_code(db, line_user_id, text)
+        if bind_reply is not None:
+            await line_reply(reply_token, [{"type": "text", "text": bind_reply}])
+            continue
+
+        # 找 Symotus 用戶（作用中帳號）
         user = _resolve_user(db, line_user_id)
         if not user:
             await line_reply(reply_token, [{"type": "text", "text": _not_bound_reply_text()}])
+            continue
+
+        # 切換帳號指令
+        switch_reply = _handle_switch_command(db, line_user_id, text)
+        if switch_reply is not None:
+            await line_reply(reply_token, [{"type": "text", "text": switch_reply}])
             continue
 
         # 特殊指令：取消相機通知（從 Flex Message 按鈕觸發）
