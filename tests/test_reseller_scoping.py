@@ -16,7 +16,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from models import Base, User, CameraAccess
-from routers.cameras import get_allowed_camera_ids, create_camera, unbind_camera, get_live_frame_url
+from routers.cameras import (
+    get_allowed_camera_ids, create_camera, unbind_camera, get_live_frame_url,
+    unsubscribe_online_notification,
+)
 import routers.cameras as cameras_mod
 
 
@@ -192,3 +195,57 @@ def test_live_frame_url_ok_for_reseller_with_grant(db):
     _grant(db, camera_id=999, user_id=reseller.id)
     result = asyncio.run(get_live_frame_url(camera_id=999, current_user=reseller, db=db))
     assert "url" in result
+
+
+# ── C-1: notify-unsubscribe 自我授權旁路 ─────────────────────────────────────
+# reseller 對無 grant 的 camera_id 呼叫 notify-unsubscribe 曾經無權限閘，
+# 且 _set_notify 對查無列的情況一律 db.add(...)，等於任何 reseller 可對任意
+# camera_id 先 notify-unsubscribe 憑空造出一筆 camera_access grant。
+
+def test_notify_unsubscribe_403_for_reseller_without_grant(db):
+    reseller = _user(db, 30, "reseller")
+    with pytest.raises(Exception) as e:
+        asyncio.run(unsubscribe_online_notification(camera_id=999, current_user=reseller, db=db))
+    assert getattr(e.value, "status_code", None) == 403
+
+    # 核心：403 之後絕不能憑空多出一筆 camera_access 列（自我授權旁路）
+    rows = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == 999, CameraAccess.user_id == reseller.id,
+    ).all()
+    assert rows == []
+
+
+def test_notify_unsubscribe_ok_for_reseller_with_grant(db):
+    reseller = _user(db, 31, "reseller")
+    _grant(db, camera_id=999, user_id=reseller.id)
+    result = asyncio.run(unsubscribe_online_notification(camera_id=999, current_user=reseller, db=db))
+    assert result["subscribed"] is False
+
+    access = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == 999, CameraAccess.user_id == reseller.id,
+    ).one()
+    assert access.notify_on_online is False
+
+
+def test_notify_unsubscribe_ok_for_admin_any_camera_builds_row(db):
+    """admin 無 allowed_ids 限制；查無既有列時仍建列留下退訂標記（既有行為保留）。"""
+    admin = _user(db, 32, "symotus_admin")
+    result = asyncio.run(unsubscribe_online_notification(camera_id=999, current_user=admin, db=db))
+    assert result["subscribed"] is False
+
+    access = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == 999, CameraAccess.user_id == admin.id,
+    ).one()
+    assert access.notify_on_online is False
+
+
+def test_notify_unsubscribe_403_for_end_user_without_grant(db):
+    end_user = _user(db, 33, "end_user")
+    with pytest.raises(Exception) as e:
+        asyncio.run(unsubscribe_online_notification(camera_id=999, current_user=end_user, db=db))
+    assert getattr(e.value, "status_code", None) == 403
+
+    rows = db.query(CameraAccess).filter(
+        CameraAccess.camera_id == 999, CameraAccess.user_id == end_user.id,
+    ).all()
+    assert rows == []

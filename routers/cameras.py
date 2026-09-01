@@ -512,7 +512,11 @@ async def _is_following_oa(line_id: str) -> bool:
 
 def _set_notify(db: Session, camera_id: int, user: User, value: bool) -> None:
     """設定某用戶對某相機的開機通知；更新所有符合列，無列則建一列（0-c/0-d）。
-    建列讓 admin（原本無 camera_access 列、以全域權限收通知）也能留下退訂標記。"""
+    建列讓 admin（原本無 camera_access 列、以全域權限收通知）也能留下退訂標記。
+
+    C-1 修正：非 admin 且查無既有列時「不」建列——否則等於讓呼叫者對任意
+    camera_id 憑空造出一筆 camera_access grant（自我授權旁路）。非 admin 無列
+    本來就不會收到通知，退訂在這種情況下是 no-op。"""
     rows = db.query(CameraAccess).filter(
         CameraAccess.camera_id == camera_id,
         CameraAccess.user_id == user.id,
@@ -520,7 +524,7 @@ def _set_notify(db: Session, camera_id: int, user: User, value: bool) -> None:
     if rows:
         for acc in rows:
             acc.notify_on_online = value
-    else:
+    elif user.role == "symotus_admin":
         db.add(CameraAccess(
             camera_id=camera_id, user_id=user.id,
             granted_by=user.id, permission_level="stream_only",
@@ -606,6 +610,10 @@ async def unsubscribe_online_notification(
     db: Session = Depends(get_db),
 ):
     """取消相機開機 LINE 通知"""
+    allowed_ids = get_allowed_camera_ids(current_user, db)
+    if allowed_ids is not None and camera_id not in allowed_ids:
+        raise HTTPException(403, "無此相機的存取權限")
+
     _set_notify(db, camera_id, current_user, False)
     db.commit()
     return {"subscribed": False, "message": "已取消開機通知"}
