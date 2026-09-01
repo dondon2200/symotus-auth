@@ -580,9 +580,45 @@ async def _handle_bind_code(db: Session, line_user_id: str, text: str) -> str | 
             f"相機開機通知與 AI 助理已可使用。若綁定多個帳號，輸入「切換帳號」可切換。")
 
 def _resolve_user(db: Session, line_user_id: str) -> User | None:
-    """依 user_line_accounts 表解析 LINE userId 對應的 Symotus 用戶（支援一帳號綁多個 LINE）。"""
-    acc = db.query(UserLineAccount).filter(UserLineAccount.line_user_id == line_user_id).first()
-    return acc.user if acc else None
+    """依 user_line_accounts 解析作用中帳號（多對多）：優先 is_active 列；
+    無 active（剛遷移或 active 列被解綁）則取 id 序第一列並順手升為 active。"""
+    rows = (db.query(UserLineAccount)
+              .filter(UserLineAccount.line_user_id == line_user_id)
+              .order_by(UserLineAccount.id).all())
+    if not rows:
+        return None
+    active = next((r for r in rows if r.is_active), None)
+    if active is None:
+        active = rows[0]
+        active.is_active = True
+        db.commit()
+    return active.user
+
+
+SWITCH_RE = re.compile(r"^切換帳號\s*(\d+)?$")
+
+
+def _handle_switch_command(db: Session, line_user_id: str, text: str) -> str | None:
+    """「切換帳號」列清單；「切換帳號 N」直接切換。非此指令回 None。
+    呼叫端保證 line_user_id 已綁定（排在 _resolve_user 之後）。"""
+    m = SWITCH_RE.match(text.strip())
+    if not m:
+        return None
+    rows = (db.query(UserLineAccount)
+              .filter(UserLineAccount.line_user_id == line_user_id)
+              .order_by(UserLineAccount.id).all())
+    if m.group(1) is None:
+        lines = [f"{i}. {r.user.username}" + ("（作用中）" if r.is_active else "")
+                 for i, r in enumerate(rows, 1)]
+        return ("已綁定的帳號：\n" + "\n".join(lines) +
+                "\n\n輸入「切換帳號 編號」切換，例如：切換帳號 1")
+    idx = int(m.group(1))
+    if not 1 <= idx <= len(rows):
+        return f"編號超出範圍，請輸入 1–{len(rows)}"
+    for r in rows:
+        r.is_active = (r is rows[idx - 1])
+    db.commit()
+    return f"✅ 已切換作用帳號：{rows[idx - 1].user.username}"
 
 
 def _not_bound_reply_text() -> str:
