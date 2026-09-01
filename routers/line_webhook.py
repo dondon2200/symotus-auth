@@ -2,8 +2,8 @@
 LINE Messaging API Webhook
 接收 LINE 訊息 → 比對用戶 → 呼叫 AI → 回覆
 """
-import hmac, hashlib, base64, json, asyncio, os
-from datetime import datetime
+import hmac, hashlib, base64, json, asyncio, os, re
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Request, HTTPException, Depends
 
@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 import httpx
 
 from database import get_db
-from models import User, UserLineAccount, CameraAccess
+from models import User, UserLineAccount, CameraAccess, LineBindCode
 from auth import create_access_token, create_refresh_token
 from models import RefreshToken
 from config import settings
@@ -530,6 +530,54 @@ async def get_and_push_snapshot(line_user_id: str, camera_id: int, auth_token: s
     await line_push(line_user_id, [
         {"type": "image", "originalContentUrl": public_url, "previewImageUrl": public_url}
     ])
+
+BIND_CODE_RE = re.compile(r"^\d{6}$")
+
+
+async def _fetch_line_profile(line_user_id: str) -> dict:
+    """Messaging API 撈顯示名稱/頭像；失敗回空 dict，不能擋綁定流程。"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"https://api.line.me/v2/bot/profile/{line_user_id}",
+                            headers=LINE_HEADERS)
+            return r.json() if r.is_success else {}
+    except Exception:
+        return {}
+
+
+async def _handle_bind_code(db: Session, line_user_id: str, text: str) -> str | None:
+    """6 位數訊息視為綁定碼（未綁定者也會輸入，呼叫端須排在身分解析之前）。
+    回 None＝非綁定碼格式，交由後續流程；回 str＝要回覆的文字。"""
+    code = text.strip()
+    if not BIND_CODE_RE.match(code):
+        return None
+    row = (db.query(LineBindCode)
+             .filter(LineBindCode.code == code,
+                     LineBindCode.used_at == None,
+                     LineBindCode.expires_at > datetime.utcnow())
+             .first())
+    if not row:
+        return "綁定碼無效或已過期，請回到網頁「個人設定」重新產生綁定碼。"
+
+    row.used_at = datetime.utcnow()
+    # 同一 LINE 的作用中帳號移到本次綁定的帳號（含「已綁過再輸碼」＝切換 active）
+    db.query(UserLineAccount).filter(
+        UserLineAccount.line_user_id == line_user_id).update({"is_active": False})
+    existing = db.query(UserLineAccount).filter_by(
+        user_id=row.user_id, line_user_id=line_user_id).first()
+    if existing:
+        existing.is_active = True
+        db.commit()
+        return f"這個 LINE 已綁定帳號 {row.user.username}，已切換為作用中帳號。"
+    profile = await _fetch_line_profile(line_user_id)
+    db.add(UserLineAccount(
+        user_id=row.user_id, line_user_id=line_user_id,
+        display_name=profile.get("displayName"),
+        picture_url=profile.get("pictureUrl"),
+        is_active=True))
+    db.commit()
+    return (f"✅ 綁定成功！目前作用帳號：{row.user.username}\n"
+            f"相機開機通知與 AI 助理已可使用。若綁定多個帳號，輸入「切換帳號」可切換。")
 
 def _resolve_user(db: Session, line_user_id: str) -> User | None:
     """依 user_line_accounts 表解析 LINE userId 對應的 Symotus 用戶（支援一帳號綁多個 LINE）。"""
