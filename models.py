@@ -34,17 +34,37 @@ class User(Base):
 
 
 class UserLineAccount(Base):
-    """一個 User 可綁定多個 LINE 帳號（多 LINE 綁定）"""
+    """Symotus 帳號 ↔ LINE 帳號多對多：一帳號可綁多個 LINE，一個 LINE 也可綁多個帳號。
+    is_active：同一 line_user_id 的多列中最多一列 True（程式維護，非 DB 約束），
+    代表 LINE AI 助理的「作用中」帳號；通知不看此欄位（推播給所有綁定帳號的聯集）。"""
     __tablename__ = "user_line_accounts"
+    __table_args__ = (UniqueConstraint("user_id", "line_user_id",
+                                       name="uq_user_line_accounts_user_line"),)
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    line_user_id = Column(String, nullable=False, unique=True)
+    line_user_id = Column(String, nullable=False, index=True)
     display_name = Column(String, nullable=True)
     picture_url = Column(String, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", backref="line_accounts")
+
+
+class LineBindCode(Base):
+    """LINE 官方帳號綁定碼：網頁產生 6 位數字，使用者在官方帳號聊天輸入完成綁定。
+    單次使用（used_at）、10 分鐘效期（expires_at）；產新碼時作廢同 user 舊碼。"""
+    __tablename__ = "line_bind_codes"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String(6), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
 
 
 class CameraAccess(Base):
