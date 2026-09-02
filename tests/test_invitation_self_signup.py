@@ -629,3 +629,50 @@ def test_list_sent_invitations_reports_signup_quota(db, reseller):
     open_row = by_id[open_inv.id]
     assert open_row["signup_count"] == 3
     assert open_row["signup_limit"] == 10
+
+
+# ── 修法：公開連結（is_public）永遠不需要帳號，signup_limit 建立時就給 0 ──────
+# 之前公開連結因無 invitee_email 而拿到 NULL，被 _signup_limit() 誤算成 10，
+# 這個 10 是純假資料（signup_via_invitation 對 is_public 恆 400，preview 的
+# signup_allowed 也因 (not inv.is_public) 恆 False）；list_sent_invitations 卻
+# 把它回給前端，分享管理頁顯示成「0/10 已自助建帳」，對公開連結是錯的。
+
+
+def test_public_link_gets_zero_signup_limit(db, reseller):
+    """公開連結建立時 signup_limit 直接存 0（而非 NULL），preview 也應回報
+    signup_allowed=False、signup_exhausted=True——公開連結本來就不能自助建帳，
+    0 讓這件事在資料庫層面自洽，不必靠每個讀取點各自記得排除 is_public。"""
+    out = _create(db, reseller, "stream_only", is_public=True)
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    assert inv.signup_limit == 0
+
+    p = preview_invitation(inv.token, db=db)
+    assert p["signup_allowed"] is False
+    assert p["signup_exhausted"] is True
+
+
+def test_list_sent_invitations_reports_is_public_and_zero_limit_for_public_link(db, reseller):
+    """list_sent_invitations 的回傳要能讓前端分辨公開連結（補上 is_public），
+    且公開連結那筆的 signup_limit 要是 0，不能再是舊的假資料 10。"""
+    open_out = _create(db, reseller, "photos_stream")
+    public_out = _create(db, reseller, "stream_only", is_public=True)
+    open_inv = db.query(CameraInvitation).filter_by(token=open_out["token"]).first()
+    public_inv = db.query(CameraInvitation).filter_by(token=public_out["token"]).first()
+
+    result = list_sent_invitations(db=db, current_user=reseller)
+    by_id = {r["id"]: r for r in result}
+
+    open_row = by_id[open_inv.id]
+    assert open_row["is_public"] is False
+    assert open_row["signup_limit"] == 10   # 既有行為不變：未指定對象的非公開連結 NULL → 10
+
+    public_row = by_id[public_inv.id]
+    assert public_row["is_public"] is True
+    assert public_row["signup_limit"] == 0
+
+
+def test_full_with_email_still_sets_limit_one_after_public_branch_added(db, reseller):
+    """既有行為不變：指定對象（非公開連結）仍是 1，三分支邏輯沒有動到這條路徑。"""
+    out = _create(db, reseller, "full", invitee_email="carol@example.com")
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    assert inv.signup_limit == 1

@@ -8,6 +8,7 @@ from auth import require_role, decode_token, hash_password
 from audit import log_action
 from config import settings
 from datetime import datetime
+from routers.invitations import _signup_limit
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -478,6 +479,8 @@ def list_all_invitations(
             "invite_url": f"{settings.FRONTEND_URL}/camera-invite/{i.token}",
             "expires_at": i.expires_at.isoformat() if i.expires_at else None,
             "created_at": i.created_at.isoformat() if i.created_at else None,
+            "signup_count": i.signup_count or 0,
+            "signup_limit": _signup_limit(i),
         } for i in cam_invs],
         "invite_tokens": [{
             "id": t.id, "token": t.token,
