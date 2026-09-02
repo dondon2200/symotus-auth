@@ -559,16 +559,19 @@ def test_login_username_side_stays_case_sensitive(db):
 
 
 def test_preview_zero_limit_is_not_allowed(db, reseller):
-    """signup_limit=0 時，preview 必須回報 signup_allowed=False、
-    signup_exhausted=True——這正是既有連結遷移後拿到的值，若被誤判為
-    「未設定」而 fallback 成 10，等於讓舊連結追溯獲得自助建帳能力。"""
+    """signup_limit=0 時 preview 必須回 signup_allowed=False——這正是既有連結遷移後
+    拿到的值，若被誤判為「未設定」而 fallback 成 10，等於讓舊連結追溯獲得自助建帳能力。
+
+    但 signup_exhausted 必須是 False：0 代表「從未開放自助建帳」，不是「名額用完」。
+    若這裡回 True，每一條歷史連結的收件者都會看到「名額已用完，請聯絡分享者」，
+    以為自己來晚了。"""
     out = _create(db, reseller, "photos_stream")
     inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
     inv.signup_limit = 0
     db.commit()
     p = preview_invitation(inv.token, db=db)
     assert p["signup_allowed"] is False
-    assert p["signup_exhausted"] is True
+    assert p["signup_exhausted"] is False
 
 
 def test_signup_zero_limit_rejected_as_exhausted(db, reseller):
@@ -639,16 +642,18 @@ def test_list_sent_invitations_reports_signup_quota(db, reseller):
 
 
 def test_public_link_gets_zero_signup_limit(db, reseller):
-    """公開連結建立時 signup_limit 直接存 0（而非 NULL），preview 也應回報
-    signup_allowed=False、signup_exhausted=True——公開連結本來就不能自助建帳，
-    0 讓這件事在資料庫層面自洽，不必靠每個讀取點各自記得排除 is_public。"""
+    """公開連結建立時 signup_limit 直接存 0（而非 NULL），讓「不能自助建帳」在資料庫
+    層面自洽，不必靠每個讀取點各自記得排除 is_public。
+
+    preview 兩個旗標都要是 False：不允許建帳（signup_allowed），但也不是名額用完
+    （signup_exhausted）——公開連結的收件者不該看到「名額已用完，請聯絡分享者」。"""
     out = _create(db, reseller, "stream_only", is_public=True)
     inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
     assert inv.signup_limit == 0
 
     p = preview_invitation(inv.token, db=db)
     assert p["signup_allowed"] is False
-    assert p["signup_exhausted"] is True
+    assert p["signup_exhausted"] is False
 
 
 def test_list_sent_invitations_reports_is_public_and_zero_limit_for_public_link(db, reseller):

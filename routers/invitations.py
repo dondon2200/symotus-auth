@@ -211,13 +211,15 @@ def preview_invitation(token: str, db: Session = Depends(get_db)):
         "permission_level": inv.permission_level,
         "permission_label": PERMISSION_LABELS.get(inv.permission_level, ""),
         "expires_at": utc_iso(inv.expires_at),
-        # 公開連結（is_public）自 create_invitation 起 signup_limit 一律為 0
-        # （既有連結也已由啟動時的遷移一次性歸零，見 main.py），因此不必在這裡
-        # 再用 is_public 額外排除——signup_limit=0 本身就已經表達「不允許自助建帳」。
-        # is_public 的 guard 是第二道防線：公開連結的 signup_limit 建立時已給 0，
-        # 但這個旗標決定前端要不要顯示建帳表單，不該只靠資料剛好是對的。
+        # 公開連結自 create_invitation 起 signup_limit 一律為 0（既有連結也已由啟動時的
+        # 遷移一次性歸零，見 main.py），所以資料本身已足以表達「不允許自助建帳」。
+        # 仍保留 is_public 的 guard 當第二道防線：這個旗標決定前端要不要顯示建帳表單，
+        # 不該只靠資料剛好是對的。
         "signup_allowed": (not inv.is_public) and (inv.signup_count or 0) < _signup_limit(inv),
-        "signup_exhausted": (inv.signup_count or 0) >= _signup_limit(inv),
+        # 「本來有名額、現在用完」才算 exhausted。signup_limit=0 是「從未開放自助建帳」
+        # （既有連結遷移後與公開連結都是 0），那不該對訪客說「名額已用完」——
+        # 那句話會讓每一條歷史連結的收件者以為自己來晚了。由 signup_allowed=False 表達即可。
+        "signup_exhausted": _signup_limit(inv) > 0 and (inv.signup_count or 0) >= _signup_limit(inv),
         "invitee_email_masked": _mask_email(inv.invitee_email) if inv.invitee_email else None,
     }
 
