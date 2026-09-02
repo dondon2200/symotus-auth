@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import or_, and_, func
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from typing import Optional
 
 from database import get_db
@@ -248,10 +248,33 @@ def _inherit_reseller_id(inviter: User) -> Optional[int]:
 
 
 class InviteSignupBody(BaseModel):
-    username: str
-    email: str
-    password: str
+    # extra="forbid"：目前沒有提權路徑（role/camera_email/reseller_id 全由伺服器決定），
+    # 防未來有人加欄位夾帶（例如 role="symotus_admin"）
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    email: EmailStr
+    password: str = Field(min_length=8)
     full_name: Optional[str] = None
+
+
+# 平台保留身分：Camera Backend 以 email 認人，symotus_admin 必須把 camera_email 設成
+# admin@timelapse.com 才看得到相機；line_*@symotus.com 是 LINE 帳號的內部別名。
+# 免登入自助建帳絕不能讓呼叫者自選這些字串去換 Camera Backend token。
+RESERVED_EMAIL_DOMAIN = "timelapse.com"
+RESERVED_EMAIL_LOCAL_PREFIX = "line_"
+
+
+def _is_reserved_identity_email(email: str) -> bool:
+    """email 需已正規化（strip + casefold）。"""
+    local, sep, domain = email.partition("@")
+    if not sep:
+        return False
+    if domain == RESERVED_EMAIL_DOMAIN:
+        return True
+    if local.startswith(RESERVED_EMAIL_LOCAL_PREFIX):
+        return True
+    return False
 
 
 # ── 自助建帳（免登入，spec 2026-09-02 S1）────────────────────────────────────
@@ -279,23 +302,31 @@ async def signup_via_invitation(
         raise HTTPException(400, "公開連結不需要帳號")
 
     email = (body.email or "").strip().casefold()
+    if _is_reserved_identity_email(email):
+        raise HTTPException(400, "此 Email 不可用於註冊")
     if inv.invitee_email and inv.invitee_email != email:
         raise HTTPException(403, "此邀請連結限定特定 Email 使用")
     if (inv.signup_count or 0) >= _signup_limit(inv):
         raise HTTPException(400, "此連結的建帳名額已用完，請聯絡分享者")
-    if len(body.password or "") < 8:
-        raise HTTPException(400, "密碼至少需要 8 個字元")
 
-    exists = db.query(User).filter(
-        or_(User.username == body.username, func.lower(User.email) == email)
-    ).first()
+    uname = (body.username or "").strip()
+    exists = db.query(User).filter(or_(
+        func.lower(User.username) == uname.casefold(),
+        func.lower(User.email) == email,
+        func.lower(User.email) == uname.casefold(),
+        func.lower(User.username) == email,
+    )).first()
     if exists:
         raise HTTPException(400, "此 Email 或帳號已存在，請直接登入後接受邀請")
 
     inviter = db.query(User).filter(User.id == inv.inviter_id).first()
+    # 存使用者輸入的原樣（僅 strip，不 casefold）：本 repo 登入是大小寫敏感的精確比對
+    # （routers/auth.py 的 User.email == body.username），若存小寫，使用者下次用原輸入
+    # 大小寫登入會查無此人；正規化後的 email 變數只用於比對，與既有 /auth/register 存法一致。
+    raw_email = (body.email or "").strip()
     user = User(
-        username=body.username,
-        email=email,
+        username=uname,
+        email=raw_email,
         full_name=body.full_name,
         hashed_password=hash_password(body.password),
         role="end_user",                 # 自助建帳一律最低權限
@@ -304,7 +335,9 @@ async def signup_via_invitation(
         created_by=inv.inviter_id,
         reseller_id=_inherit_reseller_id(inviter) if inviter else None,
     )
-    db.add(user); db.commit(); db.refresh(user)
+    db.add(user)
+    db.flush()  # 取得 user.id；User＋CameraAccess＋signup_count＋status＋audit 留在同一筆
+                # transaction 一次 commit，避免中途失敗留下「帳號建好但沒有相機授權」的殘局
 
     db.add(CameraAccess(camera_id=inv.camera_id, user_id=user.id,
                         granted_by=inv.inviter_id,

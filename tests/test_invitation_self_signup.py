@@ -2,6 +2,7 @@
 import asyncio
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -255,10 +256,16 @@ def test_signup_creates_user_and_grant(db, reseller):
 
 
 def test_signup_rejects_wrong_email(db, reseller):
+    """403 擋下後不該留副作用：不建立任何新 User，signup_count 也不遞增。"""
     out = _create(db, reseller, "full", invitee_email="bob@example.com")
+    user_count_before = db.query(User).count()
     with pytest.raises(HTTPException) as e:
         _signup(db, out["token"], email="eve@example.com", username="eve")
     assert e.value.status_code == 403
+    assert "限定特定 Email" in e.value.detail
+    assert db.query(User).count() == user_count_before
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    assert (inv.signup_count or 0) == 0
 
 
 def test_signup_respects_quota(db, reseller):
@@ -273,9 +280,9 @@ def test_signup_respects_quota(db, reseller):
 def test_signup_open_link_default_limit_ten(db, reseller):
     out = _create(db, reseller, "photos_stream")
     for i in range(10):
-        _signup(db, out["token"], email=f"u{i}@x.com", username=f"u{i}", ip=f"198.51.100.{i}")
+        _signup(db, out["token"], email=f"u{i}@x.com", username=f"usr{i}", ip=f"198.51.100.{i}")
     with pytest.raises(HTTPException) as e:
-        _signup(db, out["token"], email="u10@x.com", username="u10", ip="198.51.100.99")
+        _signup(db, out["token"], email="u10@x.com", username="usr10", ip="198.51.100.99")
     assert e.value.status_code == 400
 
 
@@ -290,8 +297,9 @@ def test_signup_existing_email_tells_user_to_login(db, reseller, guest):
 def test_signup_blocked_on_public_link(db, reseller):
     out = _create(db, reseller, "stream_only", is_public=True)
     with pytest.raises(HTTPException) as e:
-        _signup(db, out["token"], email="x@x.com", username="x")
+        _signup(db, out["token"], email="x@x.com", username="usrx")
     assert e.value.status_code == 400
+    assert "不需要帳號" in e.value.detail
 
 
 def test_signup_rejects_revoked_link(db, reseller):
@@ -299,24 +307,25 @@ def test_signup_rejects_revoked_link(db, reseller):
     inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
     inv.status = "revoked"; db.commit()
     with pytest.raises(HTTPException) as e:
-        _signup(db, inv.token, email="x@x.com", username="x")
+        _signup(db, inv.token, email="x@x.com", username="usrx")
     assert e.value.status_code == 400
+    assert "撤銷" in e.value.detail
 
 
 def test_signup_rejects_short_password(db, reseller):
-    out = _create(db, reseller, "photos_stream")
-    with pytest.raises(HTTPException) as e:
-        _signup(db, out["token"], email="x@x.com", username="x", password="short")
-    assert e.value.status_code == 400
+    """修正 1 之後，密碼過短由 pydantic 在建構 InviteSignupBody 時就擋下，
+    根本不會呼叫到 signup_via_invitation，因此改斷言 pydantic.ValidationError。"""
+    with pytest.raises(ValidationError):
+        InviteSignupBody(username="usrx", email="x@x.com", password="short")
 
 
 def test_signup_rate_limited_per_ip(db, reseller):
     """同 IP 每分鐘 5 次；第 6 次回 429（每次都用新 email 避免撞到別的錯誤）。"""
     out = _create(db, reseller, "photos_stream")
     for i in range(5):
-        _signup(db, out["token"], email=f"r{i}@x.com", username=f"r{i}", ip="192.0.2.7")
+        _signup(db, out["token"], email=f"r{i}@x.com", username=f"rate{i}", ip="192.0.2.7")
     with pytest.raises(HTTPException) as e:
-        _signup(db, out["token"], email="r5@x.com", username="r5", ip="192.0.2.7")
+        _signup(db, out["token"], email="r5@x.com", username="rate5", ip="192.0.2.7")
     assert e.value.status_code == 429
 
 
@@ -328,3 +337,70 @@ def test_inherit_reseller_chain(db):
     assert _inherit_reseller_id(admin) is None
     assert _inherit_reseller_id(rs) == 91
     assert _inherit_reseller_id(eu) == 91        # end_user 再分享 → 沿用其上層
+
+
+# ── 審查修補：保留身分 / 輸入驗證 / 交易一致性（Task 5 review）──────────────────
+
+
+def test_signup_rejects_reserved_admin_email(db, reseller):
+    """免登入建帳絕不能冒用 admin@timelapse.com——那是 Camera Backend 用來辨識
+    symotus_admin 的保留 email，用它建帳可能換到看得見全部相機的 token。"""
+    out = _create(db, reseller, "photos_stream")
+    with pytest.raises(HTTPException) as e:
+        _signup(db, out["token"], email="admin@timelapse.com", username="hijack1")
+    assert e.value.status_code == 400
+    assert "不可用於註冊" in e.value.detail
+
+
+def test_signup_rejects_reserved_line_alias_email(db, reseller):
+    """line_*@symotus.com 是 LINE 帳號的內部別名，同樣不可被自助建帳冒用。"""
+    out = _create(db, reseller, "photos_stream")
+    with pytest.raises(HTTPException) as e:
+        _signup(db, out["token"], email="line_U123@symotus.com", username="hijack2")
+    assert e.value.status_code == 400
+    assert "不可用於註冊" in e.value.detail
+
+
+def test_signup_body_rejects_invalid_email_format():
+    """email 格式錯誤要在 pydantic 建構 body 時就被擋下（EmailStr），
+    根本進不了 signup_via_invitation。"""
+    with pytest.raises(ValidationError):
+        InviteSignupBody(username="usr1", email="not-an-email", password="pw12345678")
+
+
+def test_signup_body_rejects_role_field_injection():
+    """extra='forbid'：body 夾帶 role 這種伺服器才該決定的欄位要直接被拒絕，
+    而不是被 pydantic 默默丟棄後續才被忽略——建構當下就要炸。"""
+    with pytest.raises(ValidationError):
+        InviteSignupBody(
+            username="usr1", email="usr1@x.com", password="pw12345678",
+            role="symotus_admin",
+        )
+
+
+def test_signup_rejects_expired_link(db, reseller):
+    """過期連結目前完全沒有測試覆蓋；signup 端點也要擋過期，不只 accept/preview。"""
+    from datetime import datetime, timedelta
+    out = _create(db, reseller, "photos_stream")
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    inv.expires_at = datetime.utcnow() - timedelta(hours=1)
+    db.commit()
+    with pytest.raises(HTTPException) as e:
+        _signup(db, inv.token, email="x@x.com", username="usrx")
+    assert e.value.status_code == 400
+    assert "過期" in e.value.detail
+
+
+def test_signup_stores_email_as_typed_not_lowercased(db, reseller):
+    """存原樣（僅 strip）：本 repo 登入是大小寫敏感比對，若存成全小寫，使用者用
+    原輸入的大小寫登入會查無此人。
+
+    注意：pydantic EmailStr 本身會正規化網域部分為小寫（網域大小寫不敏感是
+    RFC 慣例），但 local part 的大小寫會保留——這裡驗證的正是 local part
+    沒有被我們的 casefold() 邏輯動到。"""
+    out = _create(db, reseller, "photos_stream")
+    _signup(db, out["token"], email="Bob2@Example.com", username="bob2user")
+    user = db.query(User).filter_by(username="bob2user").first()
+    assert user is not None
+    assert user.email == "Bob2@example.com"    # local part "Bob2" 大小寫保留
+    assert user.email != user.email.casefold()  # 確認真的沒被整體 casefold
