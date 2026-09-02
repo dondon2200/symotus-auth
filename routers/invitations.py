@@ -47,6 +47,13 @@ def _signup_limit(inv: CameraInvitation) -> int:
     return inv.signup_limit if inv.signup_limit is not None else SIGNUP_LIMIT_DEFAULT
 
 
+def _mask_email(email: str) -> str:
+    """只給提示用，不外流原始 email。"""
+    name, sep, domain = email.partition("@")
+    head = name[0] if name else "*"
+    return f"{head}***{sep}{domain}" if sep else f"{head}***"
+
+
 # ── 建立邀請（產生連結）────────────────────────────────────────────────────────
 @router.post("")
 def create_invitation(
@@ -173,6 +180,9 @@ def preview_invitation(token: str, db: Session = Depends(get_db)):
         "permission_level": inv.permission_level,
         "permission_label": PERMISSION_LABELS.get(inv.permission_level, ""),
         "expires_at": utc_iso(inv.expires_at),
+        "signup_allowed": (not inv.is_public) and (inv.signup_count or 0) < _signup_limit(inv),
+        "signup_exhausted": (not inv.is_public) and (inv.signup_count or 0) >= _signup_limit(inv),
+        "invitee_email_masked": _mask_email(inv.invitee_email) if inv.invitee_email else None,
     }
 
 

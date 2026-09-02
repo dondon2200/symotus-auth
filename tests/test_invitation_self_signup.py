@@ -166,3 +166,36 @@ def test_accept_unrestricted_link_unaffected(db, reseller, guest):
     out = _create(db, reseller, "photos_stream")
     accept_invitation(out["token"], db=db, current_user=guest)
     assert db.query(CameraAccess).filter_by(user_id=guest.id).count() == 1
+
+
+from routers.invitations import preview_invitation, _mask_email
+
+
+def test_mask_email():
+    assert _mask_email("bob@example.com") == "b***@example.com"
+
+
+def test_preview_reports_signup_state(db, reseller):
+    out = _create(db, reseller, "full", invitee_email="bob@example.com")
+    p = preview_invitation(out["token"], db=db)
+    assert p["signup_allowed"] is True
+    assert p["signup_exhausted"] is False
+    assert p["invitee_email_masked"] == "b***@example.com"
+    assert "bob@example.com" not in str(p)      # 原始 email 不得外流
+
+
+def test_preview_marks_exhausted(db, reseller):
+    out = _create(db, reseller, "full", invitee_email="bob@example.com")
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    inv.signup_count = 1        # limit 為 1，已用完
+    db.commit()
+    p = preview_invitation(inv.token, db=db)
+    assert p["signup_allowed"] is False
+    assert p["signup_exhausted"] is True
+
+
+def test_preview_public_link_has_no_signup(db, reseller):
+    out = _create(db, reseller, "stream_only", is_public=True)
+    p = preview_invitation(out["token"], db=db)
+    assert p["signup_allowed"] is False
+    assert p["invitee_email_masked"] is None
