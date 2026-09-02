@@ -443,6 +443,69 @@ def test_login_allows_case_insensitive_email(db, reseller):
     assert result.access_token
 
 
+# ── Task 5：username 撞號自動改名，email 撞號才擋下 ──────────────────────────
+
+
+@pytest.fixture()
+def alice(db):
+    """username 為 alice 的既有帳號（模擬 A 先用 alice@gmail.com 建帳）。"""
+    u = User(id=3, username="alice", email="alice@gmail.com", role="end_user")
+    db.add(u); db.commit()
+    return u
+
+
+def test_signup_username_collision_auto_renames(db, reseller, alice):
+    """B 拿到另一條邀請、用 alice@company.com 建帳：email 從沒出現過，
+    但推導出的 username "alice" 已被 A 佔用。修法前這裡會 400 並叫他登入，
+    但他根本沒有帳號——永久卡死。修法後應自動改名、成功建帳。"""
+    out = _create(db, reseller, "photos_stream")
+    res = _signup(db, out["token"], email="alice@company.com", username="alice")
+    assert res["access_token"]
+    user = db.query(User).filter_by(email="alice@company.com").first()
+    assert user is not None
+    assert user.username != "alice"
+    assert user.username.startswith("alice")
+
+
+def test_signup_username_collision_chain_picks_next_available(db, reseller, alice):
+    """alice、alice2 都已存在時，第三人建帳仍要成功，且拿到再下一個可用名字。"""
+    taken2 = User(id=4, username="alice2", email="alice2@somewhere.com", role="end_user")
+    db.add(taken2); db.commit()
+
+    out = _create(db, reseller, "photos_stream")
+    res = _signup(db, out["token"], email="alice@thirdcompany.com", username="alice")
+    assert res["access_token"]
+    user = db.query(User).filter_by(email="alice@thirdcompany.com").first()
+    assert user is not None
+    assert user.username not in ("alice", "alice2")
+    assert user.username.startswith("alice")
+
+
+def test_signup_email_collision_still_blocked_with_email_specific_message(db, reseller, alice):
+    """email 本身撞號（含大小寫不同）仍然是真的該叫他登入的情況，維持擋下。"""
+    out = _create(db, reseller, "photos_stream")
+    with pytest.raises(HTTPException) as e:
+        _signup(db, out["token"], email="Alice@Gmail.com", username="whatever")
+    assert e.value.status_code == 400
+    assert "Email" in e.value.detail
+    assert "登入" in e.value.detail
+
+
+def test_signup_renamed_username_respects_max_length(db, reseller):
+    """改名後的 username 仍須符合 InviteSignupBody 的 max_length=64 上限。"""
+    base = "a" * 60  # 接近 64 字元的 local part
+    taken = User(id=5, username=base, email=f"{base}@existing.com", role="end_user")
+    db.add(taken); db.commit()
+
+    out = _create(db, reseller, "photos_stream")
+    res = _signup(db, out["token"], email=f"{base}@newcompany.com", username=base)
+    assert res["access_token"]
+    user = db.query(User).filter_by(email=f"{base}@newcompany.com").first()
+    assert user is not None
+    assert user.username != base
+    assert len(user.username) <= 64
+
+
 def test_login_username_side_stays_case_sensitive(db):
     """修正 1 的邊界保障：只有 email 側改成大小寫不敏感，username 側維持精確比對。
 

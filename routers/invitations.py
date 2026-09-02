@@ -277,6 +277,44 @@ def _is_reserved_identity_email(email: str) -> bool:
     return False
 
 
+MAX_USERNAME_LEN = 64          # 對齊 InviteSignupBody.username 的 Field(max_length=64)
+USERNAME_RENAME_ATTEMPTS = 50  # 數字尾碼嘗試上限，超過改用亂數尾碼保底避免無界迴圈
+
+
+def _username_or_email_taken(db: Session, candidate: str) -> bool:
+    """candidate（大小寫不敏感）是否已被任何既有帳號的 username 或 email 佔用。"""
+    cf = candidate.casefold()
+    return db.query(User).filter(or_(
+        func.lower(User.username) == cf,
+        func.lower(User.email) == cf,
+    )).first() is not None
+
+
+def _unique_username(db: Session, base: str) -> str:
+    """base 撞號時自動加數字尾碼，找一個未被占用（含撞到別人 email）的 username。
+
+    username 是從 email local part 機器推導出來的——使用者看不到也選不了。
+    若撞號就直接拒絕建帳，等同叫他「請直接登入」，但他根本沒有帳號可登入，
+    而 email 又是他自己的、無從更換，於是永遠卡在建不了帳、也登不了入的死路。
+    因此 username 撞號一律自動改名；只有「email 本身撞號」才是真正該擋下、
+    叫他去登入的情況（見 signup_via_invitation 內另外的 email 檢查）。
+    """
+    if not _username_or_email_taken(db, base):
+        return base
+    for n in range(2, USERNAME_RENAME_ATTEMPTS + 2):
+        suffix = str(n)
+        candidate = f"{base[:MAX_USERNAME_LEN - len(suffix)]}{suffix}"
+        if not _username_or_email_taken(db, candidate):
+            return candidate
+    # 數字尾碼試完仍撞號（極端情況）：改用亂數尾碼保底，避免無界迴圈。
+    for _ in range(USERNAME_RENAME_ATTEMPTS):
+        suffix = secrets.token_hex(3)
+        candidate = f"{base[:MAX_USERNAME_LEN - len(suffix)]}{suffix}"
+        if not _username_or_email_taken(db, candidate):
+            return candidate
+    raise HTTPException(500, "帳號名稱產生失敗，請稍後再試")
+
+
 # ── 自助建帳（免登入，spec 2026-09-02 S1）────────────────────────────────────
 @router.post("/signup/{token}")
 async def signup_via_invitation(
@@ -310,17 +348,20 @@ async def signup_via_invitation(
         raise HTTPException(400, "此連結的建帳名額已用完，請聯絡分享者")
 
     uname = (body.username or "").strip()
-    exists = db.query(User).filter(or_(
-        func.lower(User.username) == uname.casefold(),
-        func.lower(User.email) == email,
-        # 這一向目前必不命中：username 的 pattern（^[A-Za-z0-9._-]+$）不含 "@"，
-        # 而 email 必含 "@"，兩者字串不可能相等。保留是為了日後若放寬 username
-        # pattern（例如允許 email 格式當帳號）時，這裡已經先擋著；勿誤認為現行有效防護。
-        func.lower(User.email) == uname.casefold(),
-        func.lower(User.username) == email,
-    )).first()
-    if exists:
-        raise HTTPException(400, "此 Email 或帳號已存在，請直接登入後接受邀請")
+
+    # email 衝突 → 仍然擋下：這是真的該叫他去登入的情況（他自己的 email 已有帳號）。
+    if db.query(User).filter(func.lower(User.email) == email).first():
+        raise HTTPException(400, "此 Email 已有帳號，請直接登入後接受邀請")
+    # 新 email 撞到別人的 username 字串本身：理論上不會發生（username 的 pattern
+    # ^[A-Za-z0-9._-]+$ 不含 "@"，而 email 必含 "@"，兩者字串不可能相等），保留是
+    # 為了日後若放寬 username pattern（例如允許 email 格式當帳號）時已有防護。
+    # 這屬於「email」端的衝突——無法靠改 username 解決，比照上面同樣擋下。
+    if db.query(User).filter(func.lower(User.username) == email).first():
+        raise HTTPException(400, "此 Email 已有帳號，請直接登入後接受邀請")
+
+    # username 撞號 → 自動改名，不擋下（見 _unique_username 註解：使用者不選
+    # 帳號名，拒絕等於死路）。
+    uname = _unique_username(db, uname)
 
     inviter = db.query(User).filter(User.id == inv.inviter_id).first()
     # email 一律存正規化後的小寫（與 pydantic EmailStr 已小寫化的網域一致）；
