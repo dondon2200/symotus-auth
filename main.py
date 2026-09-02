@@ -102,7 +102,6 @@ async def startup():
                     ("is_public", "BOOLEAN", "FALSE"),
                     ("invitee_email", "VARCHAR", None),
                     ("signup_limit", "INTEGER", None),
-                    ("signup_count", "INTEGER", "0"),
                 ]:
                     try:
                         if default:
@@ -113,6 +112,15 @@ async def startup():
                     except Exception as e:
                         conn.rollback()
                         logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
+
+            # camera_invitations.signup_count 需要 NOT NULL，通用迴圈寫不出來，單獨補
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text("ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS signup_count INTEGER DEFAULT 0 NOT NULL"))
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
 
             # 補上 camera_access.permission_level
             with engine.connect() as conn:
