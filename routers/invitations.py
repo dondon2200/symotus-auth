@@ -36,6 +36,15 @@ class CreateInvitationBody(BaseModel):
     permission_level: str = "photos_stream"  # full / photos_stream / stream_only
     expires_hours: Optional[int] = None  # None = 不過期
     is_public: bool = False  # 公開連結，不需登入
+    invitee_email: Optional[str] = None  # 指定對象；full 必填（spec 2026-09-02 S2）
+
+
+SIGNUP_LIMIT_DEFAULT = 10   # 未指定對象的連結可自助建帳的人數上限
+
+
+def _signup_limit(inv: CameraInvitation) -> int:
+    """NULL 一律視為 10（既有連結遷移後即為 NULL）。"""
+    return inv.signup_limit if inv.signup_limit is not None else SIGNUP_LIMIT_DEFAULT
 
 
 # ── 建立邀請（產生連結）────────────────────────────────────────────────────────
@@ -49,6 +58,13 @@ def create_invitation(
         raise HTTPException(400, "未知的權限模式")
     if body.is_public and body.permission_level != "stream_only":
         raise HTTPException(400, "公開連結僅適用「僅預覽觀看」模式")
+
+    # 對象 Email 正規化與驗證（spec 2026-09-02 S2）
+    invitee_email = (body.invitee_email or "").strip().casefold() or None
+    if body.is_public and invitee_email:
+        raise HTTPException(400, "公開連結不需指定對象 Email")
+    if body.permission_level == "full" and not invitee_email:
+        raise HTTPException(400, "「全功能管理」分享必須指定對方 Email")
 
     # D4：全功能被分享者可再分享。reseller/symotus_admin 照舊放行；
     # 其他角色須持有此相機的「真分享」授權（granted_by 非本人）且等級允許 camera.share。
@@ -68,6 +84,7 @@ def create_invitation(
         CameraInvitation.permission_level == body.permission_level,  # D1：一模式一連結
         CameraInvitation.status.in_(["pending", "accepted"]),
         CameraInvitation.is_public == body.is_public,
+        CameraInvitation.invitee_email == invitee_email,   # 不同對象各自成鏈
     ).first()
     if existing_inv:
         invite_url = f"{FRONTEND_URL}/camera-invite/{existing_inv.token}"
@@ -75,6 +92,7 @@ def create_invitation(
             "id": existing_inv.id, "token": existing_inv.token,
             "invite_url": invite_url, "camera_name": existing_inv.camera_name,
             "expires_at": utc_iso(existing_inv.expires_at),
+            "invitee_email": existing_inv.invitee_email,
             "reused": True,
         }
 
@@ -92,6 +110,8 @@ def create_invitation(
         permission_level=body.permission_level,
         is_public=body.is_public,
         expires_at=expires_at,
+        invitee_email=invitee_email,
+        signup_limit=1 if invitee_email else None,
     )
     db.add(inv); db.commit(); db.refresh(inv)
 
@@ -102,6 +122,7 @@ def create_invitation(
         "invite_url": invite_url,
         "camera_name": inv.camera_name,
         "expires_at": utc_iso(expires_at),
+        "invitee_email": invitee_email,
     }
 
 

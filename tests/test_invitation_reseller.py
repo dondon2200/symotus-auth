@@ -67,9 +67,12 @@ def end_user_without_reseller(db):
 
 def _create_invitation(db, inviter, camera_id=7, level="photos_stream"):
     """輔助函式：建立邀請"""
+    kw = {}
+    if level == "full":
+        kw["invitee_email"] = "invitee@x.com"   # spec 2026-09-02 S2：full 必須指定對象
     body = CreateInvitationBody(
         camera_id=camera_id, camera_name=f"cam{camera_id}",
-        permission_level=level
+        permission_level=level, **kw
     )
     return create_invitation(body, db=db, current_user=inviter)
 

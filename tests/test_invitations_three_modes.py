@@ -39,9 +39,11 @@ def guest(db):
     return u
 
 
-def _create(db, owner, level, is_public=False):
+def _create(db, owner, level, is_public=False, **kw):
+    if level == "full" and "invitee_email" not in kw:
+        kw["invitee_email"] = "invitee@x.com"   # spec 2026-09-02 S2：full 必須指定對象
     body = CreateInvitationBody(camera_id=7, camera_name="cam7",
-                                permission_level=level, is_public=is_public)
+                                permission_level=level, is_public=is_public, **kw)
     return create_invitation(body, db=db, current_user=owner)
 
 
