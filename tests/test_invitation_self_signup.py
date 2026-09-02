@@ -79,6 +79,33 @@ def test_public_link_rejects_invitee_email(db, reseller):
     assert e.value.status_code == 400
 
 
+def test_invitee_email_rejects_malformed_format(db, reseller):
+    """複審修正 3：invitee_email 需通過 email 格式驗證，錯字（例如漏 @）要在建立
+    連結當下就擋下——否則會產生一條分享者以為指定了對象、實際上 accept 與 signup
+    都比對不到的 full 連結，永久廢掉且分享者無從得知。"""
+    with pytest.raises(ValidationError):
+        CreateInvitationBody(camera_id=7, camera_name="cam7",
+                              permission_level="photos_stream",
+                              invitee_email="not-an-email")
+
+
+def test_invitee_email_empty_string_still_treated_as_unspecified(db, reseller):
+    """既有行為不得變：呼叫端送空字串（前端目前送 undefined，但別的呼叫端可能送
+    ""）仍要視為「未指定對象」，不能因為加了格式驗證就被擋下。"""
+    out = _create(db, reseller, "photos_stream", invitee_email="")
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    assert inv.invitee_email is None
+    assert inv.signup_limit is None
+
+
+def test_invitee_email_none_still_treated_as_unspecified(db, reseller):
+    """既有行為不得變：不帶 invitee_email（None）仍視為「未指定對象」。"""
+    out = _create(db, reseller, "photos_stream", invitee_email=None)
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    assert inv.invitee_email is None
+    assert inv.signup_limit is None
+
+
 def test_dedupe_is_per_invitee_email(db, reseller):
     """D1 修訂：同相機同模式、不同對象各自成鏈，同對象重複建立回收舊連結。"""
     a = _create(db, reseller, "full", invitee_email="a@x.com")

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import or_, and_, func
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, TypeAdapter, field_validator
 from typing import Optional
 
 from database import get_db
@@ -34,6 +34,9 @@ PERMISSION_LABELS = {
     "stream_only": "僅預覽觀看（縮時預覽＋相簿檢視，不可下載）",
 }
 
+_EMAIL_ADAPTER = TypeAdapter(EmailStr)  # 模組層級快取，避免每次驗證都重建 schema
+
+
 class CreateInvitationBody(BaseModel):
     camera_id: int
     camera_name: Optional[str] = None
@@ -42,6 +45,21 @@ class CreateInvitationBody(BaseModel):
     expires_hours: Optional[int] = None  # None = 不過期
     is_public: bool = False  # 公開連結，不需登入
     invitee_email: Optional[str] = None  # 指定對象；full 必填（spec 2026-09-02 S2）
+
+    @field_validator("invitee_email")
+    @classmethod
+    def _validate_invitee_email_format(cls, v: Optional[str]) -> Optional[str]:
+        """複審修正 3：分享者打錯字（例如漏 @）要在建立連結當下就擋下——否則會
+        產生一條分享者以為指定了對象、實際上 accept 與 signup 都比對不到的連結，
+        永久廢掉且分享者無從得知。前端有正規式擋，但那是可被繞過的唯一防線。
+        用本 repo 已在用的 pydantic EmailStr 驗證格式。
+        注意：不指定對象的既有行為不能變——None 與空字串（有呼叫端可能送 ""，
+        前端目前送 undefined）都要繼續視為「未指定」而不驗證，只有非空值才驗證；
+        router 內會再把兩者一併正規化為 None。"""
+        if v is None or v.strip() == "":
+            return v
+        _EMAIL_ADAPTER.validate_python(v)  # 格式錯誤時拋 pydantic ValidationError
+        return v
 
 
 SIGNUP_LIMIT_DEFAULT = 10   # 未指定對象的連結可自助建帳的人數上限

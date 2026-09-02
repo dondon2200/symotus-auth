@@ -91,24 +91,8 @@ async def startup():
                     conn.rollback()
                     logger.warning(f"camera_invitations migration: {e}")
 
-            # 最終審查修正 1：signup_limit 欄位是否「本次啟動才新增」——用來判斷
-            # 下面的既有連結回填該不該跑。startup 每次啟動都會執行到這裡，若不先
-            # 記住「加欄位之前欄位存不存在」，之後就沒有辦法分辨「這是初次遷移」
-            # 還是「服務例行重啟」，回填會在每次重啟時都執行一次，把部署後才新建、
-            # 尚未指定對象（signup_limit 仍為 NULL、合法待 _signup_limit() 視為 10）
-            # 的連結也一併清成 0，功能等於永遠生效不了。
-            with engine.connect() as conn:
-                try:
-                    signup_limit_col_existed = conn.execute(text(
-                        "SELECT 1 FROM information_schema.columns "
-                        "WHERE table_name='camera_invitations' AND column_name='signup_limit'"
-                    )).fetchone() is not None
-                except Exception as e:
-                    # 查不到就保守當作「已存在」，寧可不回填也不要每次啟動誤傷新連結
-                    signup_limit_col_existed = True
-                    logger.warning(f"schema migration 檢查 signup_limit 欄位是否存在失敗：{e}")
-
-            # 補上 camera_invitations 後加的欄位
+            # 補上 camera_invitations 後加的欄位（signup_limit 除外——見下方單一交易區塊，
+            # 因為它需要跟「是否本次才新增」判斷與既有連結回填綁在同一個交易裡）
             with engine.connect() as conn:
                 for col, typ, default in [
                     ("token", "VARCHAR", None),
@@ -118,7 +102,6 @@ async def startup():
                     ("responded_at", "TIMESTAMP", None),
                     ("is_public", "BOOLEAN", "FALSE"),
                     ("invitee_email", "VARCHAR", None),
-                    ("signup_limit", "INTEGER", None),
                 ]:
                     try:
                         if default:
@@ -130,18 +113,42 @@ async def startup():
                         conn.rollback()
                         logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
 
-            # 既有連結不得追溯獲得自助建帳能力（同 migrations/2026-09-02_camera_invitation_signup.sql）。
-            # 只有 signup_limit 欄位「這次啟動才被新增」時才回填，之後每次重啟
-            # signup_limit_col_existed 都會是 True，不會再誤傷部署後新建的 NULL 連結。
-            if not signup_limit_col_existed:
-                with engine.connect() as conn:
-                    try:
-                        conn.execute(text("UPDATE camera_invitations SET signup_limit = 0 WHERE signup_limit IS NULL"))
-                        conn.commit()
-                        logger.info("camera_invitations.signup_limit 為本次新增欄位，已將既有連結回填 signup_limit=0（不得追溯獲得自助建帳能力）")
-                    except Exception as e:
-                        conn.rollback()
-                        logger.warning(f"schema migration signup_limit 既有連結回填失敗：{e}")
+            # 最終審查修正 1（Important，複審後再修）：既有連結不得追溯獲得自助建帳能力，
+            # 但「查欄位是否已存在」「ALTER 加欄位」「回填既有連結」原本分成三段、各自
+            # 獨立 commit：中間任何一步失敗（這台主機的 auth 容器有 OOM-kill 前科、部署
+            # 逾時被砍、連線拋例外都可能發生）都會停在「欄位已加上但沒回填」的半殘狀態，
+            # 而且失敗只 logger.warning、服務照常啟動——下次啟動查到欄位已存在就永遠跳過
+            # 回填，等於全平台歷史分享連結一路開放自助建帳（其中舊 full 連結甚至讓任何
+            # 持有連結的人建帳取得該相機完整管理權）。原本的存在性查詢也沒有 table_schema
+            # 過濾，多 schema 環境可能誤判為「已存在」而跳過回填。
+            #
+            # 改法：PostgreSQL 的 DDL 具交易性，把「查存在 → ALTER → 回填」收進同一個
+            # engine.begin() 交易：任何一步噴例外就整組 rollback（連 ALTER 也一起撤銷），
+            # 下次啟動會查到欄位仍不存在、乾淨地整組重來，不會停在半殘狀態。回填只在
+            # 「這次交易裡欄位才第一次被加上」（existed 為 False）時執行一次；之後每次
+            # 重啟欄位早已存在、existed 為 True，不會誤傷部署後才新建、尚未指定對象的
+            # NULL 連結（那些連結的 signup_limit 應維持 NULL，由 _signup_limit() 視為 10）。
+            try:
+                with engine.begin() as conn:
+                    existed = conn.execute(text(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name='camera_invitations' AND column_name='signup_limit'"
+                    )).fetchone() is not None
+                    conn.execute(text(
+                        "ALTER TABLE camera_invitations ADD COLUMN IF NOT EXISTS signup_limit INTEGER"
+                    ))
+                    if not existed:
+                        conn.execute(text(
+                            "UPDATE camera_invitations SET signup_limit = 0 WHERE signup_limit IS NULL"
+                        ))
+                if not existed:
+                    logger.info(
+                        "camera_invitations.signup_limit 為本次新增欄位，已於同一交易內回填"
+                        "既有連結 signup_limit=0（不得追溯獲得自助建帳能力）"
+                    )
+            except Exception as e:
+                logger.warning(f"schema migration signup_limit 欄位新增／回填失敗，整組已 rollback，下次啟動會重試：{e}")
 
             # camera_invitations.signup_count 需要 NOT NULL，通用迴圈寫不出來，單獨補
             with engine.connect() as conn:
