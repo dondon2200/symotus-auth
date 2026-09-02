@@ -312,11 +312,14 @@ def test_signup_rejects_revoked_link(db, reseller):
     assert "撤銷" in e.value.detail
 
 
-def test_signup_rejects_short_password(db, reseller):
-    """修正 1 之後，密碼過短由 pydantic 在建構 InviteSignupBody 時就擋下，
-    根本不會呼叫到 signup_via_invitation，因此改斷言 pydantic.ValidationError。"""
+def test_signup_rejects_short_password():
+    """密碼過短由 pydantic 在建構 InviteSignupBody 時就擋下，根本不會呼叫到
+    signup_via_invitation。直接鎖住 8 這個下限邊界（7 碼被擋、8 碼通過），
+    而非僅斷言與 Field(min_length=8) 同義的字串——這樣往後若有人把 min_length
+    改小，這條測試會確實變紅。"""
     with pytest.raises(ValidationError):
-        InviteSignupBody(username="usrx", email="x@x.com", password="short")
+        InviteSignupBody(username="usrx", email="x@x.com", password="1234567")
+    InviteSignupBody(username="usrx", email="x@x.com", password="12345678")
 
 
 def test_signup_rate_limited_per_ip(db, reseller):
@@ -391,16 +394,50 @@ def test_signup_rejects_expired_link(db, reseller):
     assert "過期" in e.value.detail
 
 
-def test_signup_stores_email_as_typed_not_lowercased(db, reseller):
-    """存原樣（僅 strip）：本 repo 登入是大小寫敏感比對，若存成全小寫，使用者用
-    原輸入的大小寫登入會查無此人。
-
-    注意：pydantic EmailStr 本身會正規化網域部分為小寫（網域大小寫不敏感是
-    RFC 慣例），但 local part 的大小寫會保留——這裡驗證的正是 local part
-    沒有被我們的 casefold() 邏輯動到。"""
+def test_signup_stores_email_as_lowercase(db, reseller):
+    """修正 1：email 一律存正規化後的小寫。登入已改為大小寫不敏感比對
+    （routers/auth.py：func.lower(User.email) == ...），所以這裡不必再遷就
+    「存原樣才能用原樣大小寫登入」的舊限制；統一存小寫可避免同一 email
+    因大小寫不同被誤判成兩個不同帳號。"""
     out = _create(db, reseller, "photos_stream")
     _signup(db, out["token"], email="Bob2@Example.com", username="bob2user")
     user = db.query(User).filter_by(username="bob2user").first()
     assert user is not None
-    assert user.email == "Bob2@example.com"    # local part "Bob2" 大小寫保留
-    assert user.email != user.email.casefold()  # 確認真的沒被整體 casefold
+    assert user.email == "bob2@example.com"
+    assert user.email == user.email.casefold()
+
+
+# ── 修正 1 回歸測試：登入大小寫不敏感（routers/auth.py）─────────────────────
+
+
+import routers.auth as auth_mod
+from auth import hash_password as _hash_password
+from schemas import LoginRequest
+
+
+@pytest.fixture(autouse=True)
+def stub_auth_camera_token(monkeypatch):
+    """login() 也會呼叫 get_camera_token 換 Camera Backend token；
+    測試不需要真的打外部網路，直接短路回空字典。"""
+    async def _fake(user_id, email, role, camera_email=None):
+        return {}
+    monkeypatch.setattr(auth_mod, "get_camera_token", _fake)
+
+
+def test_login_allows_case_insensitive_email(db, reseller):
+    """修正 1 核心保障：email 大小寫不同也要能登入。
+
+    建帳時存的是正規化小寫 email（見 test_signup_stores_email_as_lowercase），
+    但使用者未必記得自己當初輸入的大小寫，甚至輸入法/瀏覽器自動大寫首字母都
+    可能讓登入輸入與儲存值不同。這條測試確保「輸入大小寫不同於儲存值」時仍
+    能登入成功——這正是本次修法要解決的問題（過去只有唯一一種、使用者無從
+    得知的大小寫形式能登入）。
+    """
+    user = User(username="caseuser", email="caseuser@example.com",
+                hashed_password=_hash_password("pw12345678"),
+                role="end_user", is_active=True)
+    db.add(user); db.commit()
+
+    body = LoginRequest(username="CaseUser@Example.com", password="pw12345678")
+    result = asyncio.run(auth_mod.login(body, FakeRequest(ip="203.0.113.77"), db=db))
+    assert result.access_token

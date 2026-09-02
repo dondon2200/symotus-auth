@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
 from pydantic import BaseModel
 from typing import Optional
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 import httpx, secrets, time
@@ -88,8 +89,13 @@ def _rate_limit(request: Request, bucket: str, max_req: int, window: int = 60):
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
     _rate_limit(request, "login", 10)
+    # username 精確比對維持原樣；email 改大小寫不敏感——pydantic EmailStr 建帳時已把
+    # 網域部分小寫化，帳號建立端（routers/invitations.py）也統一存小寫 email，若登入仍
+    # 精確比對，使用者用非儲存大小寫輸入 email 會查無此人。body.username 防護 None/空白。
+    username_input = body.username or ""
     user = db.query(User).filter(
-        (User.username == body.username) | (User.email == body.username)
+        (User.username == username_input)
+        | (func.lower(User.email) == username_input.strip().casefold())
     ).first()
     if not user or not user.hashed_password or not verify_password(body.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="帳號或密碼錯誤")

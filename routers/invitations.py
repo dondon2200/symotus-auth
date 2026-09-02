@@ -255,11 +255,11 @@ class InviteSignupBody(BaseModel):
     username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     email: EmailStr
     password: str = Field(min_length=8)
-    full_name: Optional[str] = None
+    full_name: Optional[str] = Field(default=None, max_length=100)
 
 
 # 平台保留身分：Camera Backend 以 email 認人，symotus_admin 必須把 camera_email 設成
-# admin@timelapse.com 才看得到相機；line_*@symotus.com 是 LINE 帳號的內部別名。
+# admin@timelapse.com 才看得到相機；line_ 開頭（不限網域）是 LINE 帳號的內部別名。
 # 免登入自助建帳絕不能讓呼叫者自選這些字串去換 Camera Backend token。
 RESERVED_EMAIL_DOMAIN = "timelapse.com"
 RESERVED_EMAIL_LOCAL_PREFIX = "line_"
@@ -313,6 +313,9 @@ async def signup_via_invitation(
     exists = db.query(User).filter(or_(
         func.lower(User.username) == uname.casefold(),
         func.lower(User.email) == email,
+        # 這一向目前必不命中：username 的 pattern（^[A-Za-z0-9._-]+$）不含 "@"，
+        # 而 email 必含 "@"，兩者字串不可能相等。保留是為了日後若放寬 username
+        # pattern（例如允許 email 格式當帳號）時，這裡已經先擋著；勿誤認為現行有效防護。
         func.lower(User.email) == uname.casefold(),
         func.lower(User.username) == email,
     )).first()
@@ -320,14 +323,14 @@ async def signup_via_invitation(
         raise HTTPException(400, "此 Email 或帳號已存在，請直接登入後接受邀請")
 
     inviter = db.query(User).filter(User.id == inv.inviter_id).first()
-    # 存使用者輸入的原樣（僅 strip，不 casefold）：本 repo 登入是大小寫敏感的精確比對
-    # （routers/auth.py 的 User.email == body.username），若存小寫，使用者下次用原輸入
-    # 大小寫登入會查無此人；正規化後的 email 變數只用於比對，與既有 /auth/register 存法一致。
-    raw_email = (body.email or "").strip()
+    # email 一律存正規化後的小寫（與 pydantic EmailStr 已小寫化的網域一致）；
+    # 登入改為大小寫不敏感比對（routers/auth.py：func.lower(User.email) == ...），
+    # 使用者不論原樣或任意大小寫輸入 email 都能登入，不會出現「只有一種大小寫能登入」的情況。
+    full_name = (body.full_name or "").strip() or None
     user = User(
         username=uname,
-        email=raw_email,
-        full_name=body.full_name,
+        email=email,
+        full_name=full_name,
         hashed_password=hash_password(body.password),
         role="end_user",                 # 自助建帳一律最低權限
         is_active=True,
