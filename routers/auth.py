@@ -403,7 +403,7 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
         ).first()
         if not invite:
             raise HTTPException(400, "邀請連結無效或已過期")
-        if invite.email and invite.email != body.email:
+        if invite.email and invite.email.strip().casefold() != (body.email or "").strip().casefold():
             raise HTTPException(400, "此邀請連結限定特定 Email 使用")
 
     # 公開邀請路徑：角色依邀請指定（「reseller」需發邀請者為 platform admin）
@@ -413,15 +413,17 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
         if inviter and inviter.role == "symotus_admin":
             invite_role = "reseller"
 
+    email = (body.email or "").strip().casefold()
     existing = db.query(User).filter(
-        (User.username == body.username) | (User.email == body.email)
+        (User.username == body.username) | (func.lower(User.email) == email)
     ).first()
     if existing:
         raise HTTPException(400, "帳號或 Email 已存在")
 
+    # email 統一存小寫，登入以大小寫不敏感比對
     user = User(
         username=body.username,
-        email=body.email,
+        email=email,
         full_name=body.full_name,
         hashed_password=hash_password(body.password),
         role=body.role if is_internal else invite_role,

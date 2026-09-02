@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from database import get_db
 from models import User, CameraAccess, TechSupportGrant, CameraInvitation, InviteToken, AuditLog
@@ -42,11 +43,13 @@ def create_user(
     Literal 限制在三個合法值，非法值 422；username/email 重複回 409。"""
     if db.query(User).filter(User.username == body.username).first():
         raise HTTPException(status_code=409, detail="username 已存在")
-    if db.query(User).filter(User.email == body.email).first():
+    email = (body.email or "").strip().casefold()
+    if db.query(User).filter(func.lower(User.email) == email).first():
         raise HTTPException(status_code=409, detail="email 已存在")
+    # email 統一存小寫，登入以大小寫不敏感比對
     user = User(
         username=body.username,
-        email=body.email,
+        email=email,
         full_name=body.full_name,
         hashed_password=hash_password(body.password),
         role=body.role,

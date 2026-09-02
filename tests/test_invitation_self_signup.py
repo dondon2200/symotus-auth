@@ -441,3 +441,22 @@ def test_login_allows_case_insensitive_email(db, reseller):
     body = LoginRequest(username="CaseUser@Example.com", password="pw12345678")
     result = asyncio.run(auth_mod.login(body, FakeRequest(ip="203.0.113.77"), db=db))
     assert result.access_token
+
+
+def test_login_username_side_stays_case_sensitive(db):
+    """修正 1 的邊界保障：只有 email 側改成大小寫不敏感，username 側維持精確比對。
+
+    DB 裡存的 username 是小寫 "caseuser"；用大小寫不同的 "CaseUser" 當帳號輸入
+    登入，不該命中（不然就是 username 側也被誤放寬成不敏感了）。這是與
+    test_login_allows_case_insensitive_email 對照的反例：email 側放寬、
+    username 側不放寬，兩者都要鎖住。
+    """
+    user = User(username="caseuser", email="caseuser2@example.com",
+                hashed_password=_hash_password("pw12345678"),
+                role="end_user", is_active=True)
+    db.add(user); db.commit()
+
+    body = LoginRequest(username="CaseUser", password="pw12345678")
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(auth_mod.login(body, FakeRequest(ip="203.0.113.77"), db=db))
+    assert exc_info.value.status_code == 401
