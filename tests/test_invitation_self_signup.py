@@ -199,3 +199,132 @@ def test_preview_public_link_has_no_signup(db, reseller):
     p = preview_invitation(out["token"], db=db)
     assert p["signup_allowed"] is False
     assert p["invitee_email_masked"] is None
+
+
+import routers.invitations as inv_mod
+from routers.invitations import signup_via_invitation, InviteSignupBody, _inherit_reseller_id
+
+
+class FakeRequest:
+    """_rate_limit 只用到 headers 與 client。"""
+    def __init__(self, ip="203.0.113.9"):
+        self.headers = {"x-forwarded-for": ip}
+        self.client = None
+
+
+@pytest.fixture(autouse=True)
+def stub_camera_token(monkeypatch):
+    async def _fake(user_id, email, role, camera_email=None):
+        return {"access_token": "cam-a", "refresh_token": "cam-r"}
+    monkeypatch.setattr(inv_mod, "get_camera_token", _fake)
+
+
+@pytest.fixture(autouse=True)
+def clear_rate_limit():
+    """_rl_buckets 是 routers/auth.py 的模組級全域，會跨測試累積；
+    不清會讓同 IP 的第 6 次呼叫吃到 429，測試莫名其妙變紅。"""
+    from routers.auth import _rl_buckets
+    _rl_buckets.clear()
+    yield
+    _rl_buckets.clear()
+
+
+def _signup(db, token, email="bob@example.com", username="bob",
+            password="pw12345678", ip="203.0.113.9"):
+    body = InviteSignupBody(username=username, email=email, password=password, full_name="Bob")
+    return asyncio.run(signup_via_invitation(token, body, FakeRequest(ip), db=db))
+
+
+def test_signup_creates_user_and_grant(db, reseller):
+    out = _create(db, reseller, "full", invitee_email="bob@example.com")
+    res = _signup(db, out["token"])
+    user = db.query(User).filter_by(username="bob").first()
+    assert user.role == "end_user"
+    assert user.is_active is True
+    assert user.camera_email is None
+    assert user.created_by == reseller.id
+    assert user.reseller_id == reseller.id          # 分享者是 reseller → 掛其名下
+    acc = db.query(CameraAccess).filter_by(user_id=user.id, camera_id=7).first()
+    assert acc.permission_level == "full"
+    assert acc.granted_by == reseller.id
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    assert acc.invitation_id == inv.id
+    assert inv.signup_count == 1 and inv.invitee_id == user.id and inv.status == "accepted"
+    assert res["access_token"] and res["camera_access_token"] == "cam-a"
+    assert res["camera_id"] == 7
+
+
+def test_signup_rejects_wrong_email(db, reseller):
+    out = _create(db, reseller, "full", invitee_email="bob@example.com")
+    with pytest.raises(HTTPException) as e:
+        _signup(db, out["token"], email="eve@example.com", username="eve")
+    assert e.value.status_code == 403
+
+
+def test_signup_respects_quota(db, reseller):
+    out = _create(db, reseller, "full", invitee_email="bob@example.com")
+    _signup(db, out["token"])
+    with pytest.raises(HTTPException) as e:
+        _signup(db, out["token"], username="bob2", ip="203.0.113.10")
+    assert e.value.status_code == 400
+    assert "名額" in e.value.detail
+
+
+def test_signup_open_link_default_limit_ten(db, reseller):
+    out = _create(db, reseller, "photos_stream")
+    for i in range(10):
+        _signup(db, out["token"], email=f"u{i}@x.com", username=f"u{i}", ip=f"198.51.100.{i}")
+    with pytest.raises(HTTPException) as e:
+        _signup(db, out["token"], email="u10@x.com", username="u10", ip="198.51.100.99")
+    assert e.value.status_code == 400
+
+
+def test_signup_existing_email_tells_user_to_login(db, reseller, guest):
+    out = _create(db, reseller, "photos_stream")
+    with pytest.raises(HTTPException) as e:
+        _signup(db, out["token"], email="bob@example.com", username="other")  # guest 已用此 email
+    assert e.value.status_code == 400
+    assert "登入" in e.value.detail
+
+
+def test_signup_blocked_on_public_link(db, reseller):
+    out = _create(db, reseller, "stream_only", is_public=True)
+    with pytest.raises(HTTPException) as e:
+        _signup(db, out["token"], email="x@x.com", username="x")
+    assert e.value.status_code == 400
+
+
+def test_signup_rejects_revoked_link(db, reseller):
+    out = _create(db, reseller, "photos_stream")
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    inv.status = "revoked"; db.commit()
+    with pytest.raises(HTTPException) as e:
+        _signup(db, inv.token, email="x@x.com", username="x")
+    assert e.value.status_code == 400
+
+
+def test_signup_rejects_short_password(db, reseller):
+    out = _create(db, reseller, "photos_stream")
+    with pytest.raises(HTTPException) as e:
+        _signup(db, out["token"], email="x@x.com", username="x", password="short")
+    assert e.value.status_code == 400
+
+
+def test_signup_rate_limited_per_ip(db, reseller):
+    """同 IP 每分鐘 5 次；第 6 次回 429（每次都用新 email 避免撞到別的錯誤）。"""
+    out = _create(db, reseller, "photos_stream")
+    for i in range(5):
+        _signup(db, out["token"], email=f"r{i}@x.com", username=f"r{i}", ip="192.0.2.7")
+    with pytest.raises(HTTPException) as e:
+        _signup(db, out["token"], email="r5@x.com", username="r5", ip="192.0.2.7")
+    assert e.value.status_code == 429
+
+
+def test_inherit_reseller_chain(db):
+    admin = User(id=90, username="ad", email="ad@x.com", role="symotus_admin")
+    rs = User(id=91, username="r2", email="r2@x.com", role="reseller")
+    eu = User(id=92, username="e2", email="e2@x.com", role="end_user", reseller_id=91)
+    db.add_all([admin, rs, eu]); db.commit()
+    assert _inherit_reseller_id(admin) is None
+    assert _inherit_reseller_id(rs) == 91
+    assert _inherit_reseller_id(eu) == 91        # end_user 再分享 → 沿用其上層

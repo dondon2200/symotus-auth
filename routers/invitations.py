@@ -3,20 +3,22 @@
 Admin/Reseller 產生邀請連結 → 分享給任何人 → 點連結接受
 """
 import secrets
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import or_, and_
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy import or_, and_, func
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 from typing import Optional
 
 from database import get_db
-from models import User, CameraInvitation, CameraAccess
-from auth import get_current_user, require_role
+from models import User, CameraInvitation, CameraAccess, RefreshToken
+from auth import (get_current_user, require_role, hash_password,
+                  create_access_token, create_refresh_token)
 from audit import log_action
 from policies import level_allows
 from config import settings
 from schemas import utc_iso
+from routers.auth import get_camera_token, _rate_limit
 
 router = APIRouter(prefix="/invitations", tags=["invitations"])
 
@@ -234,6 +236,102 @@ def accept_invitation(
     db.commit()
 
     return {"message": f"已接受！相機「{inv.camera_name}」已加入您的儀表板", "camera_id": inv.camera_id}
+
+
+def _inherit_reseller_id(inviter: User) -> Optional[int]:
+    """S4：新帳號繼承分享者的歸屬鏈。"""
+    if inviter.role == "reseller":
+        return inviter.id
+    if inviter.role == "symotus_admin":
+        return None
+    return inviter.reseller_id      # end_user 再分享 → 沿用其上層
+
+
+class InviteSignupBody(BaseModel):
+    username: str
+    email: str
+    password: str
+    full_name: Optional[str] = None
+
+
+# ── 自助建帳（免登入，spec 2026-09-02 S1）────────────────────────────────────
+@router.post("/signup/{token}")
+async def signup_via_invitation(
+    token: str,
+    body: InviteSignupBody,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """未登入者用分享連結建帳：建帳＋授權＋簽 token 一次完成。
+
+    不走 /auth/register——那條路的安全模型綁死 InviteToken，不該再開分支。
+    """
+    _rate_limit(request, "invite_signup", 5)
+
+    inv = db.query(CameraInvitation).filter(CameraInvitation.token == token).first()
+    if not inv:
+        raise HTTPException(404, "邀請連結不存在")
+    if inv.status == "revoked":
+        raise HTTPException(400, "此邀請已撤銷")
+    if inv.expires_at and inv.expires_at < datetime.utcnow():
+        raise HTTPException(400, "邀請連結已過期")
+    if inv.is_public:
+        raise HTTPException(400, "公開連結不需要帳號")
+
+    email = (body.email or "").strip().casefold()
+    if inv.invitee_email and inv.invitee_email != email:
+        raise HTTPException(403, "此邀請連結限定特定 Email 使用")
+    if (inv.signup_count or 0) >= _signup_limit(inv):
+        raise HTTPException(400, "此連結的建帳名額已用完，請聯絡分享者")
+    if len(body.password or "") < 8:
+        raise HTTPException(400, "密碼至少需要 8 個字元")
+
+    exists = db.query(User).filter(
+        or_(User.username == body.username, func.lower(User.email) == email)
+    ).first()
+    if exists:
+        raise HTTPException(400, "此 Email 或帳號已存在，請直接登入後接受邀請")
+
+    inviter = db.query(User).filter(User.id == inv.inviter_id).first()
+    user = User(
+        username=body.username,
+        email=email,
+        full_name=body.full_name,
+        hashed_password=hash_password(body.password),
+        role="end_user",                 # 自助建帳一律最低權限
+        is_active=True,
+        camera_email=None,               # 非 admin 不綁 Camera Backend
+        created_by=inv.inviter_id,
+        reseller_id=_inherit_reseller_id(inviter) if inviter else None,
+    )
+    db.add(user); db.commit(); db.refresh(user)
+
+    db.add(CameraAccess(camera_id=inv.camera_id, user_id=user.id,
+                        granted_by=inv.inviter_id,
+                        permission_level=inv.permission_level,
+                        invitation_id=inv.id))
+    inv.signup_count = (inv.signup_count or 0) + 1
+    inv.status = "accepted"
+    inv.invitee_id = user.id
+    inv.responded_at = datetime.utcnow()
+    log_action(db, user, "camera_invite_signup", "camera_invitation", inv.id,
+               f"camera_id={inv.camera_id} level={inv.permission_level} inviter={inv.inviter_id}")
+    db.commit()
+
+    camera_tokens = await get_camera_token(user.id, user.email, user.role, user.camera_email)
+    access_token = create_access_token(user, db)
+    refresh = create_refresh_token()
+    db.add(RefreshToken(user_id=user.id, token=refresh,
+                        expires_at=datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)))
+    db.commit()
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh,
+        "expires_in": settings.JWT_EXPIRE_MINUTES * 60,
+        "camera_access_token": camera_tokens.get("access_token"),
+        "camera_refresh_token": camera_tokens.get("refresh_token"),
+        "camera_id": inv.camera_id,
+    }
 
 
 # ── 拒絕邀請（需登入）──────────────────────────────────────────────────────────
