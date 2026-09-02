@@ -192,6 +192,11 @@ def accept_invitation(
     if inv.expires_at and inv.expires_at < datetime.utcnow():
         raise HTTPException(400, "邀請連結已過期")
 
+    # 指定對象的連結只對該 email 有效（spec 2026-09-02 §1）；
+    # 否則「指定 email」只擋得住建帳、擋不住已有帳號的人拿連結接受。
+    if inv.invitee_email and (current_user.email or "").strip().casefold() != inv.invitee_email:
+        raise HTTPException(403, "此邀請連結限定特定 Email 使用")
+
     # 若已有此相機的 camera_access：定案②以最新接受為準（可升可降），同步更新來源連結與分享者
     existing = db.query(CameraAccess).filter(
         CameraAccess.user_id == current_user.id,

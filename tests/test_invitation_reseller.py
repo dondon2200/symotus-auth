@@ -65,11 +65,11 @@ def end_user_without_reseller(db):
     return u
 
 
-def _create_invitation(db, inviter, camera_id=7, level="photos_stream"):
+def _create_invitation(db, inviter, camera_id=7, level="photos_stream", invitee_email=None):
     """輔助函式：建立邀請"""
     kw = {}
     if level == "full":
-        kw["invitee_email"] = "invitee@x.com"   # spec 2026-09-02 S2：full 必須指定對象
+        kw["invitee_email"] = invitee_email or "invitee@x.com"   # spec 2026-09-02 S2：full 必須指定對象
     body = CreateInvitationBody(
         camera_id=camera_id, camera_name=f"cam{camera_id}",
         permission_level=level, **kw
@@ -191,7 +191,7 @@ def test_accept_invitation_no_fill_if_inviter_is_end_user(db):
     db.commit()
 
     # Step 1: reseller_r 給 user_b 分享（full access）
-    inv_for_b = _create_invitation(db, reseller_r, camera_id=10, level="full")
+    inv_for_b = _create_invitation(db, reseller_r, camera_id=10, level="full", invitee_email=user_b.email)
     accept_invitation(inv_for_b["token"], db=db, current_user=user_b)
 
     # Step 2: user_b 基於上述 full grant 再分享給 user_a

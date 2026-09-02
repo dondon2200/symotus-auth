@@ -136,3 +136,33 @@ def test_dedupe_reuses_when_no_invitee_email(db, reseller):
         CameraInvitation.invitee_email.is_(None),
     ).count()
     assert count_2 == 1
+
+
+from routers.invitations import accept_invitation
+
+
+@pytest.fixture()
+def guest(db):
+    u = User(id=2, username="guest", email="Bob@Example.com", role="end_user")
+    db.add(u); db.commit()
+    return u
+
+
+def test_accept_rejects_wrong_email(db, reseller, guest):
+    out = _create(db, reseller, "full", invitee_email="someone-else@x.com")
+    with pytest.raises(HTTPException) as e:
+        accept_invitation(out["token"], db=db, current_user=guest)
+    assert e.value.status_code == 403
+
+
+def test_accept_allows_matching_email_case_insensitive(db, reseller, guest):
+    out = _create(db, reseller, "full", invitee_email="bob@example.com")
+    accept_invitation(out["token"], db=db, current_user=guest)
+    acc = db.query(CameraAccess).filter_by(user_id=guest.id, camera_id=7).first()
+    assert acc is not None and acc.permission_level == "full"
+
+
+def test_accept_unrestricted_link_unaffected(db, reseller, guest):
+    out = _create(db, reseller, "photos_stream")
+    accept_invitation(out["token"], db=db, current_user=guest)
+    assert db.query(CameraAccess).filter_by(user_id=guest.id).count() == 1

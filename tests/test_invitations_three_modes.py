@@ -78,7 +78,7 @@ def test_accept_stamps_invitation_id(db, owner, guest):
 
 def test_accept_latest_wins_up_and_down(db, owner, guest):
     """定案②：重複接受以最新為準（可升可降）。"""
-    full_inv = _create(db, owner, "full")
+    full_inv = _create(db, owner, "full", invitee_email=guest.email)
     preview_inv = _create(db, owner, "stream_only")
     accept_invitation(full_inv["token"], db=db, current_user=guest)
     accept_invitation(preview_inv["token"], db=db, current_user=guest)  # 降級
@@ -92,7 +92,7 @@ def test_accept_latest_wins_up_and_down(db, owner, guest):
 
 def test_revoke_only_kills_own_grants(db, owner, guest):
     """D2：撤「僅預覽」連結不影響同相機「全功能」授權。"""
-    full_inv = _create(db, owner, "full")
+    full_inv = _create(db, owner, "full", invitee_email=guest.email)
     preview_inv = _create(db, owner, "stream_only")
     other = User(id=3, username="other", email="other@x.com", role="end_user")
     db.add(other); db.commit()
