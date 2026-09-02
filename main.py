@@ -100,6 +100,9 @@ async def startup():
                     ("expires_at", "TIMESTAMP", None),
                     ("responded_at", "TIMESTAMP", None),
                     ("is_public", "BOOLEAN", "FALSE"),
+                    ("invitee_email", "VARCHAR", None),
+                    ("signup_limit", "INTEGER", None),
+                    ("signup_count", "INTEGER", "0"),
                 ]:
                     try:
                         if default:

@@ -279,6 +279,11 @@ class CameraInvitation(Base):
     responded_at = Column(DateTime, nullable=True)
     is_public = Column(Boolean, default=False, nullable=False, server_default="false")  # 公開連結，不需登入
 
+    # 自助建帳（spec 2026-09-02）
+    invitee_email = Column(String, nullable=True)                                   # 指定對象；有值則建帳與接受都須為此 email
+    signup_limit = Column(Integer, nullable=True)                                   # 可自助建帳人數上限；NULL 視為 10
+    signup_count = Column(Integer, default=0, nullable=False, server_default="0")   # 已自助建帳人數
+
 
 # ── Billing 計費模組 ─────────────────────────────────────────────
 # 設計見 symotus-frontend/docs/superpowers/specs/2026-08-20-billing-rebuild-design.md
