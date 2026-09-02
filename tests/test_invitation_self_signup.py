@@ -523,3 +523,82 @@ def test_login_username_side_stays_case_sensitive(db):
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(auth_mod.login(body, FakeRequest(ip="203.0.113.77"), db=db))
     assert exc_info.value.status_code == 401
+
+
+# ── 最終整體審查修正（2026-09-02）─────────────────────────────────────────────
+# 修正 1：signup_limit=0（既有連結遷移後回填的值，表示「不允許自助建帳」）
+# 一定要讓 preview/signup 視為「名額用完」，不能被 `or`/truthy 判斷誤當成
+# 「沒設定」而 fallback 成 10。
+
+
+def test_preview_zero_limit_is_not_allowed(db, reseller):
+    """signup_limit=0 時，preview 必須回報 signup_allowed=False、
+    signup_exhausted=True——這正是既有連結遷移後拿到的值，若被誤判為
+    「未設定」而 fallback 成 10，等於讓舊連結追溯獲得自助建帳能力。"""
+    out = _create(db, reseller, "photos_stream")
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    inv.signup_limit = 0
+    db.commit()
+    p = preview_invitation(inv.token, db=db)
+    assert p["signup_allowed"] is False
+    assert p["signup_exhausted"] is True
+
+
+def test_signup_zero_limit_rejected_as_exhausted(db, reseller):
+    """signup_limit=0 時呼叫 signup 端點要回 400「名額已用完」，而不是
+    誤把 0 當成「無限制/未設定」讓它通過建帳。"""
+    out = _create(db, reseller, "photos_stream")
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    inv.signup_limit = 0
+    db.commit()
+    with pytest.raises(HTTPException) as e:
+        _signup(db, inv.token, email="new@x.com", username="newusr")
+    assert e.value.status_code == 400
+    assert "名額" in e.value.detail
+    assert db.query(User).filter_by(email="new@x.com").first() is None
+
+
+# 修正 2（M-3）：保留身分 email 要在「建立邀請」當下就擋，不能等到對方 signup
+# 時才擋——否則那條連結永遠沒人建得了帳，形同永久卡死。
+
+
+def test_create_invitation_rejects_reserved_admin_domain(db, reseller):
+    with pytest.raises(HTTPException) as e:
+        _create(db, reseller, "full", invitee_email="admin@timelapse.com")
+    assert e.value.status_code == 400
+    assert "保留身分" in e.value.detail
+
+
+def test_create_invitation_rejects_reserved_line_alias(db, reseller):
+    with pytest.raises(HTTPException) as e:
+        _create(db, reseller, "full", invitee_email="line_U123@symotus.com")
+    assert e.value.status_code == 400
+    assert "保留身分" in e.value.detail
+
+
+# 修正 4（M-2）：分享者要能在「已送出的邀請」清單看到名額用了幾個。
+
+
+from routers.invitations import list_sent_invitations
+
+
+def test_list_sent_invitations_reports_signup_quota(db, reseller):
+    out = _create(db, reseller, "full", invitee_email="quota@x.com")
+    inv = db.query(CameraInvitation).filter_by(token=out["token"]).first()
+    assert inv.signup_limit == 1        # full＋指定對象 → 限 1 人
+
+    open_out = _create(db, reseller, "photos_stream")
+    open_inv = db.query(CameraInvitation).filter_by(token=open_out["token"]).first()
+    open_inv.signup_count = 3           # 未指定對象 → NULL 應算作 10
+    db.commit()
+
+    result = list_sent_invitations(db=db, current_user=reseller)
+    by_id = {r["id"]: r for r in result}
+
+    full_row = by_id[inv.id]
+    assert full_row["signup_count"] == 0
+    assert full_row["signup_limit"] == 1
+
+    open_row = by_id[open_inv.id]
+    assert open_row["signup_count"] == 3
+    assert open_row["signup_limit"] == 10

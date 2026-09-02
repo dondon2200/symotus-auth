@@ -2,6 +2,7 @@
 相機邀請系統（連結式）
 Admin/Reseller 產生邀請連結 → 分享給任何人 → 點連結接受
 """
+import logging
 import secrets
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import or_, and_, func
@@ -21,6 +22,8 @@ from schemas import utc_iso
 from routers.auth import get_camera_token, _rate_limit
 
 router = APIRouter(prefix="/invitations", tags=["invitations"])
+
+logger = logging.getLogger(__name__)
 
 FRONTEND_URL = getattr(settings, "FRONTEND_URL", "https://user.symotus.com")
 
@@ -74,6 +77,11 @@ def create_invitation(
         raise HTTPException(400, "公開連結不需指定對象 Email")
     if body.permission_level == "full" and not invitee_email:
         raise HTTPException(400, "「全功能管理」分享必須指定對方 Email")
+    # 最終審查修正 2（M-3）：保留身分 email 要在建立當下就擋，不能等到 signup
+    # 才擋——否則分享者可以建一條指定 admin@timelapse.com 的 full 連結，
+    # 結果對方永遠建不了帳，連結形同永久卡死無法使用。
+    if invitee_email and _is_reserved_identity_email(invitee_email):
+        raise HTTPException(400, "此 Email 為平台保留身分，不可作為分享對象")
 
     # D4：全功能被分享者可再分享。reseller/symotus_admin 照舊放行；
     # 其他角色須持有此相機的「真分享」授權（granted_by 非本人）且等級允許 camera.share。
@@ -396,6 +404,12 @@ async def signup_via_invitation(
     db.commit()
 
     camera_tokens = await get_camera_token(user.id, user.email, user.role, user.camera_email)
+    if not camera_tokens:
+        # 建帳／授權／signup_count 都已 commit，這裡失敗只是少了 camera token；
+        # limit=1 的連結名額已被這次消耗掉、無法重試，至少留下痕跡方便事後追查。
+        logger.warning(
+            f"camera_invite_signup: get_camera_token 失敗，invitation_id={inv.id} 新帳號 user_id={user.id}"
+        )
     access_token = create_access_token(user, db)
     refresh = create_refresh_token()
     db.add(RefreshToken(user_id=user.id, token=refresh,
@@ -453,6 +467,8 @@ def list_sent_invitations(
             "permission_label": PERMISSION_LABELS.get(inv.permission_level, ""),
             "invitee_name": (invitee.full_name or invitee.username or invitee.email) if invitee else None,
             "expires_at": utc_iso(inv.expires_at),
+            "signup_count": inv.signup_count or 0,
+            "signup_limit": _signup_limit(inv),
         })
     return result
 
