@@ -85,3 +85,54 @@ def test_dedupe_is_per_invitee_email(db, reseller):
     assert a["token"] != b["token"]
     again = _create(db, reseller, "full", invitee_email="A@X.com")
     assert again["token"] == a["token"] and again.get("reused") is True
+
+
+from routers.invitations import _signup_limit, SIGNUP_LIMIT_DEFAULT
+
+
+def test_signup_limit_default_fallback():
+    """_signup_limit 將 None 視為 SIGNUP_LIMIT_DEFAULT（10）；有值則直接回傳。"""
+    inv_none = CameraInvitation(token="tok1", inviter_id=1, camera_id=7,
+                                permission_level="photos_stream", signup_limit=None)
+    assert _signup_limit(inv_none) == SIGNUP_LIMIT_DEFAULT
+    assert _signup_limit(inv_none) == 10
+
+    inv_value = CameraInvitation(token="tok2", inviter_id=1, camera_id=7,
+                                 permission_level="photos_stream", signup_limit=5)
+    assert _signup_limit(inv_value) == 5
+
+
+def test_dedupe_reuses_when_no_invitee_email(db, reseller):
+    """驗證 SQLAlchemy 將 invitee_email == None 轉譯為 IS NULL（非 = NULL）。
+
+    若此轉譯出錯（例如變成 = NULL），未指定對象的連結每次都會新建而不會 dedupe。
+    此測試確保：(1) 同 reseller、同相機、同模式、無指定對象，第二次回收舊連結；
+    (2) 回傳的 token 相同；(3) reused 為 True；(4) DB 裡只有一筆該相機該模式的連結。
+    """
+    # 第一次建立無指定對象的連結
+    first = _create(db, reseller, "photos_stream")
+    first_token = first["token"]
+    assert first.get("reused") != True  # 首次應該是新建
+
+    # 驗證 DB 中有一筆
+    count_1 = db.query(CameraInvitation).filter(
+        CameraInvitation.inviter_id == reseller.id,
+        CameraInvitation.camera_id == 7,
+        CameraInvitation.permission_level == "photos_stream",
+        CameraInvitation.invitee_email.is_(None),
+    ).count()
+    assert count_1 == 1
+
+    # 第二次建立相同條件的連結，應該回收第一次的
+    second = _create(db, reseller, "photos_stream")
+    assert second["token"] == first_token
+    assert second.get("reused") is True
+
+    # 驗證 DB 仍只有一筆（沒有新建）
+    count_2 = db.query(CameraInvitation).filter(
+        CameraInvitation.inviter_id == reseller.id,
+        CameraInvitation.camera_id == 7,
+        CameraInvitation.permission_level == "photos_stream",
+        CameraInvitation.invitee_email.is_(None),
+    ).count()
+    assert count_2 == 1
