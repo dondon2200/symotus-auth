@@ -69,6 +69,25 @@ class LineBindCode(Base):
     user = relationship("User")
 
 
+class LineBindSession(Base):
+    """LINE Login 一鍵綁定的一次性 session。
+
+    身分留在後端：手機掃描桌機顯示的 QR 時，不需要在手機上重新登入平台。
+    sid 等同憑證（持有者可把自己的 LINE 綁進該帳號），故 5 分鐘效期 + 單次使用。
+    不用記憶體 dict：綁定跨裝置、跨數分鐘，auth 容器有 mem_limit 且部署會重建，
+    state 一掉使用者就白掃一次 QR。"""
+    __tablename__ = "line_bind_sessions"
+
+    id = Column(Integer, primary_key=True)
+    sid = Column(String, nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
+
+
 class CameraAccess(Base):
     """相機存取授權"""
     """end_user 可以存取哪些相機（camera_id 對應現有後端的相機 ID）"""
