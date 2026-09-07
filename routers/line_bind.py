@@ -130,7 +130,8 @@ async def _exchange_code(code: str) -> dict | None:
                 "client_secret": settings.LINE_CLIENT_SECRET,
             })
             return r.json() if r.is_success else None
-    except Exception:
+    except Exception as e:
+        print(f"[line-bind] 交換 token 失敗: {e}")
         return None
 
 
@@ -142,7 +143,8 @@ async def _verify_id_token(id_token: str) -> dict | None:
             r = await c.post(LINE_VERIFY_URL, data={
                 "id_token": id_token, "client_id": settings.LINE_CHANNEL_ID})
             return r.json() if r.is_success else None
-    except Exception:
+    except Exception as e:
+        print(f"[line-bind] 驗證 id_token 失敗: {e}")
         return None
 
 
@@ -161,7 +163,8 @@ async def _friend_flag(access_token: str) -> bool | None:
             if not r.is_success:
                 return None
             return bool(r.json().get("friendFlag"))
-    except Exception:
+    except Exception as e:
+        print(f"[line-bind] 查詢好友狀態失敗: {e}")
         return None
 
 
@@ -170,8 +173,8 @@ async def _safe_push(line_user_id: str, text: str) -> None:
     讓例外冒出去會變成 500 頁，使用者以為失敗又無法重試（連結已作廢）。"""
     try:
         await line_push(line_user_id, [{"type": "text", "text": text}])
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[line-bind] 推播失敗: {e}")
 
 
 _ADD_FRIEND_BUTTON = """<a href="https://line.me/R/ti/p/{oa}" style="display:inline-block;

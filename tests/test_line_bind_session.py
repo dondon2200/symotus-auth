@@ -230,12 +230,65 @@ def test_callback_rejects_replayed_session(client, make_user, db, line_channel, 
 
 def test_callback_never_issues_login_token(client, make_user, db, line_channel, fake_line):
     """callback 只做綁定，絕不可發登入 token／建帳——這是本功能最重要的安全不變式。"""
-    from models import User
+    from models import RefreshToken, User
     user = make_user("cb9", "cb9@x.com", password="password123")
     row = _make_session(db, user)
     before = db.query(User).count()
-    r = client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    tokens_before = db.query(RefreshToken).count()
+    # follow_redirects=False：萬一哪天改成用 302 把 token 帶到前端 fragment，
+    # TestClient 預設會跟著轉址，讓下面的斷言看不到問題。
+    r = client.get(f"/auth/line/callback?code=xyz&state={row.sid}", follow_redirects=False)
     assert r.status_code == 200
     assert "access_token" not in r.text
     assert "set-cookie" not in {k.lower() for k in r.headers.keys()}
     assert db.query(User).count() == before
+    # 發登入 token 的典型副作用是同時寫一列 refresh token；沒增加才代表真的沒發。
+    assert db.query(RefreshToken).count() == tokens_before
+
+
+def test_callback_deactivates_other_binding_on_new_row(client, make_user, db,
+                                                        line_channel, fake_line):
+    """不變式：同一支 LINE（line_user_id）最多一列 is_active=True。
+
+    user A 已經用這支 LINE 綁定；user B 換綁同一支 LINE（B 原本沒有這支 LINE 的列，
+    所以走「新增列」路徑）。綁定完成後，A 那列必須被退位，只剩 B 是作用中，
+    否則 LINE AI 助理仍會以 A 的身分操作相機。
+    """
+    user_a = make_user("cbA1", "cbA1@x.com", password="password123")
+    user_b = make_user("cbB1", "cbB1@x.com", password="password123")
+    db.add(UserLineAccount(user_id=user_a.id, line_user_id="U-line-1",
+                           display_name="A", is_active=True))
+    db.commit()
+
+    row = _make_session(db, user_b)
+    r = client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    assert r.status_code == 200
+
+    db.expire_all()
+    rows = db.query(UserLineAccount).filter_by(line_user_id="U-line-1").all()
+    assert [x.user_id for x in rows if x.is_active] == [user_b.id]
+
+
+def test_callback_deactivates_other_binding_on_idempotent_path(client, make_user, db,
+                                                                line_channel, fake_line):
+    """不變式：同一支 LINE 最多一列 is_active=True，走冪等分支時也要成立。
+
+    user A 是目前的作用中帳號；user B 早已綁過同一支 LINE 但目前是非作用中。
+    B 再走一次 callback（B 已有列，進冪等分支），完成後只剩 B 是作用中，A 要被退位。
+    """
+    user_a = make_user("cbA2", "cbA2@x.com", password="password123")
+    user_b = make_user("cbB2", "cbB2@x.com", password="password123")
+    db.add(UserLineAccount(user_id=user_a.id, line_user_id="U-line-1",
+                           display_name="A", is_active=True))
+    db.add(UserLineAccount(user_id=user_b.id, line_user_id="U-line-1",
+                           display_name="B", is_active=False))
+    db.commit()
+
+    row = _make_session(db, user_b)
+    r = client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    assert r.status_code == 200
+    assert "已經綁定" in r.text
+
+    db.expire_all()
+    rows = db.query(UserLineAccount).filter_by(line_user_id="U-line-1").all()
+    assert [x.user_id for x in rows if x.is_active] == [user_b.id]
