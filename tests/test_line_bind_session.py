@@ -1,6 +1,7 @@
 """LINE Login 一鍵綁定：綁定 session 與 OAuth callback。"""
 import secrets
 from datetime import datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from config import settings
@@ -58,3 +59,39 @@ def test_bind_session_writes_audit_log(client, make_user, auth_headers, db, line
     assert row.target_id == user.id
     assert row.target_type == "user"
     assert row.detail == "line_bind_sessions"
+
+
+def _make_session(db, user, minutes=5, used=False):
+    row = LineBindSession(sid=secrets.token_urlsafe(8), user_id=user.id,
+                          expires_at=datetime.utcnow() + timedelta(minutes=minutes),
+                          used_at=datetime.utcnow() if used else None)
+    db.add(row)
+    db.commit()
+    return row
+
+
+def test_bind_start_redirects_to_line(client, make_user, db, line_channel):
+    user = make_user("bs3", "bs3@x.com", password="password123")
+    row = _make_session(db, user)
+    r = client.get(f"/auth/line/bind-start?s={row.sid}", follow_redirects=False)
+    assert r.status_code == 302
+    q = parse_qs(urlparse(r.headers["location"]).query)
+    assert q["response_type"] == ["code"]
+    assert q["client_id"] == ["2010000000"]
+    assert q["state"] == [row.sid]
+    assert q["scope"] == ["profile openid"]
+    assert q["bot_prompt"] == ["aggressive"]
+
+
+def test_bind_start_rejects_expired(client, make_user, db, line_channel):
+    user = make_user("bs4", "bs4@x.com", password="password123")
+    row = _make_session(db, user, minutes=-1)
+    r = client.get(f"/auth/line/bind-start?s={row.sid}", follow_redirects=False)
+    assert r.status_code == 200 and "已失效" in r.text
+
+
+def test_bind_start_rejects_used(client, make_user, db, line_channel):
+    user = make_user("bs5", "bs5@x.com", password="password123")
+    row = _make_session(db, user, used=True)
+    r = client.get(f"/auth/line/bind-start?s={row.sid}", follow_redirects=False)
+    assert r.status_code == 200 and "已失效" in r.text

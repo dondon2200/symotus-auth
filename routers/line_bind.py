@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -52,3 +53,51 @@ def create_bind_session(request: Request, db: Session = Depends(get_db),
         "bind_url": f"{settings.PUBLIC_BASE_URL}/auth/line/bind-start?s={sid}",
         "expires_at": row.expires_at.isoformat() + "Z",
     }
+
+
+LINE_AUTHORIZE_URL = "https://access.line.me/oauth2/v2.1/authorize"
+
+
+def _page(title: str, body: str, extra_html: str = "") -> HTMLResponse:
+    """綁定流程的結果頁。使用者是在 LINE 內建瀏覽器看這一頁，越簡單越好。"""
+    return HTMLResponse(f"""<!doctype html><html lang="zh-Hant"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title></head>
+<body style="margin:0;font-family:system-ui,-apple-system,'Noto Sans TC',sans-serif;
+background:#131313;color:#e5e2e1;display:flex;min-height:100vh;align-items:center;
+justify-content:center;padding:24px;">
+<div style="max-width:420px;text-align:center;">
+<h1 style="font-size:20px;margin:0 0 12px;">{title}</h1>
+<p style="font-size:14px;line-height:1.7;color:#a78b7d;margin:0;">{body}</p>
+{extra_html}</div></body></html>""")
+
+
+def _load_session(db: Session, sid: str) -> LineBindSession | None:
+    """只回傳未使用且未過期的 session。"""
+    if not sid:
+        return None
+    return (db.query(LineBindSession)
+              .filter(LineBindSession.sid == sid,
+                      LineBindSession.used_at == None,   # noqa: E711
+                      LineBindSession.expires_at > datetime.utcnow())
+              .first())
+
+
+@router.get("/line/bind-start")
+def line_bind_start(s: str = "", db: Session = Depends(get_db)):
+    """使用者（或掃 QR 的手機）開啟的入口：驗證 session 後轉去 LINE 授權。
+    刻意不需要 JWT——手機掃桌機的 QR 時沒有登入態，身分是靠 sid 帶的。"""
+    if not _login_channel_ready():
+        return _page("尚未啟用", "系統尚未啟用 LINE 一鍵綁定，請改用個人設定頁的綁定碼流程。")
+    row = _load_session(db, s)
+    if row is None:
+        return _page("連結已失效", "這個綁定連結已過期或已使用過，請回到網頁「個人設定」重新產生。")
+    params = {
+        "response_type": "code",
+        "client_id": settings.LINE_CHANNEL_ID,
+        "redirect_uri": settings.LINE_REDIRECT_URI,
+        "state": row.sid,
+        "scope": "profile openid",
+        "bot_prompt": "aggressive",
+    }
+    return RedirectResponse(f"{LINE_AUTHORIZE_URL}?{urlencode(params)}", status_code=302)
