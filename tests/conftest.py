@@ -28,6 +28,7 @@ from models import (
 )
 from auth import hash_password, create_access_token
 from routers.auth import router as auth_router
+from routers.line_bind import router as line_bind_router
 
 _TABLES = [
     User.__table__, RefreshToken.__table__, AuditLog.__table__, CameraAccess.__table__,
@@ -54,6 +55,7 @@ def db():
 def app():
     a = FastAPI()
     a.include_router(auth_router)
+    a.include_router(line_bind_router)
     return a
 
 

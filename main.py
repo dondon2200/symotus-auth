@@ -458,7 +458,7 @@ async def shutdown():
         logger.warning(f"shutdown_gdrive_jobs: {e}")
 
 
-from routers import auth, invites, users, support, admin, jobs, cameras, line_webhook, invitations, public_camera, billing
+from routers import auth, invites, users, support, admin, jobs, cameras, line_webhook, invitations, public_camera, billing, line_bind
 app.include_router(auth.router)
 app.include_router(invites.router)
 app.include_router(users.router)
@@ -473,6 +473,7 @@ app.include_router(public_camera.router)  # 必須在 cameras 前（避免 /{cam
 app.include_router(cameras.router)
 app.include_router(line_webhook.router)
 app.include_router(invitations.router)
+app.include_router(line_bind.router)
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
