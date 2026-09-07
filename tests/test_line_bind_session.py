@@ -112,3 +112,108 @@ def test_page_does_not_escape_extra_html():
     import routers.line_bind as lb
     r = lb._page("標題", "內文", '<a href="https://line.me/x">加好友</a>')
     assert '<a href="https://line.me/x">' in r.body.decode()
+
+
+from models import UserLineAccount
+import routers.line_bind as lb
+
+
+@pytest.fixture()
+def fake_line(monkeypatch):
+    """把三個對外 HTTP 呼叫換成可控假物件，並攔截推播。"""
+    sent = []
+
+    async def _exchange(code):
+        return {"access_token": "at-" + code, "id_token": "idt-" + code}
+
+    async def _verify(id_token):
+        return {"sub": "U-line-1", "name": "測試員", "picture": "https://p/1.jpg"}
+
+    async def _friend(access_token):
+        return True
+
+    async def _push(user_id, messages):
+        sent.append((user_id, messages))
+
+    monkeypatch.setattr(lb, "_exchange_code", _exchange)
+    monkeypatch.setattr(lb, "_verify_id_token", _verify)
+    monkeypatch.setattr(lb, "_friend_flag", _friend)
+    monkeypatch.setattr(lb, "line_push", _push)
+    return sent
+
+
+def test_callback_binds_account(client, make_user, db, line_channel, fake_line):
+    user = make_user("cb1", "cb1@x.com", password="password123")
+    row = _make_session(db, user)
+    r = client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    assert r.status_code == 200 and "已綁定" in r.text
+    acc = db.query(UserLineAccount).filter_by(user_id=user.id).one()
+    assert acc.line_user_id == "U-line-1"
+    assert acc.display_name == "測試員" and acc.is_active is True
+    db.refresh(row)
+    assert row.used_at is not None
+
+
+def test_callback_is_idempotent(client, make_user, db, line_channel, fake_line):
+    user = make_user("cb2", "cb2@x.com", password="password123")
+    db.add(UserLineAccount(user_id=user.id, line_user_id="U-line-1",
+                           display_name="舊名字", is_active=True))
+    db.commit()
+    row = _make_session(db, user)
+    r = client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    assert r.status_code == 200 and "已經綁定" in r.text
+    assert db.query(UserLineAccount).filter_by(user_id=user.id).count() == 1
+
+
+def test_callback_rejects_bad_state(client, make_user, db, line_channel, fake_line):
+    make_user("cb3", "cb3@x.com", password="password123")
+    r = client.get("/auth/line/callback?code=xyz&state=not-a-real-sid")
+    assert r.status_code == 200 and "已失效" in r.text
+    assert db.query(UserLineAccount).count() == 0
+
+
+def test_callback_warns_when_not_friend(client, make_user, db, line_channel,
+                                        fake_line, monkeypatch):
+    async def _not_friend(access_token):
+        return False
+    monkeypatch.setattr(lb, "_friend_flag", _not_friend)
+    user = make_user("cb4", "cb4@x.com", password="password123")
+    row = _make_session(db, user)
+    r = client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    assert "還差一步" in r.text
+    assert db.query(UserLineAccount).filter_by(user_id=user.id).count() == 1
+    assert fake_line == []          # 非好友不推播
+
+
+def test_callback_unknown_friendship_still_succeeds(client, make_user, db, line_channel,
+                                                    fake_line, monkeypatch):
+    """查不到好友狀態（Login channel 未連結官方帳號）不能當成「不是好友」，
+    否則連早就加過好友的人都會看到警告。"""
+    async def _unknown(access_token):
+        return None
+    monkeypatch.setattr(lb, "_friend_flag", _unknown)
+    user = make_user("cb7", "cb7@x.com", password="password123")
+    row = _make_session(db, user)
+    r = client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    assert "已綁定完成" in r.text and "還差一步" not in r.text
+    assert "沒有收到" in r.text                      # 附上補救提示
+    assert [t for t, _ in fake_line] == ["U-line-1"]  # 仍然推播歡迎訊息
+
+
+def test_callback_notifies_existing_recipients(client, make_user, db, line_channel, fake_line):
+    user = make_user("cb5", "cb5@x.com", password="password123")
+    db.add(UserLineAccount(user_id=user.id, line_user_id="U-existing",
+                           display_name="同事", is_active=True))
+    db.commit()
+    row = _make_session(db, user)
+    client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    targets = [t for t, _ in fake_line]
+    assert "U-line-1" in targets and "U-existing" in targets
+
+
+def test_callback_user_cancelled(client, make_user, db, line_channel, fake_line):
+    user = make_user("cb6", "cb6@x.com", password="password123")
+    row = _make_session(db, user)
+    r = client.get(f"/auth/line/callback?error=access_denied&state={row.sid}")
+    assert "未完成" in r.text
+    assert db.query(UserLineAccount).count() == 0

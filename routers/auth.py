@@ -350,12 +350,6 @@ def line_url(response: Response, invite_token: str = None):
     """已停用：LINE 登入關閉，OAuth 只保留 /line/bind-url 綁定流程。"""
     raise HTTPException(410, "第三方登入已停用")
 
-@router.get("/line/bind-url")
-def line_bind_url(current_user: User = Depends(get_current_user)):
-    """已停用：LINE 綁定改用官方帳號綁定碼流程（見 POST /auth/me/line/bind-code）——
-    使用者加官方帳號好友後在聊天輸入綁定碼，由 webhook 完成綁定，不再走 LINE OAuth 授權連結。"""
-    raise HTTPException(410, "LINE 綁定已改用官方帳號綁定碼流程")
-
 @router.post("/line/token", response_model=TokenResponse)
 async def line_token(body: OAuthCallbackRequest, request: Request, db: Session = Depends(get_db)):
     """已停用：LINE 登入關閉，OAuth 只保留 /line/bind-url 綁定流程。"""
@@ -460,9 +454,3 @@ async def register(body: UserCreateInternal, request: Request, db: Session = Dep
         camera_refresh_token=camera_tokens.get("refresh_token"),
     )
 
-
-@router.get("/line/callback")
-async def line_callback(code: str, state: str = "", request: Request = None, db: Session = Depends(get_db)):
-    """已停用：LINE 登入與 LINE 綁定的 OAuth callback 一併停用——
-    綁定改用官方帳號綁定碼流程（見 POST /auth/me/line/bind-code），登入僅剩帳密。"""
-    raise HTTPException(410, "LINE 綁定已改用官方帳號綁定碼流程")
