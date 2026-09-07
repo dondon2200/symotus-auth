@@ -258,3 +258,19 @@ async def line_bind_callback(code: str = "", state: str = "", error: str = "",
                  f"帳號 {user.username} 之後會把相機通知送到這支 LINE。"
                  f"若你沒有收到我們剛送出的歡迎訊息，代表還沒加入官方帳號好友，請按下方按鈕。",
                  add_friend)
+
+
+@router.get("/line/bind-session/{sid}")
+def poll_bind_session(sid: str, db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)):
+    """桌機頁面輪詢用。限建立者本人查詢，避免以 sid 探測他人綁定進度。"""
+    row = db.query(LineBindSession).filter(
+        LineBindSession.sid == sid,
+        LineBindSession.user_id == current_user.id).first()
+    if row is None:
+        raise HTTPException(404, "找不到綁定連結")
+    if row.used_at is not None:
+        return {"status": "done"}
+    if row.expires_at <= datetime.utcnow():
+        return {"status": "expired"}
+    return {"status": "pending"}

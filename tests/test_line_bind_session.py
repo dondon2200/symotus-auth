@@ -292,3 +292,41 @@ def test_callback_deactivates_other_binding_on_idempotent_path(client, make_user
     db.expire_all()
     rows = db.query(UserLineAccount).filter_by(line_user_id="U-line-1").all()
     assert [x.user_id for x in rows if x.is_active] == [user_b.id]
+
+
+def test_poll_pending_then_done(client, make_user, auth_headers, db, line_channel, fake_line):
+    """輪詢 session 狀態：pending → done"""
+    user = make_user("pl1", "pl1@x.com", password="password123")
+    row = _make_session(db, user)
+    r1 = client.get(f"/auth/line/bind-session/{row.sid}", headers=auth_headers(user))
+    assert r1.json()["status"] == "pending"
+    client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    r2 = client.get(f"/auth/line/bind-session/{row.sid}", headers=auth_headers(user))
+    assert r2.json()["status"] == "done"
+
+
+def test_poll_expired(client, make_user, auth_headers, db, line_channel):
+    """輪詢過期的 session 回傳 expired"""
+    user = make_user("pl2", "pl2@x.com", password="password123")
+    row = _make_session(db, user, minutes=-1)
+    r = client.get(f"/auth/line/bind-session/{row.sid}", headers=auth_headers(user))
+    assert r.json()["status"] == "expired"
+
+
+def test_poll_other_users_session_is_404(client, make_user, auth_headers, db, line_channel):
+    """其他使用者無法查詢他人的 session，回傳 404"""
+    owner = make_user("pl3", "pl3@x.com", password="password123")
+    nosy = make_user("pl4", "pl4@x.com", password="password123")
+    row = _make_session(db, owner)
+    r = client.get(f"/auth/line/bind-session/{row.sid}", headers=auth_headers(nosy))
+    assert r.status_code == 404
+
+
+def test_me_includes_picture_url(client, make_user, auth_headers, db):
+    """測試 /auth/me 回傳 line_accounts 包含 picture_url"""
+    user = make_user("pl5", "pl5@x.com", password="password123")
+    db.add(UserLineAccount(user_id=user.id, line_user_id="U-pic",
+                           display_name="有頭貼", picture_url="https://p/x.jpg"))
+    db.commit()
+    body = client.get("/auth/me", headers=auth_headers(user)).json()
+    assert body["line_accounts"][0]["picture_url"] == "https://p/x.jpg"

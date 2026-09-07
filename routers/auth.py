@@ -157,6 +157,7 @@ def _me_payload(user: User) -> dict:
     """/auth/me 系列端點共用的使用者序列化。"""
     line_accounts = [
         {"id": a.id, "display_name": a.display_name,
+         "picture_url": a.picture_url,
          "created_at": a.created_at.isoformat() if a.created_at else None}
         for a in user.line_accounts
     ]
