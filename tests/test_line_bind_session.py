@@ -47,3 +47,14 @@ def test_bind_session_501_without_channel(client, make_user, auth_headers, monke
     user = make_user("bs2", "bs2@x.com", password="password123")
     r = client.post("/auth/me/line/bind-session", headers=auth_headers(user))
     assert r.status_code == 501
+
+
+def test_bind_session_writes_audit_log(client, make_user, auth_headers, db, line_channel):
+    from models import AuditLog
+    user = make_user("bs6", "bs6@x.com", password="password123")
+    client.post("/auth/me/line/bind-session", headers=auth_headers(user))
+    row = db.query(AuditLog).filter(AuditLog.action == "self_line_bind_session").one()
+    assert row.actor_id == user.id
+    assert row.target_id == user.id
+    assert row.target_type == "user"
+    assert row.detail == "line_bind_sessions"

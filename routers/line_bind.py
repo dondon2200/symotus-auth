@@ -16,6 +16,7 @@ from database import get_db
 from models import User, LineBindSession
 from auth import get_current_user
 from config import settings
+from audit import log_action
 from routers.auth import _rate_limit
 
 router = APIRouter(prefix="/auth", tags=["line-bind"])
@@ -42,6 +43,9 @@ def create_bind_session(request: Request, db: Session = Depends(get_db),
         sid=sid, user_id=current_user.id,
         expires_at=datetime.utcnow() + timedelta(minutes=BIND_SESSION_TTL_MINUTES))
     db.add(row)
+    # 比照 create_line_bind_code：這個端點發出的是「能把 LINE 綁進本帳號」的憑證，要留稽核軌跡
+    log_action(db, current_user, "self_line_bind_session", "user", current_user.id,
+               "line_bind_sessions")
     db.commit()
     return {
         "sid": sid,
