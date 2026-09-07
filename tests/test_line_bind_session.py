@@ -217,3 +217,25 @@ def test_callback_user_cancelled(client, make_user, db, line_channel, fake_line)
     r = client.get(f"/auth/line/callback?error=access_denied&state={row.sid}")
     assert "未完成" in r.text
     assert db.query(UserLineAccount).count() == 0
+
+
+def test_callback_rejects_replayed_session(client, make_user, db, line_channel, fake_line):
+    """session 的 used_at 機制核心不變式：已用過的連結重放要顯示已失效，不能再次綁定。"""
+    user = make_user("cb8", "cb8@x.com", password="password123")
+    row = _make_session(db, user, used=True)
+    r = client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    assert r.status_code == 200 and "已失效" in r.text
+    assert db.query(UserLineAccount).count() == 0
+
+
+def test_callback_never_issues_login_token(client, make_user, db, line_channel, fake_line):
+    """callback 只做綁定，絕不可發登入 token／建帳——這是本功能最重要的安全不變式。"""
+    from models import User
+    user = make_user("cb9", "cb9@x.com", password="password123")
+    row = _make_session(db, user)
+    before = db.query(User).count()
+    r = client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    assert r.status_code == 200
+    assert "access_token" not in r.text
+    assert "set-cookie" not in {k.lower() for k in r.headers.keys()}
+    assert db.query(User).count() == before

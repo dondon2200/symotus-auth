@@ -21,7 +21,7 @@ from auth import get_current_user
 from config import settings
 from audit import log_action
 from routers.auth import _rate_limit
-from routers.line_webhook import line_push
+from routers.line_webhook import line_push, _clear_history
 
 router = APIRouter(prefix="/auth", tags=["line-bind"])
 
@@ -118,26 +118,35 @@ LINE_VERIFY_URL = "https://api.line.me/oauth2/v2.1/verify"
 LINE_FRIENDSHIP_URL = "https://api.line.me/friendship/v1/status"
 
 
+# 連線逾時／DNS 失敗／回應非 JSON 都要回 None 讓上層顯示結果頁，不能讓例外變成 500
 async def _exchange_code(code: str) -> dict | None:
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.post(LINE_TOKEN_URL, data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": settings.LINE_REDIRECT_URI,
-            "client_id": settings.LINE_CHANNEL_ID,
-            "client_secret": settings.LINE_CLIENT_SECRET,
-        })
-        return r.json() if r.is_success else None
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(LINE_TOKEN_URL, data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": settings.LINE_REDIRECT_URI,
+                "client_id": settings.LINE_CHANNEL_ID,
+                "client_secret": settings.LINE_CLIENT_SECRET,
+            })
+            return r.json() if r.is_success else None
+    except Exception:
+        return None
 
 
+# 連線逾時／DNS 失敗／回應非 JSON 都要回 None 讓上層顯示結果頁，不能讓例外變成 500
 async def _verify_id_token(id_token: str) -> dict | None:
     """web login 的 id_token 是 HS256，不自行驗簽，交給 LINE 的 verify 端點。"""
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.post(LINE_VERIFY_URL, data={
-            "id_token": id_token, "client_id": settings.LINE_CHANNEL_ID})
-        return r.json() if r.is_success else None
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(LINE_VERIFY_URL, data={
+                "id_token": id_token, "client_id": settings.LINE_CHANNEL_ID})
+            return r.json() if r.is_success else None
+    except Exception:
+        return None
 
 
+# 連線逾時／DNS 失敗／回應非 JSON 都要回 None（符合本函式的三態語意），不能讓例外變成 500
 async def _friend_flag(access_token: str) -> bool | None:
     """是否已加官方帳號好友。沒加好友就收不到任何推播，必須主動查而不是靠推播失敗推論。
 
@@ -145,12 +154,24 @@ async def _friend_flag(access_token: str) -> bool | None:
     None 的主因是 Login channel 沒有連結官方帳號（此 API 需要連結才有意義）。
     這種情況不能當成「不是好友」——否則連早就加過好友的人都會看到警告。
     """
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.get(LINE_FRIENDSHIP_URL,
-                        headers={"Authorization": f"Bearer {access_token}"})
-        if not r.is_success:
-            return None
-        return bool(r.json().get("friendFlag"))
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(LINE_FRIENDSHIP_URL,
+                            headers={"Authorization": f"Bearer {access_token}"})
+            if not r.is_success:
+                return None
+            return bool(r.json().get("friendFlag"))
+    except Exception:
+        return None
+
+
+async def _safe_push(line_user_id: str, text: str) -> None:
+    """推播失敗不得影響已完成的綁定：此時資料已寫入、session 已消耗，
+    讓例外冒出去會變成 500 頁，使用者以為失敗又無法重試（連結已作廢）。"""
+    try:
+        await line_push(line_user_id, [{"type": "text", "text": text}])
+    except Exception:
+        pass
 
 
 _ADD_FRIEND_BUTTON = """<a href="https://line.me/R/ti/p/{oa}" style="display:inline-block;
@@ -178,20 +199,25 @@ async def line_bind_callback(code: str = "", state: str = "", error: str = "",
 
     row.used_at = datetime.utcnow()
     user = row.user
-    existing = db.query(UserLineAccount).filter_by(
-        user_id=user.id, line_user_id=line_user_id).first()
     others = [a.line_user_id for a in user.line_accounts
               if a.line_user_id != line_user_id]
 
+    # 同一支 LINE 的其他綁定退為非作用中（AI 助理的「作用中帳號」語意，通知不看此欄位）。
+    # 必須在判斷 existing 之前做：否則冪等路徑只把本列設 True，舊帳號那列仍是 True，
+    # line_webhook._resolve_user 取 id 最小的作用中列 → 使用者剛綁定 B 卻仍以 A 身分操作。
+    # 順序比照 routers/line_webhook.py 綁定碼流程。
+    db.query(UserLineAccount).filter(
+        UserLineAccount.line_user_id == line_user_id).update({"is_active": False})
+
+    existing = db.query(UserLineAccount).filter_by(
+        user_id=user.id, line_user_id=line_user_id).first()
     if existing:
         existing.is_active = True
         db.commit()
+        _clear_history(line_user_id)   # 作用中帳號變了，AI 對話歷史不能沿用舊帳號的
         return _page("已經綁定過了",
                      f"這支 LINE 已經綁在帳號 {user.username}，不需要重複綁定。可以關閉此頁。")
 
-    # 同一支 LINE 的其他綁定退為非作用中（AI 助理的「作用中帳號」語意，通知不看此欄位）
-    db.query(UserLineAccount).filter(
-        UserLineAccount.line_user_id == line_user_id).update({"is_active": False})
     db.add(UserLineAccount(
         user_id=user.id, line_user_id=line_user_id,
         display_name=(claims or {}).get("name"),
@@ -199,10 +225,17 @@ async def line_bind_callback(code: str = "", state: str = "", error: str = "",
         is_active=True))
     log_action(db, user, "self_link_line", "user", user.id, "line_id")
     db.commit()
+    _clear_history(line_user_id)   # 作用中帳號變了，AI 對話歷史不能沿用舊帳號的
 
     oa = settings.LINE_OA_BASIC_ID or ""
     add_friend = _ADD_FRIEND_BUTTON.format(oa=oa) if oa else ""
     is_friend = await _friend_flag(tokens.get("access_token", ""))
+
+    # 知會同帳號既有的其他接收人。綁定此刻已經完成，所以不論新綁定者自己是不是好友
+    # 都要通知——這是共用帳號的安全知會，不該因為對方沒加好友就消失。
+    display = (claims or {}).get("name") or "一位成員"
+    for other in others:
+        await _safe_push(other, f"提醒：{display} 剛剛綁定了帳號 {user.username} 的 LINE 通知。")
 
     if is_friend is False:      # 明確不是好友，才擋下來提醒
         return _page("還差一步",
@@ -211,13 +244,9 @@ async def line_bind_callback(code: str = "", state: str = "", error: str = "",
 
     # True 或 None 都照成功走。None＝查不到好友狀態（多半是 Login channel 未連結
     # 官方帳號），此時推播可能靜默失敗，故成功頁附上「沒收到訊息就是還沒加好友」的提示。
-    await line_push(line_user_id, [{"type": "text", "text":
+    await _safe_push(line_user_id,
         f"✅ 綁定成功！目前作用帳號：{user.username}\n"
-        f"AI 助理已可直接使用；相機開機通知還需到網頁「通知設定」逐台開啟訂閱。"}])
-    display = (claims or {}).get("name") or "一位成員"
-    for other in others:
-        await line_push(other, [{"type": "text", "text":
-            f"提醒：{display} 剛剛綁定了帳號 {user.username} 的 LINE 通知。"}])
+        f"AI 助理已可直接使用；相機開機通知還需到網頁「通知設定」逐台開啟訂閱。")
 
     if is_friend is True:
         return _page("✅ 已綁定完成",

@@ -347,12 +347,12 @@ async def link_google(body: OAuthCallbackRequest, db: Session = Depends(get_db),
 
 @router.get("/line/url")
 def line_url(response: Response, invite_token: str = None):
-    """已停用：LINE 登入關閉，OAuth 只保留 /line/bind-url 綁定流程。"""
+    """已停用：LINE 登入關閉，綁定改走 /auth/line/bind-start 一鍵綁定流程。"""
     raise HTTPException(410, "第三方登入已停用")
 
 @router.post("/line/token", response_model=TokenResponse)
 async def line_token(body: OAuthCallbackRequest, request: Request, db: Session = Depends(get_db)):
-    """已停用：LINE 登入關閉，OAuth 只保留 /line/bind-url 綁定流程。"""
+    """已停用：LINE 登入關閉，綁定改走 /auth/line/bind-start 一鍵綁定流程。"""
     raise HTTPException(410, "第三方登入已停用")
 
 
