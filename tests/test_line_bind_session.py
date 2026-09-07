@@ -95,3 +95,20 @@ def test_bind_start_rejects_used(client, make_user, db, line_channel):
     row = _make_session(db, user, used=True)
     r = client.get(f"/auth/line/bind-start?s={row.sid}", follow_redirects=False)
     assert r.status_code == 200 and "已失效" in r.text
+
+
+def test_page_escapes_user_content():
+    """title/body 可能含使用者可控的顯示名稱，必須轉義。"""
+    import routers.line_bind as lb
+    r = lb._page("<script>x</script>", "名字是 <img src=x onerror=alert(1)>")
+    text = r.body.decode()
+    assert "<script>x</script>" not in text
+    assert "&lt;script&gt;" in text
+    assert "<img src=x" not in text
+
+
+def test_page_does_not_escape_extra_html():
+    """extra_html 是刻意允許的 HTML 片段（加好友按鈕），不可被轉義掉。"""
+    import routers.line_bind as lb
+    r = lb._page("標題", "內文", '<a href="https://line.me/x">加好友</a>')
+    assert '<a href="https://line.me/x">' in r.body.decode()

@@ -5,6 +5,7 @@
 → LINE 回 /auth/line/callback → 寫入 user_line_accounts。
 既有的官方帳號綁定碼流程（routers/auth.py + line_webhook）完整保留為備援。
 """
+import html
 import secrets
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
@@ -59,16 +60,23 @@ LINE_AUTHORIZE_URL = "https://access.line.me/oauth2/v2.1/authorize"
 
 
 def _page(title: str, body: str, extra_html: str = "") -> HTMLResponse:
-    """綁定流程的結果頁。使用者是在 LINE 內建瀏覽器看這一頁，越簡單越好。"""
+    """綁定流程的結果頁。使用者是在 LINE 內建瀏覽器看這一頁，越簡單越好。
+
+    title/body 一律經 HTML 轉義：後續任務會把帳號名稱與 LINE 顯示名稱（使用者完全可控）
+    帶進來，不轉義就是 XSS。extra_html 刻意不轉義，呼叫者必須自行確保安全
+    （目前僅用於程式內寫死的加好友按鈕）。
+    """
+    safe_title = html.escape(title)
+    safe_body = html.escape(body)
     return HTMLResponse(f"""<!doctype html><html lang="zh-Hant"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title></head>
+<title>{safe_title}</title></head>
 <body style="margin:0;font-family:system-ui,-apple-system,'Noto Sans TC',sans-serif;
 background:#131313;color:#e5e2e1;display:flex;min-height:100vh;align-items:center;
 justify-content:center;padding:24px;">
 <div style="max-width:420px;text-align:center;">
-<h1 style="font-size:20px;margin:0 0 12px;">{title}</h1>
-<p style="font-size:14px;line-height:1.7;color:#a78b7d;margin:0;">{body}</p>
+<h1 style="font-size:20px;margin:0 0 12px;">{safe_title}</h1>
+<p style="font-size:14px;line-height:1.7;color:#a78b7d;margin:0;">{safe_body}</p>
 {extra_html}</div></body></html>""")
 
 
