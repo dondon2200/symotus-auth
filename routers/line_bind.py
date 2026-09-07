@@ -21,7 +21,7 @@ from auth import get_current_user
 from config import settings
 from audit import log_action
 from routers.auth import _rate_limit
-from routers.line_webhook import line_push, _clear_history
+from routers.line_webhook import LINE_PUSH_URL, LINE_HEADERS, _clear_history
 
 router = APIRouter(prefix="/auth", tags=["line-bind"])
 
@@ -29,10 +29,17 @@ BIND_SESSION_TTL_MINUTES = 5
 
 
 def _login_channel_ready() -> bool:
-    """Login channel 三個變數齊備才算可用；缺任一項就讓前端退回綁定碼流程。"""
+    """Login channel 三個設定齊備才算可用；缺任一項就讓前端退回綁定碼流程。
+
+    刻意檢查 LINE_LOGIN_CHANNEL_SECRET 而非 settings.LINE_CLIENT_SECRET——後者是
+    別名，會 fallback 到 Messaging API 的 LINE_CHANNEL_SECRET（正式環境本來就有值），
+    用它判斷會讓 501 備援永遠不觸發。
+    LINE_REDIRECT_URI 必須指向本服務，否則殘留的舊值會讓授權導回別的網域。
+    """
     return bool(settings.LINE_CHANNEL_ID
-                and settings.LINE_CLIENT_SECRET
-                and settings.LINE_REDIRECT_URI)
+                and settings.LINE_LOGIN_CHANNEL_SECRET
+                and settings.LINE_REDIRECT_URI
+                and settings.LINE_REDIRECT_URI.startswith(settings.PUBLIC_BASE_URL))
 
 
 @router.post("/me/line/bind-session")
@@ -43,6 +50,8 @@ def create_bind_session(request: Request, db: Session = Depends(get_db),
         raise HTTPException(501, "尚未啟用 LINE 一鍵綁定")
     _rate_limit(request, "line_bind_session", 10)
     sid = secrets.token_urlsafe(32)
+    # 比照 create_line_bind_code：產新連結即作廢本人舊連結，避免同時存在多張有效憑證
+    db.query(LineBindSession).filter(LineBindSession.user_id == current_user.id).delete()
     row = LineBindSession(
         sid=sid, user_id=current_user.id,
         expires_at=datetime.utcnow() + timedelta(minutes=BIND_SESSION_TTL_MINUTES))
@@ -168,13 +177,25 @@ async def _friend_flag(access_token: str) -> bool | None:
         return None
 
 
-async def _safe_push(line_user_id: str, text: str) -> None:
-    """推播失敗不得影響已完成的綁定：此時資料已寫入、session 已消耗，
-    讓例外冒出去會變成 500 頁，使用者以為失敗又無法重試（連結已作廢）。"""
+async def _safe_push(line_user_id: str, text: str) -> bool:
+    """送出推播並回報是否真的送達。
+
+    回 False 代表 LINE 拒收——最常見的原因是使用者沒加官方帳號好友，
+    但也可能是 Login channel 與官方帳號不在同一個 Provider（userId 對 Messaging API
+    無效）。這種情況下綁定會寫入成功卻永遠收不到通知，是最難查的失敗模式，
+    所以必須讓呼叫端有機會據此提示使用者，不能靜默吞掉。
+    推播失敗本身不得影響已完成的綁定，故仍不讓例外冒出去。
+    """
     try:
-        await line_push(line_user_id, [{"type": "text", "text": text}])
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(LINE_PUSH_URL, headers=LINE_HEADERS,
+                             json={"to": line_user_id, "messages": [{"type": "text", "text": text}]})
+            if not r.is_success:
+                print(f"[line-bind] 推播遭拒 status={r.status_code}")
+            return r.is_success
     except Exception as e:
         print(f"[line-bind] 推播失敗: {e}")
+        return False
 
 
 _ADD_FRIEND_BUTTON = """<a href="https://line.me/R/ti/p/{oa}" style="display:inline-block;
@@ -240,16 +261,22 @@ async def line_bind_callback(code: str = "", state: str = "", error: str = "",
     for other in others:
         await _safe_push(other, f"提醒：{display} 剛剛綁定了帳號 {user.username} 的 LINE 通知。")
 
-    if is_friend is False:      # 明確不是好友，才擋下來提醒
+    if is_friend is False:      # 明確不是好友，才擋下來提醒；不論之後推播是否送達都不受影響
         return _page("還差一步",
                      "綁定已完成，但你還沒有加入我們的官方帳號好友——沒加好友就收不到任何通知。",
                      add_friend)
 
-    # True 或 None 都照成功走。None＝查不到好友狀態（多半是 Login channel 未連結
-    # 官方帳號），此時推播可能靜默失敗，故成功頁附上「沒收到訊息就是還沒加好友」的提示。
-    await _safe_push(line_user_id,
+    # True 或 None 都先照成功走，實際是否送達交給 delivered 判斷。None＝查不到好友狀態
+    # （多半是 Login channel 未連結官方帳號），此時推播可能靜默失敗，故用 delivered 把關。
+    delivered = await _safe_push(line_user_id,
         f"✅ 綁定成功！目前作用帳號：{user.username}\n"
         f"AI 助理已可直接使用；相機開機通知還需到網頁「通知設定」逐台開啟訂閱。")
+
+    if not delivered:
+        return _page("已綁定，但通知目前送不出去",
+                     f"帳號 {user.username} 已經綁定這支 LINE，但我們剛才送出的訊息被 LINE 拒收了。"
+                     f"請先確認已加入官方帳號好友；若已加好友仍收不到，請聯絡管理員協助檢查設定。",
+                     add_friend)
 
     if is_friend is True:
         return _page("✅ 已綁定完成",

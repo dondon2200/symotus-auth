@@ -39,6 +39,19 @@ def test_create_bind_session(client, make_user, auth_headers, db, line_channel):
     assert (row.expires_at - datetime.utcnow()).total_seconds() > 4 * 60
 
 
+def test_create_bind_session_invalidates_previous(client, make_user, auth_headers, db, line_channel):
+    """比照 create_line_bind_code：產新連結即作廢本人舊連結，同一使用者只留最新一張。"""
+    user = make_user("bs9", "bs9@x.com", password="password123")
+    r1 = client.post("/auth/me/line/bind-session", headers=auth_headers(user))
+    sid1 = r1.json()["sid"]
+    r2 = client.post("/auth/me/line/bind-session", headers=auth_headers(user))
+    sid2 = r2.json()["sid"]
+    assert sid1 != sid2
+    rows = db.query(LineBindSession).filter_by(user_id=user.id).all()
+    assert len(rows) == 1
+    assert rows[0].sid == sid2
+
+
 def test_bind_session_requires_auth(client):
     assert client.post("/auth/me/line/bind-session").status_code in (401, 403)
 
@@ -46,6 +59,29 @@ def test_bind_session_requires_auth(client):
 def test_bind_session_501_without_channel(client, make_user, auth_headers, monkeypatch):
     monkeypatch.setattr(settings, "LINE_CHANNEL_ID", None)
     user = make_user("bs2", "bs2@x.com", password="password123")
+    r = client.post("/auth/me/line/bind-session", headers=auth_headers(user))
+    assert r.status_code == 501
+
+
+def test_bind_session_501_login_secret_missing_falls_back_to_messaging_secret(client, make_user, auth_headers, monkeypatch):
+    """LINE_CLIENT_SECRET 是別名，沒設 LINE_LOGIN_CHANNEL_SECRET 時會 fallback 到
+    Messaging API 的 LINE_CHANNEL_SECRET（正式環境本來就有值）。_login_channel_ready
+    必須認 LINE_LOGIN_CHANNEL_SECRET 本身，不能用別名判斷，否則 501 備援永遠不會觸發。"""
+    monkeypatch.setattr(settings, "LINE_CHANNEL_ID", "2010000000")
+    monkeypatch.setattr(settings, "LINE_LOGIN_CHANNEL_SECRET", None)
+    monkeypatch.setattr(settings, "LINE_CHANNEL_SECRET", "messaging-api-secret")
+    monkeypatch.setattr(settings, "LINE_REDIRECT_URI", "https://user.symotus.com/auth-api/auth/line/callback")
+    user = make_user("bs7", "bs7@x.com", password="password123")
+    r = client.post("/auth/me/line/bind-session", headers=auth_headers(user))
+    assert r.status_code == 501
+
+
+def test_bind_session_501_redirect_uri_wrong_domain(client, make_user, auth_headers, monkeypatch):
+    """LINE_REDIRECT_URI 指向別的網域（殘留舊值）時也要視為未就緒，避免授權導回錯誤網域。"""
+    monkeypatch.setattr(settings, "LINE_CHANNEL_ID", "2010000000")
+    monkeypatch.setattr(settings, "LINE_LOGIN_CHANNEL_SECRET", "test-secret")
+    monkeypatch.setattr(settings, "LINE_REDIRECT_URI", "https://admin.symotus.com/auth/callback/line")
+    user = make_user("bs8", "bs8@x.com", password="password123")
     r = client.post("/auth/me/line/bind-session", headers=auth_headers(user))
     assert r.status_code == 501
 
@@ -132,13 +168,14 @@ def fake_line(monkeypatch):
     async def _friend(access_token):
         return True
 
-    async def _push(user_id, messages):
-        sent.append((user_id, messages))
+    async def _push(line_user_id, text):
+        sent.append((line_user_id, text))
+        return True
 
     monkeypatch.setattr(lb, "_exchange_code", _exchange)
     monkeypatch.setattr(lb, "_verify_id_token", _verify)
     monkeypatch.setattr(lb, "_friend_flag", _friend)
-    monkeypatch.setattr(lb, "line_push", _push)
+    monkeypatch.setattr(lb, "_safe_push", _push)
     return sent
 
 
@@ -209,6 +246,35 @@ def test_callback_notifies_existing_recipients(client, make_user, db, line_chann
     client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
     targets = [t for t, _ in fake_line]
     assert "U-line-1" in targets and "U-existing" in targets
+
+
+def test_callback_warns_when_push_delivery_fails(client, make_user, db, line_channel, monkeypatch):
+    """推播被 LINE 拒收（_safe_push 回 False）：綁定仍要寫入 DB，不能因為推播失敗就回滾，
+    但頁面要改示警，不能顯示一般的「已綁定完成」，讓使用者知道通知其實沒送到。"""
+    async def _exchange(code):
+        return {"access_token": "at-" + code, "id_token": "idt-" + code}
+
+    async def _verify(id_token):
+        return {"sub": "U-line-1", "name": "測試員", "picture": "https://p/1.jpg"}
+
+    async def _friend(access_token):
+        return True
+
+    async def _push(line_user_id, text):
+        return False
+
+    monkeypatch.setattr(lb, "_exchange_code", _exchange)
+    monkeypatch.setattr(lb, "_verify_id_token", _verify)
+    monkeypatch.setattr(lb, "_friend_flag", _friend)
+    monkeypatch.setattr(lb, "_safe_push", _push)
+
+    user = make_user("cb10", "cb10@x.com", password="password123")
+    row = _make_session(db, user)
+    r = client.get(f"/auth/line/callback?code=xyz&state={row.sid}")
+    assert r.status_code == 200
+    assert "送不出去" in r.text
+    acc = db.query(UserLineAccount).filter_by(user_id=user.id).one()
+    assert acc.line_user_id == "U-line-1" and acc.is_active is True
 
 
 def test_callback_user_cancelled(client, make_user, db, line_channel, fake_line):
