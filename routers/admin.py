@@ -2,12 +2,13 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, CameraAccess, TechSupportGrant, CameraInvitation, InviteToken, AuditLog
+from models import User, CameraAccess, TechSupportGrant, CameraInvitation, InviteToken, AuditLog, RefreshToken
 from schemas import UserResponse, TechSupportGrantResponse, AdminUserCreate
 from auth import require_role, decode_token, hash_password
 from audit import log_action
 from config import settings
 from datetime import datetime
+from pydantic import BaseModel
 from routers.invitations import _signup_limit
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -64,6 +65,36 @@ def create_user(
     db.commit()
     db.refresh(user)
     return user
+
+
+MIN_PASSWORD_LENGTH = 8
+
+
+class AdminResetPasswordRequest(BaseModel):
+    new_password: str
+
+
+@router.post("/users/{user_id}/password")
+def admin_reset_password(
+    user_id: int,
+    body: AdminResetPasswordRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("symotus_admin")),
+):
+    """symotus_admin 替任一使用者重設密碼（免舊密碼）。
+    重設後該使用者所有 refresh token 作廢，並寫 admin_reset_password 稽核。"""
+    if len(body.new_password or "") < MIN_PASSWORD_LENGTH:
+        raise HTTPException(400, f"新密碼至少需要 {MIN_PASSWORD_LENGTH} 個字元")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "使用者不存在")
+    user.hashed_password = hash_password(body.new_password)
+    for token in db.query(RefreshToken).filter(RefreshToken.user_id == user.id,
+                                               RefreshToken.revoked == False).all():
+        token.revoked = True
+    log_action(db, current_user, "admin_reset_password", "user", user.id, "hashed_password")
+    db.commit()
+    return {"ok": True, "user_id": user.id}
 
 
 @router.get("/resellers")
