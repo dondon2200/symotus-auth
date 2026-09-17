@@ -1,9 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "mcp__464d3b9d-20a1-4a47-9532-12940207f845__bash",
-      "mcp__64dd1e80-b57c-485a-93ca-ff3ef3101ae9__bash",
-      "mcp__af5c4ec0-be1e-47d6-8c29-4c27220a0ec5__bash"
+      "mcp__Innfact_Server__bash",
+      "mcp__Mictron_ERP_Shell__bash",
+      "mcp__Project_Collab_Server__bash"
     ]
   }
 }
