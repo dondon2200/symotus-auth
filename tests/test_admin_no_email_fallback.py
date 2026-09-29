@@ -84,12 +84,30 @@ def test_non_admin_without_camera_email_still_returns_empty(role):
     assert calls == []
 
 
-def test_admin_with_camera_email_payload_unchanged():
-    """有 camera_email 的既有帳號（含 admin）：payload 逐字節不變（沿用自己的 camera_email, user_id=0）。"""
+def test_admin_with_camera_email_uses_real_camera_user_id():
+    """2026-09-29 回歸：綁 admin@timelapse.com 且有 camera_user_id 的 admin，token payload
+    必須帶真實 uid，不可再送 0——這顆 token 會被 DELETE 等寫入路徑共用，user_id=0 的
+    token 去 DELETE /api/cameras/{id} 被 Camera Backend 打 500（camera-delete-backend-500）。"""
     u = FakeUser(email="admin@timelapse.com", role="symotus_admin", camera_user_id=99)
     token = asyncio.run(get_camera_backend_token(u))
     assert token != ""
-    assert calls[-1] == {"user_id": 0, "email": "admin@timelapse.com", "role": "admin"}
+    assert calls[-1] == {"user_id": 99, "email": "admin@timelapse.com", "role": "admin"}
+
+
+def test_admin_bound_to_admin_email_without_uid_falls_back_to_one():
+    """綁 admin@timelapse.com 但 camera_user_id 未設：比照免綁定路徑 fallback 1，不可退回 0。"""
+    u = FakeUser(email="admin@timelapse.com", role="symotus_admin", camera_user_id=None)
+    token = asyncio.run(get_camera_backend_token(u))
+    assert token != ""
+    assert calls[-1] == {"user_id": 1, "email": "admin@timelapse.com", "role": "admin"}
+
+
+def test_non_admin_email_without_uid_payload_unchanged():
+    """一般 camera_email 帳號（無 camera_user_id）：payload 逐字節不變，仍送 user_id=0 純用 email 查。"""
+    u = FakeUser(email="owner@x.com", role="reseller", camera_user_id=None)
+    token = asyncio.run(get_camera_backend_token(u))
+    assert token != ""
+    assert calls[-1] == {"user_id": 0, "email": "owner@x.com", "role": "reseller"}
 
 
 def test_cache_key_includes_uid_no_cross_identity_collision():
@@ -116,16 +134,16 @@ def test_cache_key_includes_uid_no_cross_identity_collision():
 
 
 def test_cache_key_distinguishes_legacy_email_bound_admin_from_fallback():
-    """同 email(admin@timelapse.com)、同 role(admin)，但 uid 不同（舊 email 綁定路徑
-    uid=0 vs 免綁定 fallback 預設 uid=1）不可共用快取，否則寫入時彼此互相冒用 uid。"""
-    legacy_admin = FakeUser(email="admin@timelapse.com", role="symotus_admin", camera_user_id=None)
+    """同 email(admin@timelapse.com)、同 role(admin)，但 uid 不同（email 綁定路徑帶自己的
+    camera_user_id=5 vs 免綁定 fallback 預設 uid=1）不可共用快取，否則寫入時彼此互相冒用 uid。"""
+    legacy_admin = FakeUser(email="admin@timelapse.com", role="symotus_admin", camera_user_id=5)
     fallback_admin = FakeUser(email=None, role="symotus_admin", camera_user_id=None)
 
     token_legacy = asyncio.run(get_camera_backend_token(legacy_admin))
     token_fallback = asyncio.run(get_camera_backend_token(fallback_admin))
 
     assert len(calls) == 2
-    assert calls[0] == {"user_id": 0, "email": "admin@timelapse.com", "role": "admin"}
+    assert calls[0] == {"user_id": 5, "email": "admin@timelapse.com", "role": "admin"}
     assert calls[1] == {"user_id": 1, "email": "admin@timelapse.com", "role": "admin"}
     assert token_legacy != token_fallback
 

@@ -12,9 +12,10 @@ from routers.cameras import get_camera_backend_token
 
 
 class FakeUser:
-    def __init__(self, email="owner@x.com", role="reseller"):
+    def __init__(self, email="owner@x.com", role="reseller", camera_user_id=None):
         self.camera_email = email
         self.role = role
+        self.camera_user_id = camera_user_id
 
 
 calls: list = []

@@ -47,13 +47,26 @@ async def get_camera_backend_token(user: User) -> str:
       的 camera_user_id，只是「不驗 user_id、純用 email 查帳號」的暗號，不可誤用於
       這條路徑），不可用 0——這顆 token 也會被 DELETE 等寫入路徑共用，假造 user_id=0
       做寫入會被 Camera Backend 打 500（camera-delete-backend-500 雷區）。
+    - 有 camera_email 的帳號若 DB 也有真實 camera_user_id（目前只有綁 admin@timelapse.com
+      的 admin），同樣帶真實 uid；綁 admin@timelapse.com 但未設 uid 時 fallback 1。
+      其他一般帳號仍送 user_id=0 純用 email 查（讀寫皆沿用既有行為）。
     - 快取鍵含 role 與 uid：同帳號換角色不會拿到舊權限的 token；同 email+role 但
-      不同 camera_user_id（例如多個無 email 的 admin 各自 fallback 到不同 uid，或
-      巧遇某帳號恰好 camera_email=admin@timelapse.com 而 uid=0）不會互撞拿到彼此的
-      token——那樣寫入時會帶錯 uid，重現 user_id 不一致的 500 雷區。
+      不同 camera_user_id（例如多個無 email 的 admin 各自 fallback 到不同 uid）不會
+      互撞拿到彼此的 token——那樣寫入時會帶錯 uid，重現 user_id 不一致的 500 雷區。
     """
     if user.camera_email:
-        email, role, uid = user.camera_email, to_backend_role(user.role), 0
+        email, role = user.camera_email, to_backend_role(user.role)
+        # 有真實 camera_user_id 就帶上（目前只有手動/migration 綁 admin@timelapse.com 的
+        # admin 帳號有值）；綁 admin@timelapse.com 但未設時比照下方免綁定路徑 fallback 1。
+        # 其他帳號維持 0（純用 email 查）。2026-09-29 事故：綁 admin@timelapse.com 的
+        # admin 走這條拿到 user_id=0 的 token 去 DELETE /api/cameras/58 被 CB 打 500，
+        # 正是 camera-delete-backend-500 雷區；免綁定 fallback 路徑反而沒事。
+        if user.camera_user_id:
+            uid = user.camera_user_id
+        elif email == "admin@timelapse.com":
+            uid = 1
+        else:
+            uid = 0
     elif user.role == "symotus_admin":
         email, role, uid = "admin@timelapse.com", "admin", (user.camera_user_id or 1)
     else:
