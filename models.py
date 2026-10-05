@@ -17,6 +17,9 @@ class User(Base):
     hashed_password = Column(String, nullable=True)  # nullable for OAuth-only users
     role = Column(String, nullable=False, default="end_user")  # symotus_admin | reseller | end_user
     is_active = Column(Boolean, default=True)
+    # 工程模式：前端顯示工程測試用的隱藏設定（例：拍照星期 DAY0–DAY6、OSD 字幕）。
+    # 只影響畫面；由 symotus_admin 在帳號管理切換，寫進 JWT 與 /auth/me。
+    engineering_mode = Column(Boolean, nullable=False, default=False, server_default="false")
     reseller_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # end_user -> reseller
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 

@@ -242,6 +242,7 @@ def list_all_users(
     return [{"id": u.id, "username": u.username, "email": u.email,
              "role": u.role,
              "is_active": u.is_active,
+             "engineering_mode": bool(u.engineering_mode),
              "full_name": u.full_name, "reseller_id": u.reseller_id,
              "has_password": bool(u.hashed_password),
              "created_at": u.created_at.isoformat() if u.created_at else None} for u in users]
@@ -272,14 +273,15 @@ def update_user_admin(
     authorization: str = Header(None),
     db: Session = Depends(get_db),
 ):
-    """更新用戶屬性：role、is_active（service key 或 symotus_admin JWT 保護）。
-    camera_email/camera_user_id 已移除可寫欄位（Task 5：非 admin 不再綁 Camera Backend）。"""
+    """更新用戶屬性：role、is_active、reseller_id、engineering_mode（service key 或 symotus_admin JWT 保護）。
+    camera_email/camera_user_id 已移除可寫欄位（Task 5：非 admin 不再綁 Camera Backend）。
+    engineering_mode 只影響前端畫面（顯示工程測試用設定），不是權限。"""
     if not _is_admin(x_service_key, authorization):
         raise HTTPException(status_code=403, detail="Invalid service key")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    changes = {k: body[k] for k in ("role", "is_active", "reseller_id") if k in body}
+    changes = {k: body[k] for k in ("role", "is_active", "reseller_id", "engineering_mode") if k in body}
     if "role" in body:
         if body["role"] not in ("symotus_admin", "reseller", "end_user"):
             raise HTTPException(status_code=400, detail="role 僅能是 symotus_admin/reseller/end_user")
@@ -288,12 +290,17 @@ def update_user_admin(
         user.is_active = body["is_active"]
     if "reseller_id" in body:
         user.reseller_id = body["reseller_id"]  # 可為 null（解除從屬）
+    if "engineering_mode" in body:
+        if not isinstance(body["engineering_mode"], bool):
+            raise HTTPException(status_code=400, detail="engineering_mode 必須是布林值")
+        user.engineering_mode = body["engineering_mode"]
     log_action(db, _actor_user(authorization, db), "update_user", "user", user.id,
                f"{user.username} -> {changes}")
     db.commit()
     return {"id": user.id, "username": user.username, "email": user.email,
             "role": user.role, "is_active": user.is_active,
-            "reseller_id": user.reseller_id}
+            "reseller_id": user.reseller_id,
+            "engineering_mode": bool(user.engineering_mode)}
 
 
 @router.post("/camera-access")

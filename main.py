@@ -174,6 +174,14 @@ async def startup():
                 except Exception as e:
                     conn.rollback()
                     logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
+            # 補上 users.engineering_mode（工程模式，2026-10-05）
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS engineering_mode BOOLEAN DEFAULT FALSE NOT NULL"))
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    logger.warning(f"schema migration 補欄位失敗（略過，可能是權限不足或鎖表）：{e}")
             with engine.connect() as conn:
                 try:
                     conn.execute(text("ALTER TABLE camera_access ADD COLUMN IF NOT EXISTS invitation_id INTEGER"))
