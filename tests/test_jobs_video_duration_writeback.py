@@ -139,3 +139,31 @@ def test_internal端點同樣的補值語意(client, db, user):
     db.refresh(job)
     assert job.video_duration_secs == 42.5
     assert job.completed_at == completed_at_first
+
+
+def test_put轉failed時一併寫入Spark的失敗原因(client, user, auth_headers, db, monkeypatch):
+    """前端看到失敗會先 PUT failed；任務進終態後列表同步就不再處理它，
+    所以失敗原因必須在 PUT 這條路徑寫入，否則任務頁永遠看不到原因。"""
+    _make_job(db, user.id, "j4", status="processing")
+    msg = "這台相機累積了 116579 張照片，超過單次處理上限 50000 張，請指定較短的日期區間。"
+    _patch_spark(monkeypatch, {"j4": {"status": "failed", "error": msg}})
+
+    r = client.put("/jobs/j4", json={"status": "failed", "percent_complete": 0},
+                    headers=auth_headers(user))
+    assert r.status_code == 200
+    assert r.json()["status"] == "failed"
+
+    job = db.query(TimelapsJob).filter(TimelapsJob.job_id == "j4").first()
+    assert job.error_message == msg
+
+
+def test_put轉completed不寫入error_message(client, user, auth_headers, db, monkeypatch):
+    _make_job(db, user.id, "j5", status="processing")
+    _patch_spark(monkeypatch, {"j5": {"status": "completed", "error": None}})
+
+    r = client.put("/jobs/j5", json={"status": "completed", "percent_complete": 100},
+                    headers=auth_headers(user))
+    assert r.status_code == 200
+
+    job = db.query(TimelapsJob).filter(TimelapsJob.job_id == "j5").first()
+    assert job.error_message is None

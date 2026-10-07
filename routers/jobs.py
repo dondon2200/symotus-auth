@@ -154,6 +154,10 @@ async def update_job(
                 spark_duration = data.get("video_duration_secs")
                 if job.video_duration_secs is None and spark_duration is not None:
                     job.video_duration_secs = spark_duration
+                # 失敗原因也要在這裡寫：前端看到失敗會先 PUT 成 failed，任務一進終態
+                # _sync_jobs_with_spark 就不再碰它，原因會永遠是空的。
+                if spark_status == "failed" and data.get("error"):
+                    job.error_message = data.get("error")
         else:
             job.status = body.status
     if body.percent_complete is not None:
