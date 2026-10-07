@@ -1231,13 +1231,24 @@ def _video_download_url(job: GDriveJob) -> Optional[str]:
     return f"{settings.PUBLIC_BASE_URL}/jobs/gdrive/{job.id}/video?t={ticket}"
 
 
+# 影片代理要轉給 Spark 的請求標頭／轉回瀏覽器的回應標頭。
+# Range 是 <video> 播放的關鍵：瀏覽器靠它先抓檔頭、拖曳時跳段；沒轉的話每個 Range
+# 請求都回 200 整檔，大檔（上萬張的 1080p）會卡在 0:00 等整份下載完。
+_VIDEO_FORWARD_REQUEST_HEADERS = ("range", "if-range")
+_VIDEO_RELAY_RESPONSE_HEADERS = ("content-length", "content-range", "accept-ranges",
+                                 "last-modified", "etag")
+
+
 @router.get("/gdrive/{job_id}/video")
-async def download_gdrive_video(job_id: int, t: str, db: Session = Depends(get_db)):
+async def download_gdrive_video(job_id: int, t: str, request: Request, db: Session = Depends(get_db)):
     """代理下載已生成的影片，避免把 SPARK_API_KEY 曝露給瀏覽器。
 
     身分靠 query string 的短效 ticket——瀏覽器的 top-level 下載導覽帶不了
     Authorization header。ticket 同時綁定 user 與 job，所以不能拿別人的 ticket
     換這支影片，也不能拿這支的 ticket 換別支。
+
+    支援分段讀取：Range／If-Range 原樣轉給 Spark（它用 FileResponse 直接送檔），
+    206／416 與 Content-Range 原樣轉回，<video> 才能邊下載邊播、拖曳進度。
     """
     claims = decode_video_ticket(t)
     if not claims:
@@ -1254,14 +1265,25 @@ async def download_gdrive_video(job_id: int, t: str, db: Session = Depends(get_d
         raise HTTPException(404, "找不到此任務的影片")
 
     upstream = f"{SPARK_API_URL}/jobs/{job.spark_job_id}/download"
+    upstream_headers = {"x-api-key": SPARK_API_KEY}
+    for name in _VIDEO_FORWARD_REQUEST_HEADERS:
+        if request.headers.get(name):
+            upstream_headers[name] = request.headers[name]
+
     client = httpx.AsyncClient(timeout=None)
     try:
-        req = client.build_request("GET", upstream, headers={"x-api-key": SPARK_API_KEY})
+        req = client.build_request("GET", upstream, headers=upstream_headers)
         resp = await client.send(req, stream=True)
     except Exception:
         await client.aclose()
         raise HTTPException(502, "暫時無法取得影片，請稍後再試")
-    if resp.status_code != 200:
+    if resp.status_code == 416:
+        # 要求的範圍超出檔尾：照 HTTP 語意回 416，瀏覽器會自行修正，不是 Spark 故障
+        content_range = resp.headers.get("content-range")
+        await resp.aclose(); await client.aclose()
+        return Response(status_code=416,
+                        headers={"Content-Range": content_range} if content_range else None)
+    if resp.status_code not in (200, 206):
         await resp.aclose(); await client.aclose()
         raise HTTPException(502, f"Spark 取檔失敗（{resp.status_code}）")
 
@@ -1275,9 +1297,11 @@ async def download_gdrive_video(job_id: int, t: str, db: Session = Depends(get_d
             await client.aclose()
 
     headers = {"Content-Disposition": f'attachment; filename="timelapse_{job_id}.mp4"'}
-    if resp.headers.get("content-length"):
-        headers["Content-Length"] = resp.headers["content-length"]
+    for name in _VIDEO_RELAY_RESPONSE_HEADERS:
+        if resp.headers.get(name):
+            headers[name.title()] = resp.headers[name]
     return StreamingResponse(body(),
+                             status_code=resp.status_code,
                              media_type=resp.headers.get("content-type", "video/mp4"),
                              headers=headers)
 
