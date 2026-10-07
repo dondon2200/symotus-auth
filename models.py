@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, ARRAY, UniqueConstraint, Float, Index, text, func
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, Date, ForeignKey, ARRAY, UniqueConstraint, Float, Index, LargeBinary, text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship, backref, declarative_base
 from datetime import datetime
@@ -182,14 +182,12 @@ class TimelapsJob(Base):
     processing_time_secs = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    # 任務完成時間（naive UTC）。計費用量以「完成日」歸屬，不用 created_at——
-    # 跨日完成的任務（例如台北 23:40 建立、隔天 04:00 完成）用建立日會被永久漏計。
-    # 舊資料為 NULL，採集時退回用 created_at（見 services/billing_usage.py）。
+    # 任務完成時間（naive UTC），取自 Spark 回報。舊資料為 NULL。
+    # （2026-08-20 版計費曾以此歸屬用量；計費 v2 已不計量，欄位保留供任務頁顯示。）
     completed_at = Column(DateTime, nullable=True)
-    # Spark 回報的產出影片實際長度（秒）。計費用量以此為準。
+    # Spark 回報的產出影片實際長度（秒）。舊資料為 NULL。
     # 不可用 image_count/fps 推算——image_count 是「可用的來源照片張數」，
     # Spark 依 target_duration_secs 抽樣，實測兩者差 2～6 倍且倍率不固定。
-    # 舊資料為 NULL，採集時退回 image_count/fps（高估值，見 billing_usage.py）。
     video_duration_secs = Column(Float, nullable=True)
 
     # 切日條件 collect_timelapse_secs 用 COALESCE(completed_at, created_at) 過濾，
@@ -307,128 +305,149 @@ class CameraInvitation(Base):
     signup_count = Column(Integer, default=0, nullable=False, server_default="0")   # 已自助建帳人數
 
 
-# ── Billing 計費模組 ─────────────────────────────────────────────
-# 設計見 symotus-frontend/docs/superpowers/specs/2026-08-20-billing-rebuild-design.md
-# 金額一律整數 TWD；發票明細存快照（方案改價/相機改名不得回頭改變已開發票）。
+# ── Billing 計費模組 v2：按相機訂閱 ─────────────────────────────────
+# 設計見 symotus-frontend/docs/superpowers/specs/2026-10-07-camera-subscription-billing-design.md
+# 金額一律整數 TWD；日期（帳單日、截止日、付款日）一律存台北日期（Date），時間戳存 naive UTC。
+# 2026-08-20 版的 billing_plans / billing_customers / billing_subscriptions / billing_invoices /
+# billing_invoice_lines / billing_usage_daily 表仍留在正式庫、不再讀寫；確認 v2 穩定後另開工單 DROP。
 
-class BillingPlan(Base):
-    """計費方案"""
-    __tablename__ = "billing_plans"
+class BillingPlanV2(Base):
+    """方案 = 合約期 × 繳費週期 × 每期金額 的一種組合。月約年繳不允許（spec D2）。"""
+    __tablename__ = "billing_plans_v2"
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     description = Column(Text, nullable=True)
-    monthly_fee = Column(Integer, nullable=False, default=0)         # TWD/月
-    timelapse_quota_secs = Column(Integer, nullable=False, default=0)  # 0 = 不限
-    storage_quota_gb = Column(Integer, nullable=False, default=0)      # 0 = 不限
+    term = Column(String, nullable=False)    # monthly | annual
+    cycle = Column(String, nullable=False)   # monthly | yearly
+    price = Column(Integer, nullable=False)  # 每期金額 TWD，0 合法（免費）
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-class BillingCustomer(Base):
-    """客戶的計費設定。與 users 一對一，但不污染 User 表。"""
-    __tablename__ = "billing_customers"
+class BillingSubscriptionV2(Base):
+    """一台相機一份訂閱。plan_name/term/cycle/price 建立時快照，方案改價不影響。
 
-    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
-    billing_day = Column(Integer, nullable=False, default=1)  # 1-28，避開月底不存在的日期
-    frozen = Column(Boolean, nullable=False, default=False)
-    frozen_at = Column(DateTime, nullable=True)
-    note = Column(Text, nullable=True)
-
-    # ── 客戶條件（2026-08-20 補回，見 2026-08-20-billing-phase2b-customer-terms.md）──
-    payment_method = Column(String, nullable=False, default="monthly_transfer", server_default="monthly_transfer")
-    statement_day = Column(Integer, nullable=False, default=1, server_default="1")  # 1-28，避開月底不存在的日期
-    # 客戶級自訂月費：設了就覆蓋該客戶所有相機的方案月費。
-    # NULL = 未設定（用方案月費）；0 是有效值（談成免費），兩者語意不同。
-    custom_monthly_fee = Column(Integer, nullable=True)
-    # 分潤不進發票（設計決定：另列應付），只用於 /admin/commissions 報表。
-    # 兩個數值欄位各自獨立驗證上限，避免共用欄位時 percent 的「不超過 100%」
-    # 保護把 fixed 綁死在 10000 元；只讀 commission_type 對應的那一個。
-    commission_type = Column(String, nullable=True)          # percent | fixed
-    commission_percent_bps = Column(Integer, nullable=True)  # 萬分比：1250 = 12.5%
-    commission_fixed_amount = Column(Integer, nullable=True) # TWD 整數
-
-
-class BillingSubscription(Base):
-    """一台相機一份訂閱。
-
-    同一台相機同時間只能有一份「生效中」的訂閱，否則會重複計費。
-    router 端原本只靠 SELECT-then-INSERT 防重複，並發下擋不住，
-    所以這裡也加一道「部分唯一索引」（比照 BillingInvoice 的作法）當最後防線。
-    """
-    __tablename__ = "billing_subscriptions"
+    同一台相機同時最多一份 scheduled/active/suspended：router 端先查再寫擋不住並發，
+    部分唯一索引是最後防線。"""
+    __tablename__ = "billing_subscriptions_v2"
     __table_args__ = (
         Index(
-            "uq_billing_subscription_camera_active",
+            "uq_billing_sub_v2_camera_open",
             "camera_id",
             unique=True,
-            postgresql_where=text("status = 'active'"),
-            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status IN ('scheduled', 'active', 'suspended')"),
+            sqlite_where=text("status IN ('scheduled', 'active', 'suspended')"),
         ),
+        Index("ix_billing_sub_v2_camera_status", "camera_id", "status"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     camera_id = Column(Integer, nullable=False, index=True)
-    customer_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    plan_id = Column(Integer, ForeignKey("billing_plans.id"), nullable=False)
-    status = Column(String, nullable=False, default="active")  # active | paused | cancelled
-    started_at = Column(DateTime, default=datetime.utcnow)
-    cancelled_at = Column(DateTime, nullable=True)
+    camera_name = Column(String, nullable=True)     # 建立時快照，帳單沿用
+    camera_serial = Column(String, nullable=True)   # NAS 目錄名；鎖定時擋 /cameras/nas/image 用
+    customer_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)  # 付款人（reseller）
+    plan_id = Column(Integer, ForeignKey("billing_plans_v2.id"), nullable=False)
+    plan_name = Column(String, nullable=False)
+    term = Column(String, nullable=False)
+    cycle = Column(String, nullable=False)
+    price = Column(Integer, nullable=False)
+    start_date = Column(Date, nullable=False)       # 第一期帳單日（台北）
+    anchor_day = Column(Integer, nullable=False)    # = start_date.day，1–31
+    term_start = Column(Date, nullable=False)       # 目前合約期起點；年約續約時往後推 12 個月
+    auto_renew = Column(Boolean, nullable=False, default=True)
+    cancel_at = Column(Date, nullable=True)         # 「到期不續約」的生效日（台北）；NULL = 未設
+    status = Column(String, nullable=False, default="active")  # scheduled | active | suspended | ended
+    suspended_at = Column(DateTime, nullable=True)
+    ended_at = Column(DateTime, nullable=True)
+    end_reason = Column(String, nullable=True)      # not_renewed | terminated | non_payment
+    lock_released_at = Column(DateTime, nullable=True)
+    note = Column(Text, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-    # NAS 目錄名（= Camera Backend 的 device_serial_id）。
-    # 由用量採集在首次需要時解析並快取，避免每日為每台相機重複打 Camera Backend。
-    camera_serial = Column(String, nullable=True)
 
+class BillingBill(Base):
+    """一份訂閱的一期應繳款。
 
-class BillingInvoice(Base):
-    """月結發票。(customer_id, period) 唯一是產生作業冪等性的根據。
-
-    這裡刻意用「部分唯一索引」而非一般 UniqueConstraint：作廢(void)的發票
-    不算數，讓該客戶＋期別可以重新開立；但同一時間絕不能有兩張「非作廢」
-    的發票佔用同一期別，否則會重複收費。
-    """
-    __tablename__ = "billing_invoices"
+    UNIQUE(subscription_id, period_start) 不排除作廢：帳單由排程自動補開，
+    若作廢後可重開，排程隔天就會把它補回來（spec §6.4）。"""
+    __tablename__ = "billing_bills"
     __table_args__ = (
-        Index(
-            "uq_billing_invoice_customer_period_active",
-            "customer_id", "period",
-            unique=True,
-            postgresql_where=text("status != 'void'"),
-            sqlite_where=text("status != 'void'"),
-        ),
+        UniqueConstraint("subscription_id", "period_start", name="uq_billing_bill_sub_period"),
+        Index("ix_billing_bill_customer_status", "customer_id", "status"),
+        Index("ix_billing_bill_status_due", "status", "due_date"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
-    customer_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    period = Column(String, nullable=False, index=True)  # YYYY-MM
-    total = Column(Integer, nullable=False, default=0)
-    status = Column(String, nullable=False, default="unpaid")  # unpaid | paid | void
-    issued_at = Column(DateTime, default=datetime.utcnow)
-    paid_at = Column(DateTime, nullable=True)
-    paid_note = Column(Text, nullable=True)
-
-
-class BillingInvoiceLine(Base):
-    """發票明細。camera_name/plan_name/amount 是開立當下的快照，不可回頭變動。"""
-    __tablename__ = "billing_invoice_lines"
-
-    id = Column(Integer, primary_key=True, index=True)
-    invoice_id = Column(Integer, ForeignKey("billing_invoices.id"), nullable=False, index=True)
-    subscription_id = Column(Integer, nullable=True)
-    camera_id = Column(Integer, nullable=False)
+    subscription_id = Column(Integer, ForeignKey("billing_subscriptions_v2.id"), nullable=False, index=True)
+    camera_id = Column(Integer, nullable=False, index=True)
+    customer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     camera_name = Column(String, nullable=True)
     plan_name = Column(String, nullable=True)
-    amount = Column(Integer, nullable=False, default=0)
+    cycle = Column(String, nullable=False)
+    period_start = Column(Date, nullable=False)     # = 帳單日
+    period_end = Column(Date, nullable=False)       # 下一期帳單日（半開區間）
+    due_date = Column(Date, nullable=False)
+    amount = Column(Integer, nullable=False)
+    status = Column(String, nullable=False, default="unpaid")  # unpaid | paid | void
+    paid_on = Column(Date, nullable=True)           # 客戶實際付款日
+    paid_at = Column(DateTime, nullable=True)       # admin 確認時間
+    paid_note = Column(Text, nullable=True)
+    paid_via_report_id = Column(Integer, nullable=True)
+    pending_report_id = Column(Integer, nullable=True, index=True)  # 目前所在的 pending 回報
+    voided_at = Column(DateTime, nullable=True)
+    void_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
-class BillingUsageDaily(Base):
-    """每日用量。存日粒度而非累計值，讓採集失敗後可安全補跑（upsert 覆蓋同一天）。"""
-    __tablename__ = "billing_usage_daily"
-    __table_args__ = (UniqueConstraint("camera_id", "date", name="uq_billing_usage_camera_date"),)
+class BillingPaymentReport(Base):
+    """reseller 送出的「我已付款」。回報本身不改帳單狀態，admin 確認後才算已繳。"""
+    __tablename__ = "billing_payment_reports"
+    __table_args__ = (
+        Index("ix_billing_report_status_created", "status", "created_at"),
+        Index("ix_billing_report_customer_status", "customer_id", "status"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
-    camera_id = Column(Integer, nullable=False, index=True)
-    date = Column(String, nullable=False, index=True)  # YYYY-MM-DD（台北時區）
-    timelapse_secs = Column(Integer, nullable=False, default=0)
-    storage_gb = Column(Float, nullable=False, default=0)  # 時間點快照（該相機在 NAS 上的總佔用量），不是每日增量，跨天絕不可加總
-    collected_at = Column(DateTime, default=datetime.utcnow)
+    customer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    paid_on = Column(Date, nullable=False)
+    amount = Column(Integer, nullable=False)
+    method = Column(String, nullable=False)          # transfer | cash | other
+    account_last5 = Column(String(5), nullable=True)
+    note = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default="pending")  # pending | confirmed | rejected | withdrawn
+    reviewed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    review_note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class BillingPaymentReportBill(Base):
+    """回報當下勾了哪些帳單（歷史，不刪）。confirmed 在審核時逐張寫入。"""
+    __tablename__ = "billing_payment_report_bills"
+
+    report_id = Column(Integer, ForeignKey("billing_payment_reports.id"), primary_key=True)
+    bill_id = Column(Integer, ForeignKey("billing_bills.id"), primary_key=True)
+    amount_snapshot = Column(Integer, nullable=False)
+    confirmed = Column(Boolean, nullable=True)
+
+
+class BillingPaymentReceipt(Base):
+    """收據檔案。存 DB 而不是檔案系統：auth 容器沒有自己的持久化 volume，量也小（spec §11.1）。"""
+    __tablename__ = "billing_payment_receipts"
+
+    report_id = Column(Integer, ForeignKey("billing_payment_reports.id"), primary_key=True)
+    content_type = Column(String, nullable=False)
+    data = Column(LargeBinary, nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class BillingSetting(Base):
+    """計費設定（key/value）。目前只有 payment_instructions。"""
+    __tablename__ = "billing_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

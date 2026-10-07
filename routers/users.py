@@ -6,6 +6,7 @@ from models import User, CameraAccess
 from schemas import UserResponse, UserUpdate, ResellerUserCreate
 from auth import get_current_user, require_role, hash_password
 from audit import log_action
+from services.billing_v2 import assert_camera_unlocked
 
 router = APIRouter(prefix="/reseller", tags=["reseller"])
 
@@ -247,6 +248,7 @@ def grant_camera_access(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("reseller", "symotus_admin"))
 ):
+    assert_camera_unlocked(db, current_user, camera_id)  # 計費 v2：鎖定相機不可再分配
     user_id = body.get("user_id")
     user = db.query(User).filter(User.id == user_id, User.reseller_id == current_user.id).first()
     if not user:

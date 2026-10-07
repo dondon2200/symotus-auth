@@ -18,6 +18,10 @@ from models import User, CameraAccess, TechSupportGrant
 from auth import get_current_user, to_backend_role
 from audit import log_action
 from policies import level_allows, feature_for_write
+from services.billing_v2 import (
+    assert_camera_unlocked, billing_field, camera_billing_flags, get_lock_map, locked_camera_ids,
+    locked_serial_in_path,
+)
 
 router = APIRouter(prefix="/cameras", tags=["cameras"])
 
@@ -227,6 +231,10 @@ async def fetch_camera_detail(camera_id: int, owner: Optional[User], admin_holde
     return None
 
 
+_LOCKED_STRIP_FIELDS = ("ip_address", "port", "username", "device_serial_id", "serial_history",
+                        "device_mac", "spark_nas_path")
+
+
 @router.get("")
 async def list_cameras(
     current_user: User = Depends(get_current_user),
@@ -297,6 +305,16 @@ async def list_cameras(
         cameras.append(cam_data)
         shared_ids.add(access.camera_id)
 
+    # 計費 v2：每台附 billing 欄位（鎖定／逾期）。非管理員看鎖定相機時清掉連線資訊與 NAS 路徑，
+    # 避免拿 IP 反查 go2rtc 串流名稱或 serial 組 NAS 圖片網址（spec §8.2）。
+    lock_map = get_lock_map(db)
+    flags = camera_billing_flags(db, current_user)
+    for c in cameras:
+        c["billing"] = billing_field(db, current_user, c.get("id"), lock_map, flags)
+        if c["billing"]["locked"] and current_user.role != "symotus_admin":
+            for k in _LOCKED_STRIP_FIELDS:
+                c.pop(k, None)
+
     return {"cameras": cameras, "total": len(cameras)}
 
 
@@ -322,7 +340,7 @@ async def get_timer_status(
     if resp.status_code == 200:
         data = resp.json()
         if allowed_ids is not None and isinstance(data, dict) and isinstance(data.get("cameras"), list):
-            allowed_set = set(allowed_ids)
+            allowed_set = set(allowed_ids) - locked_camera_ids(db)
             data["cameras"] = [c for c in data["cameras"] if c.get("camera_id") in allowed_set]
             data["total"] = len(data["cameras"])
         return data
@@ -342,6 +360,10 @@ async def get_thumbnails(
     # 過濾掉沒有權限的 id
     if allowed_ids is not None:
         requested_ids = [i for i in requested_ids if i in allowed_ids]
+    # 計費 v2：非管理員拿不到鎖定相機的縮圖（只略過該台，不整包失敗）
+    if current_user.role != "symotus_admin":
+        locked = locked_camera_ids(db)
+        requested_ids = [i for i in requested_ids if i not in locked]
 
     if not requested_ids:
         return {}
@@ -457,6 +479,7 @@ async def get_camera(
     allowed_ids = get_allowed_camera_ids(current_user, db)
     if allowed_ids is not None and camera_id not in allowed_ids:
         raise HTTPException(403, "無此相機的存取權限")
+    assert_camera_unlocked(db, current_user, camera_id)
 
     cam_token = await get_camera_backend_token(current_user)
 
@@ -597,6 +620,7 @@ async def get_live_frame_url(
     allowed_ids = get_allowed_camera_ids(current_user, db)
     if allowed_ids is not None and camera_id not in allowed_ids:
         raise HTTPException(403, "無此相機的存取權限")
+    assert_camera_unlocked(db, current_user, camera_id)
 
     exp = int(_time.time()) + 1800
     sig = _live_frame_sig(camera_id, exp)
@@ -615,6 +639,7 @@ async def subscribe_online_notification(
     allowed_ids = get_allowed_camera_ids(current_user, db)
     if allowed_ids is not None and camera_id not in allowed_ids:
         raise HTTPException(403, "無此相機的存取權限")
+    assert_camera_unlocked(db, current_user, camera_id)
 
     # notify.subscribe 政策：被分享者（非自我配對）等級不足或功能停用 → 拒訂（退訂不受限）
     _acc = db.query(CameraAccess).filter(
@@ -699,6 +724,10 @@ async def notify_bulk(
         allowed_set = set(allowed_ids)
         camera_ids = [c for c in camera_ids if c in allowed_set]
 
+    if subscribe and current_user.role != "symotus_admin":
+        locked = locked_camera_ids(db)
+        camera_ids = [c for c in camera_ids if c not in locked]
+
     if subscribe:
         line_accounts = current_user.line_accounts
         if not line_accounts:
@@ -737,6 +766,7 @@ async def unbind_camera(
     allowed_ids = get_allowed_camera_ids(current_user, db)
     if allowed_ids is not None and camera_id not in allowed_ids:
         raise HTTPException(403, "無此相機的存取權限")
+    assert_camera_unlocked(db, current_user, camera_id)
 
     if current_user.role == "end_user":
         # F-12：僅「完整(full)權限」帳號可解除綁定
@@ -819,6 +849,7 @@ async def delete_camera(
     """
     if not confirm:
         raise HTTPException(400, "需帶 ?confirm=true 才會真正刪除")
+    assert_camera_unlocked(db, current_user, camera_id)
 
     access = db.query(CameraAccess).filter(
         CameraAccess.camera_id == camera_id,
@@ -886,10 +917,12 @@ async def nas_images(
     """
     from datetime import datetime, timedelta, date as date_type
 
-    cam_token = await get_camera_backend_token(current_user)
-
     params = dict(request.query_params)
     camera_id = params.get("camera_id")
+    if camera_id:
+        assert_camera_unlocked(db, current_user, int(camera_id))
+
+    cam_token = await get_camera_backend_token(current_user)
 
     # F-3：此相機的 grant（決定是否允許 granter/admin fallback）
     access = None
@@ -1115,6 +1148,10 @@ async def nas_image(
     db: Session = Depends(get_db),
 ):
     """NAS 單張照片 proxy"""
+    # 計費 v2：只帶路徑，以 serial 反查是否屬於鎖定相機（serial 在暫停／結束時寫入訂閱）
+    if current_user.role != "symotus_admin" and locked_serial_in_path(
+            db, request.query_params.get("path") or request.query_params.get("file_path") or ""):
+        raise HTTPException(403, detail={"code": "CAMERA_LOCKED", "message": "此相機服務已停用"})
     cam_token = await get_camera_backend_token(current_user)
     # 分享用戶沒有自己的 token → 嘗試用 granter token
     if not cam_token:
@@ -1209,6 +1246,7 @@ async def proxy_camera_api(
     allowed_ids = get_allowed_camera_ids(current_user, db)
     if allowed_ids is not None and camera_id not in allowed_ids:
         raise HTTPException(403, "無此相機的存取權限")
+    assert_camera_unlocked(db, current_user, camera_id)
 
     # 此相機的 camera_access grant（供 F-5 等級檢查 與 F-3 fallback 閘 共用）
     access = db.query(CameraAccess).filter(

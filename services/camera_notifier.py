@@ -115,6 +115,9 @@ async def send_line_push(line_user_id: str, camera_id: int, camera_name: str):
 def get_notify_line_ids(camera_id: int, db: Session) -> list[str]:
     """找應收通知的所有 LINE user ID"""
     ids = set()
+    # 計費 v2：鎖定相機只通知 admin（spec D8）
+    from services.billing_v2 import locked_camera_ids
+    locked = camera_id in locked_camera_ids(db)
     # 0-d：對本相機明確退訂（notify_on_online=False）的 user_id，即使是 admin 也不通知。
     opted_out = {
         acc.user_id for acc in db.query(CameraAccess).filter(
@@ -127,6 +130,8 @@ def get_notify_line_ids(camera_id: int, db: Session) -> list[str]:
         if u.id not in opted_out:
             for acc in u.line_accounts:
                 ids.add(acc.line_user_id)
+    if locked:
+        return list(ids)
     # camera_access 裡有綁定 LINE 且 notify_on_online=True 的用戶
     for acc in db.query(CameraAccess).filter(CameraAccess.camera_id == camera_id).all():
         # 只通知有訂閱的用戶（notify_on_online 預設 True）

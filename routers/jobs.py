@@ -30,8 +30,7 @@ class JobCreate(BaseModel):
 class JobUpdate(BaseModel):
     status: Optional[str] = None
     percent_complete: Optional[int] = None
-    # Spark 回報的產出影片實際長度（秒）。若前端轉態通知有帶就存，沒有就 None
-    # （計費採集時會退回 image_count/fps 的 fallback，見 services/billing_usage.py）。
+    # Spark 回報的產出影片實際長度（秒）。若前端轉態通知有帶就存，沒有就 None。
     video_duration_secs: Optional[float] = None
 
 class JobResponse(BaseModel):
@@ -196,7 +195,7 @@ class JobInternalUpdate(BaseModel):
     # Spark 回呼若帶上真正的完成時間就用它；這個 endpoint 實務上從未被 Spark
     # 呼叫過（Spark 不會 callback），但保留欄位以防萬一，行為與 list 同步一致。
     completed_at: Optional[str] = None
-    # Spark 回報的產出影片實際長度（秒）。計費用量以此為準（見 services/billing_usage.py）。
+    # Spark 回報的產出影片實際長度（秒）。
     video_duration_secs: Optional[float] = None
 
 @router.put("/internal/{job_id}")

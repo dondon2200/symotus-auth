@@ -1,724 +1,1160 @@
-"""計費模組 API。
+"""計費 v2 API：按相機訂閱、週年帳單日、逾期處置、付款回報。
 
-權限原則（spec §6）：
+規格：symotus-frontend/docs/superpowers/specs/2026-10-07-camera-subscription-billing-design.md §11.3
+
+權限原則：
 - /billing/admin/* 一律 require_role("symotus_admin")，與前端顯不顯示無關。
-- /billing/*/my 只回 current_user 自己的資料，路徑不吃 user_id 參數——
-  沒有可竄改的輸入，就沒有 IDOR。
+- /billing/my/* 與 /billing/notices/my 只回 current_user 自己的資料；用他人的 bill_id／report_id
+  一律回 404（不透露存在與否）。
+- 金錢狀態只由 admin 改變：reseller 的付款回報不會讓帳單變已繳（spec §6.5）。
 """
+import hashlib
+import logging
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func
+import httpx
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import Response
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from audit import log_action
+from auth import get_current_user, require_role
 from database import get_db
 from models import (
-    User, BillingPlan, BillingCustomer, BillingSubscription, BillingInvoice, BillingInvoiceLine,
-    BillingUsageDaily,
+    BillingBill, BillingPaymentReceipt, BillingPaymentReport, BillingPaymentReportBill,
+    BillingPlanV2, BillingSetting, BillingSubscriptionV2, CameraAccess, User,
 )
-from schemas import (
-    PlanCreate, PlanUpdate, PlanResponse,
-    CustomerUpdate, CustomerResponse,
-    SubscriptionCreate, SubscriptionResponse,
-    InvoiceResponse, InvoiceLineResponse, InvoiceDetailResponse,
-    CommissionRowResponse,
-    MySubscriptionResponse, MyQuotaResponse,
+from services.billing_dates import (
+    next_bill_date_after, overdue_days, taipei_date_to_utc_naive, taipei_today, term_end_of, valid_combo,
 )
-from auth import require_role, get_current_user
-from audit import log_action
-from services.billing_calc import (
-    invoice_total, quota_state, period_of, next_period, period_bounds_utc, effective_monthly_fee,
-    commission_amount, commission_display,
+from services.billing_v2 import (
+    OPEN_STATUSES, advance_one, get_lock_map, invalidate_lock_cache,
 )
-from services.billing_usage import run_collection, yesterday_taipei, backfill_all_missing_job_fields
 
 router = APIRouter(prefix="/billing", tags=["billing"])
+logger = logging.getLogger(__name__)
 
 ADMIN = require_role("symotus_admin")
 
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+MAX_BACKDATE_DAYS = 92          # 建立訂閱時起始日最多回溯（spec §7）
+MAX_PENDING_REPORTS = 10        # 每位 reseller 同時最多幾份待確認回報（spec §6.5）
+MAX_RECEIPT_BYTES = 2 * 1024 * 1024
+PENDING_ALERT_DAYS = 3          # 待確認超過幾天標紅
+LAST5_RE = re.compile(r"^[0-9]{5}$")
+SETTING_KEYS = ("payment_instructions",)
 
 
-@router.get("/admin/plans", response_model=list[PlanResponse])
-def list_plans(
-    include_inactive: bool = False,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(ADMIN),
-):
-    q = db.query(BillingPlan)
+# ── 共用小工具 ────────────────────────────────────────────────────────
+
+def _user_names(db: Session, ids) -> dict[int, str]:
+    ids = {i for i in ids if i}
+    if not ids:
+        return {}
+    return {u.id: u.username for u in db.query(User).filter(User.id.in_(ids)).all()}
+
+
+def _iso(d) -> Optional[str]:
+    return d.isoformat() if d else None
+
+
+def _utc_iso(ts: Optional[datetime]) -> Optional[str]:
+    return ts.isoformat() + "Z" if ts else None
+
+
+def _bill_state(b: BillingBill, today: date) -> str:
+    """顯示狀態：paid / void / pending（付款確認中）/ overdue / due（待繳、未到期）。"""
+    if b.status == "paid":
+        return "paid"
+    if b.status == "void":
+        return "void"
+    if b.pending_report_id:
+        return "pending"
+    return "overdue" if today > b.due_date else "due"
+
+
+def _bill_out(b: BillingBill, today: date, sub_status: Optional[str] = None) -> dict:
+    return {
+        "id": b.id,
+        "subscription_id": b.subscription_id,
+        "camera_id": b.camera_id,
+        "customer_id": b.customer_id,
+        "camera_name": b.camera_name,
+        "plan_name": b.plan_name,
+        "cycle": b.cycle,
+        "period_start": _iso(b.period_start),
+        "period_end": _iso(b.period_end),
+        "due_date": _iso(b.due_date),
+        "amount": b.amount,
+        "status": b.status,
+        "state": _bill_state(b, today),
+        "overdue": b.status == "unpaid" and today > b.due_date,
+        "overdue_days": overdue_days(b.due_date, today) if b.status == "unpaid" else 0,
+        "paid_on": _iso(b.paid_on),
+        "paid_at": _utc_iso(b.paid_at),
+        "paid_note": b.paid_note,
+        "paid_late": bool(b.status == "paid" and b.paid_on and b.paid_on > b.due_date),
+        "paid_via_report_id": b.paid_via_report_id,
+        "pending_report_id": b.pending_report_id,
+        "void_reason": b.void_reason,
+        "subscription_status": sub_status,
+    }
+
+
+def _plan_out(p: BillingPlanV2) -> dict:
+    return {"id": p.id, "name": p.name, "description": p.description, "term": p.term,
+            "cycle": p.cycle, "price": p.price, "is_active": p.is_active}
+
+
+def _sub_out(db: Session, s: BillingSubscriptionV2, today: date, names: Optional[dict] = None,
+             lock_map: Optional[dict] = None) -> dict:
+    names = names if names is not None else _user_names(db, [s.customer_id])
+    lock_map = lock_map if lock_map is not None else get_lock_map(db)
+    unpaid = db.query(BillingBill).filter(
+        BillingBill.subscription_id == s.id, BillingBill.status == "unpaid").all()
+    overdue = [b for b in unpaid if today > b.due_date]
+    next_bill = None
+    if s.status in ("scheduled", "active", "suspended"):
+        next_bill = s.start_date if s.start_date > today else next_bill_date_after(
+            s.start_date, s.cycle, s.anchor_day, today)
+        if s.cancel_at and next_bill >= s.cancel_at:
+            next_bill = None
+    lock = lock_map.get(s.camera_id)
+    is_latest_lock = bool(lock) and (
+        (lock["state"] == "suspended" and s.status == "suspended")
+        or (lock["state"] == "ended" and s.status == "ended" and s.lock_released_at is None))
+    return {
+        "id": s.id,
+        "camera_id": s.camera_id,
+        "camera_name": s.camera_name or f"相機 #{s.camera_id}",
+        "customer_id": s.customer_id,
+        "customer_name": names.get(s.customer_id),
+        "plan_id": s.plan_id,
+        "plan_name": s.plan_name,
+        "term": s.term,
+        "cycle": s.cycle,
+        "price": s.price,
+        "start_date": _iso(s.start_date),
+        "anchor_day": s.anchor_day,
+        "term_start": _iso(s.term_start),
+        "term_end": _iso(term_end_of(s.term_start, s.anchor_day)) if s.term == "annual" else None,
+        "auto_renew": s.auto_renew,
+        "cancel_at": _iso(s.cancel_at),
+        "status": s.status,
+        "suspended_at": _utc_iso(s.suspended_at),
+        "ended_at": _utc_iso(s.ended_at),
+        "end_reason": s.end_reason,
+        "lock_released_at": _utc_iso(s.lock_released_at),
+        "locked": lock["state"] if is_latest_lock else None,
+        "next_bill_date": _iso(next_bill),
+        "unpaid_count": len(unpaid),
+        "unpaid_total": sum(b.amount for b in unpaid),
+        "overdue_count": len(overdue),
+        "overdue_total": sum(b.amount for b in overdue),
+        "max_overdue_days": max((overdue_days(b.due_date, today) for b in overdue), default=0),
+        "note": s.note,
+        "created_at": _utc_iso(s.created_at),
+    }
+
+
+def _get_setting(db: Session, key: str) -> Optional[str]:
+    row = db.query(BillingSetting).filter(BillingSetting.key == key).first()
+    return row.value if row else None
+
+
+def _maybe_resume(db: Session, sub_ids, today: date, actor: User) -> list[int]:
+    """暫停中的訂閱若已無逾期帳單 → 恢復。只在 admin 勾了「同時恢復服務」時呼叫（spec §9.4）。"""
+    db.flush()  # SessionLocal 是 autoflush=False：剛標成 paid 的帳單要先 flush，下面的 count 才看得到
+    resumed = []
+    for sid in set(sub_ids):
+        sub = db.query(BillingSubscriptionV2).filter(BillingSubscriptionV2.id == sid).first()
+        if not sub or sub.status != "suspended":
+            continue
+        still = db.query(BillingBill).filter(
+            BillingBill.subscription_id == sid, BillingBill.status == "unpaid",
+            BillingBill.due_date < today).count()
+        if still:
+            continue
+        sub.status = "active"
+        sub.suspended_at = None
+        log_action(db, actor, "billing.subscription.resume", "billing_subscription", sid, "after payment")
+        resumed.append(sid)
+    return resumed
+
+
+async def _resolve_camera(camera_id: int) -> tuple[Optional[str], Optional[str]]:
+    """用 admin token 取相機名稱與 NAS serial（快照與鎖定 /nas/image 用）。失敗回 (None, None)。"""
+    from routers.cameras import CAMERA_BACKEND_URL, _get_admin_camera_token
+    tok = await _get_admin_camera_token()
+    if not tok:
+        return None, None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
+                                 headers={"Authorization": f"Bearer {tok}"})
+        if r.status_code != 200:
+            return None, None
+        basic = r.json().get("basic_info", r.json())
+        serial = basic.get("device_serial_id") or basic.get("serial_id") or basic.get("serial")
+        return basic.get("name"), serial
+    except Exception as e:  # noqa: BLE001
+        logger.warning("billing: 取相機 %s 資訊失敗：%s", camera_id, e)
+        return None, None
+
+
+async def _fetch_all_cameras() -> list[dict]:
+    from routers.cameras import CAMERA_BACKEND_URL, _get_admin_camera_token
+    tok = await _get_admin_camera_token()
+    if not tok:
+        return []
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(f"{CAMERA_BACKEND_URL}/api/cameras",
+                             headers={"Authorization": f"Bearer {tok}"}, params={"limit": 1000})
+    if r.status_code != 200:
+        return []
+    return r.json().get("cameras", [])
+
+
+async def _ensure_serial(db: Session, sub: BillingSubscriptionV2) -> None:
+    if sub.camera_serial:
+        return
+    name, serial = await _resolve_camera(sub.camera_id)
+    if serial:
+        sub.camera_serial = serial
+    if name and not sub.camera_name:
+        sub.camera_name = name
+
+
+# ── 方案 ──────────────────────────────────────────────────────────────
+
+class PlanIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    term: Literal["monthly", "annual"]
+    cycle: Literal["monthly", "yearly"]
+    price: int = Field(ge=0, le=10_000_000)
+    is_active: bool = True
+
+
+class PlanPatch(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    price: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    is_active: Optional[bool] = None
+
+
+@router.get("/admin/plans")
+def list_plans(include_inactive: bool = False, db: Session = Depends(get_db), _: User = Depends(ADMIN)):
+    q = db.query(BillingPlanV2)
     if not include_inactive:
-        q = q.filter(BillingPlan.is_active == True)  # noqa: E712
-    return q.order_by(BillingPlan.id).all()
+        q = q.filter(BillingPlanV2.is_active == True)  # noqa: E712
+    return [_plan_out(p) for p in q.order_by(BillingPlanV2.id).all()]
 
 
-@router.post("/admin/plans", response_model=PlanResponse)
-def create_plan(
-    body: PlanCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(ADMIN),
-):
-    plan = BillingPlan(**body.model_dump())
-    db.add(plan)
-    log_action(db, current_user, "billing_create_plan", "billing_plan", None, f"name={body.name}")
-    db.commit(); db.refresh(plan)
-    return plan
+@router.post("/admin/plans")
+def create_plan(body: PlanIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    if not valid_combo(body.term, body.cycle):
+        raise HTTPException(422, "月約不可年繳（請改用年約年繳）")
+    p = BillingPlanV2(**body.model_dump())
+    db.add(p)
+    db.flush()
+    log_action(db, me, "billing.plan.create", "billing_plan", p.id, f"{p.name} {p.term}/{p.cycle} {p.price}")
+    db.commit()
+    return _plan_out(p)
 
 
-@router.put("/admin/plans/{plan_id}", response_model=PlanResponse)
-def update_plan(
-    plan_id: int,
-    body: PlanUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(ADMIN),
-):
-    plan = db.query(BillingPlan).filter(BillingPlan.id == plan_id).first()
-    if not plan:
+@router.put("/admin/plans/{plan_id}")
+def update_plan(plan_id: int, body: PlanPatch, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    """合約期與週期建立後不可改（已綁訂閱的語意會被改掉）；要換組合就新建方案。改價不影響既有訂閱。"""
+    p = db.query(BillingPlanV2).filter(BillingPlanV2.id == plan_id).first()
+    if not p:
         raise HTTPException(404, "方案不存在")
-    # 局部更新：只套用請求裡「真的有帶」的欄位，未帶的欄位維持既有值
-    # （例如只傳 {"is_active": true} 不該把 monthly_fee/quota 打歸零）。
-    for k, v in body.model_dump(exclude={"is_active"}, exclude_unset=True).items():
-        setattr(plan, k, v)
-    if body.is_active is not None:
-        # 允許重新啟用已停用的方案；is_active 未帶值時不動它（PlanCreate 沒有這欄，舊呼叫端仍相容）
-        plan.is_active = body.is_active
-    # 已開立的發票存的是快照，不受這次改價影響（spec §4）
-    log_action(db, current_user, "billing_update_plan", "billing_plan", plan_id, f"fee={plan.monthly_fee}")
-    db.commit(); db.refresh(plan)
-    return plan
+    changes = body.model_dump(exclude_unset=True)
+    for k, v in changes.items():
+        setattr(p, k, v)
+    log_action(db, me, "billing.plan.update", "billing_plan", p.id, str(changes))
+    db.commit()
+    return _plan_out(p)
 
 
 @router.delete("/admin/plans/{plan_id}")
-def deactivate_plan(
-    plan_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(ADMIN),
-):
-    """軟刪。真刪會讓發票明細指向不存在的方案。"""
-    plan = db.query(BillingPlan).filter(BillingPlan.id == plan_id).first()
-    if not plan:
+def deactivate_plan(plan_id: int, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    p = db.query(BillingPlanV2).filter(BillingPlanV2.id == plan_id).first()
+    if not p:
         raise HTTPException(404, "方案不存在")
-    plan.is_active = False
-    log_action(db, current_user, "billing_deactivate_plan", "billing_plan", plan_id)
+    p.is_active = False
+    log_action(db, me, "billing.plan.deactivate", "billing_plan", p.id, p.name)
     db.commit()
-    return {"message": "已停用方案"}
+    return {"ok": True}
 
 
-def get_or_create_customer(db: Session, user_id: int) -> BillingCustomer:
-    """計費設定採 lazy 建立：使用者建立時不必知道計費模組的存在。"""
-    c = db.query(BillingCustomer).filter(BillingCustomer.user_id == user_id).first()
-    if not c:
-        c = BillingCustomer(user_id=user_id)
-        db.add(c)
-        try:
-            db.commit()
-        except IntegrityError:
-            # 並發下可能有另一個請求搶先建立同一筆客戶紀錄；
-            # user_id 是主鍵不會產生重複列，rollback 後重查回傳既有那筆即可
-            db.rollback()
-            c = db.query(BillingCustomer).filter(BillingCustomer.user_id == user_id).first()
-        else:
-            db.refresh(c)
-    return c
+# ── 訂閱 ──────────────────────────────────────────────────────────────
+
+class SubscriptionIn(BaseModel):
+    camera_ids: list[int] = Field(min_length=1, max_length=50)
+    customer_id: int
+    plan_id: int
+    start_date: date
+    price: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    auto_renew: bool = True
+    note: Optional[str] = Field(default=None, max_length=1000)
+    mark_past_due_paid: bool = False   # 補登歷史訂閱時，把已過截止日的帳單標成已收款（spec §13 S7）
 
 
-@router.get("/admin/customers", response_model=list[CustomerResponse])
-def list_customers(
-    role: str = "all",
-    db: Session = Depends(get_db),
-    current_user: User = Depends(ADMIN),
-):
-    # 這是 GET，不該有寫入副作用：list_customers 曾經對每個使用者呼叫
-    # get_or_create_customer（內含 commit），N 個使用者 = N 次 insert + N 次 commit，
-    # 且與所有相機 CRUD proxy 共用連線池。改用一次查完 billing_customers 再用
-    # Python dict 比對，沒有紀錄的使用者用預設值組出回應，完全不寫 DB。
-    q = db.query(User).filter(User.is_active == True)  # noqa: E712
-    if role != "all":
-        q = q.filter(User.role == role)
-    users = q.order_by(User.id).all()
-    customers = {c.user_id: c for c in db.query(BillingCustomer).all()}
+class EndIn(BaseModel):
+    reason: Literal["terminated", "non_payment"] = "terminated"
+    bill_actions: dict[int, Literal["keep", "void"]] = {}
+
+
+class ScheduleCancelIn(BaseModel):
+    cancel: bool
+
+
+@router.get("/admin/resellers")
+def list_resellers(db: Session = Depends(get_db), _: User = Depends(ADMIN)):
+    """建立訂閱時可選的付款人：只能是 reseller（spec §13 S10）。"""
+    rows = db.query(User).filter(User.role == "reseller", User.is_active == True).order_by(User.username).all()  # noqa: E712
+    return [{"id": u.id, "username": u.username, "email": u.email} for u in rows]
+
+
+@router.get("/admin/unsubscribed-cameras")
+async def unsubscribed_cameras(db: Session = Depends(get_db), _: User = Depends(ADMIN)):
+    """尚未納管的相機（沒有 scheduled/active/suspended 訂閱）＋ 可能的付款人（持自我配對 grant 的 reseller）。"""
+    cams = await _fetch_all_cameras()
+    open_ids = {r[0] for r in db.query(BillingSubscriptionV2.camera_id)
+                .filter(BillingSubscriptionV2.status.in_(OPEN_STATUSES)).all()}
+    lock_map = get_lock_map(db)
+    resellers = {u.id: u.username for u in db.query(User).filter(User.role == "reseller").all()}
+    owners: dict[int, list[dict]] = {}
+    for a in db.query(CameraAccess).filter(CameraAccess.granted_by == CameraAccess.user_id).all():
+        if a.user_id in resellers:
+            owners.setdefault(a.camera_id, []).append({"id": a.user_id, "username": resellers[a.user_id]})
     out = []
-    for u in users:
-        c = customers.get(u.id)
-        out.append(CustomerResponse(
-            user_id=u.id, username=u.username, email=u.email, role=u.role,
-            billing_day=c.billing_day if c else 1,
-            frozen=c.frozen if c else False,
-            note=c.note if c else None,
-            payment_method=c.payment_method if c else "monthly_transfer",
-            statement_day=c.statement_day if c else 1,
-            custom_monthly_fee=c.custom_monthly_fee if c else None,
-            commission_type=c.commission_type if c else None,
-            commission_percent_bps=c.commission_percent_bps if c else None,
-            commission_fixed_amount=c.commission_fixed_amount if c else None,
-            commission_display=commission_display(
-                c.commission_type, c.commission_percent_bps, c.commission_fixed_amount
-            ) if c else "",
-        ))
+    for c in cams:
+        cid = c.get("id")
+        if cid is None or cid in open_ids:
+            continue
+        out.append({"camera_id": cid, "camera_name": c.get("name") or f"相機 #{cid}",
+                    "locked": (lock_map.get(cid) or {}).get("state"),
+                    "owners": owners.get(cid, [])})
     return out
 
 
-# NOT NULL 欄位：models.py 裡 nullable=False。顯式傳 null 會讓 setattr 把欄位
-# 寫成 None，直接違反 DB 的 NOT NULL 約束（而且是在 commit 當下才炸，訊息不友善）。
-# 這裡提前擋下，回一個看得懂原因的 422。
-_NOT_NULL_CUSTOMER_FIELDS = {"billing_day", "payment_method", "statement_day"}
-
-
-@router.put("/admin/customers/{user_id}", response_model=CustomerResponse)
-def update_customer(
-    user_id: int,
-    body: CustomerUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(ADMIN),
+@router.get("/admin/subscriptions")
+def list_subscriptions(
+    status: Optional[str] = None,
+    customer_id: Optional[int] = None,
+    camera_id: Optional[int] = None,
+    db: Session = Depends(get_db), _: User = Depends(ADMIN),
 ):
-    u = db.query(User).filter(User.id == user_id).first()
-    if not u:
-        raise HTTPException(404, "使用者不存在")
-    c = get_or_create_customer(db, user_id)
-    # PATCH 語意：只套用請求中真的有帶的欄位，避免把沒帶到的欄位覆寫成 None
-    # （custom_monthly_fee 等欄位 0 是合法值，不能用 is not None 判斷）。
-    # 用 model_fields_set 而非 model_dump(exclude_unset=True) 的 key 集合：
-    # 兩者理論上一致，但這裡明確表達「有沒有帶這個 key」的判斷依據。
-    fields_set = body.model_fields_set
-    data = body.model_dump(exclude_unset=True)
-    for field in fields_set & _NOT_NULL_CUSTOMER_FIELDS:
-        if data.get(field) is None:
-            raise HTTPException(422, f"{field} 不可清空為 null（此欄位不允許為空）")
-    # 只送數值欄位（commission_percent_bps / commission_fixed_amount）而不送
-    # commission_type 時，schema 層看不到客戶目前已存的型別，這裡用客戶現有的
-    # commission_type 判斷數值有沒有送錯欄位——避免看似合法的單一欄位更新，
-    # 實際上把數值寫進與目前型別不符的欄位（單位錯亂）。
-    if "commission_type" not in fields_set:
-        if "commission_percent_bps" in fields_set and c.commission_type != "percent":
-            raise HTTPException(422, "未設定 commission_type 為 percent 時，不可更新 commission_percent_bps")
-        if "commission_fixed_amount" in fields_set and c.commission_type != "fixed":
-            raise HTTPException(422, "未設定 commission_type 為 fixed 時，不可更新 commission_fixed_amount")
-        # 型別本身沒被清除（沒帶 commission_type）的情況下，數值欄位被明確傳 null
-        # 等於想清掉數值卻留著型別，型別/數值會不成對。要清空分潤設定必須整組清，
-        # 也就是傳 {"commission_type": null}，而不是單獨把數值清成 null。
-        if "commission_percent_bps" in fields_set and data.get("commission_percent_bps") is None:
-            raise HTTPException(422, "不可單獨將 commission_percent_bps 清空為 null；"
-                                      "請傳 {\"commission_type\": null} 清除整組分潤設定")
-        if "commission_fixed_amount" in fields_set and data.get("commission_fixed_amount") is None:
-            raise HTTPException(422, "不可單獨將 commission_fixed_amount 清空為 null；"
-                                      "請傳 {\"commission_type\": null} 清除整組分潤設定")
-    for field in ("billing_day", "note", "payment_method", "statement_day",
-                  "custom_monthly_fee", "commission_type",
-                  "commission_percent_bps", "commission_fixed_amount"):
-        if field in data:
-            setattr(c, field, data[field])
-    # 型別變更時把不相符的數值欄位清掉：兩個欄位都會回傳給前端，
-    # 殘留值會讓管理者看到「型別是固定金額，卻同時顯示 15%」。
-    if "commission_type" in fields_set:
-        if c.commission_type != "percent":
-            c.commission_percent_bps = None
-        if c.commission_type != "fixed":
-            c.commission_fixed_amount = None
-    # 稽核日誌只在分潤欄位真的有被這次請求改動時才附上分潤顯示字串，
-    # 避免日誌內容誤導成「這次操作有動到分潤」——即使值沒變。
-    commission_changed = bool(
-        fields_set & {"commission_type", "commission_percent_bps", "commission_fixed_amount"}
-    )
-    detail = commission_display(
-        c.commission_type, c.commission_percent_bps, c.commission_fixed_amount
-    ) if commission_changed else ""
-    log_action(db, current_user, "billing_update_customer", "billing_customer", user_id, detail)
-    db.commit(); db.refresh(c)
-    return CustomerResponse(user_id=u.id, username=u.username, email=u.email, role=u.role,
-                            billing_day=c.billing_day, frozen=c.frozen, note=c.note,
-                            payment_method=c.payment_method, statement_day=c.statement_day,
-                            custom_monthly_fee=c.custom_monthly_fee,
-                            commission_type=c.commission_type,
-                            commission_percent_bps=c.commission_percent_bps,
-                            commission_fixed_amount=c.commission_fixed_amount,
-                            commission_display=commission_display(
-                                c.commission_type, c.commission_percent_bps, c.commission_fixed_amount
-                            ))
+    q = db.query(BillingSubscriptionV2)
+    if status:
+        q = q.filter(BillingSubscriptionV2.status == status)
+    if customer_id:
+        q = q.filter(BillingSubscriptionV2.customer_id == customer_id)
+    if camera_id:
+        q = q.filter(BillingSubscriptionV2.camera_id == camera_id)
+    subs = q.order_by(BillingSubscriptionV2.id.desc()).all()
+    today = taipei_today()
+    names = _user_names(db, [s.customer_id for s in subs])
+    lock_map = get_lock_map(db)
+    return [_sub_out(db, s, today, names, lock_map) for s in subs]
 
 
-@router.post("/admin/customers/{user_id}/freeze")
-def freeze_customer(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    """只做標記：不會自動擋登入或斷服務（spec §5）。"""
-    u = db.query(User).filter(User.id == user_id).first()
-    if not u:
-        raise HTTPException(404, "使用者不存在")
-    c = get_or_create_customer(db, user_id)
-    c.frozen = True
-    c.frozen_at = datetime.utcnow()
-    log_action(db, current_user, "billing_freeze_customer", "billing_customer", user_id)
-    db.commit()
-    return {"message": "已標記凍結"}
-
-
-@router.post("/admin/customers/{user_id}/unfreeze")
-def unfreeze_customer(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    u = db.query(User).filter(User.id == user_id).first()
-    if not u:
-        raise HTTPException(404, "使用者不存在")
-    c = get_or_create_customer(db, user_id)
-    c.frozen = False
-    c.frozen_at = None
-    log_action(db, current_user, "billing_unfreeze_customer", "billing_customer", user_id)
-    db.commit()
-    return {"message": "已解除凍結"}
-
-
-def _sub_response(sub: BillingSubscription, plan: BillingPlan | None,
-                  customer: BillingCustomer | None) -> SubscriptionResponse:
-    # monthly_fee 要顯示「客戶實付」，不是方案原價——自訂月費（custom_monthly_fee）
-    # 設了就覆蓋方案月費，這裡跟 generate_invoices 用同一個 effective_monthly_fee，
-    # 否則列表上看到的月費會跟真正開出來的發票金額對不上。
-    plan_fee = plan.monthly_fee if plan else 0
-    custom_fee = customer.custom_monthly_fee if customer else None
-    return SubscriptionResponse(
-        id=sub.id, camera_id=sub.camera_id, customer_id=sub.customer_id, plan_id=sub.plan_id,
-        plan_name=plan.name if plan else None,
-        monthly_fee=effective_monthly_fee(plan_fee, custom_fee) if plan else 0,
-        status=sub.status,
-    )
-
-
-@router.get("/admin/subscriptions", response_model=list[SubscriptionResponse])
-def list_subscriptions(db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    subs = db.query(BillingSubscription).order_by(BillingSubscription.id).all()
-    plans = {p.id: p for p in db.query(BillingPlan).all()}
-    # 一次撈出所有客戶的自訂月費設定，避免逐筆查 DB（同檔既有慣例）。
-    customer_ids = {s.customer_id for s in subs}
-    customer_configs = {
-        c.user_id: c for c in db.query(BillingCustomer).filter(BillingCustomer.user_id.in_(customer_ids)).all()
-    }
-    return [_sub_response(s, plans.get(s.plan_id), customer_configs.get(s.customer_id)) for s in subs]
-
-
-@router.post("/admin/subscriptions", response_model=SubscriptionResponse)
-def create_subscription(
-    body: SubscriptionCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(ADMIN),
-):
-    plan = db.query(BillingPlan).filter(BillingPlan.id == body.plan_id).first()
-    if not plan:
-        raise HTTPException(404, "方案不存在")
-    if not db.query(User).filter(User.id == body.customer_id).first():
-        raise HTTPException(404, "客戶不存在")
-    dup = db.query(BillingSubscription).filter(
-        BillingSubscription.camera_id == body.camera_id,
-        BillingSubscription.status == "active",
-    ).first()
-    if dup:
-        raise HTTPException(409, "此相機已有生效中的訂閱")
-
-    # camera_serial 故意不從任何來源帶入，永遠是新建時的預設值 None：
-    # 目前沒有「更改既有訂閱 camera_id」的端點，所以沒有快取失效路徑；
-    # 未來若加上相機改派功能，務必在那裡清空舊訂閱的 camera_serial。
-    sub = BillingSubscription(camera_id=body.camera_id, customer_id=body.customer_id, plan_id=body.plan_id)
-    db.add(sub)
-    log_action(db, current_user, "billing_create_subscription", "billing_subscription", None,
-               f"camera={body.camera_id} plan={plan.name}")
-    try:
-        db.commit()
-    except IntegrityError:
-        # 並發下兩個請求可能都通過上面的 SELECT 檢查，部分唯一索引是最後防線
-        db.rollback()
-        raise HTTPException(409, "此相機已有生效中的訂閱")
-    db.refresh(sub)
-    customer = db.query(BillingCustomer).filter(BillingCustomer.user_id == body.customer_id).first()
-    return _sub_response(sub, plan, customer)
-
-
-@router.delete("/admin/subscriptions/{sub_id}")
-def cancel_subscription(sub_id: int, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    """軟性取消：保留歷史，讓已開立的發票仍能追溯到來源訂閱。"""
-    sub = db.query(BillingSubscription).filter(BillingSubscription.id == sub_id).first()
-    if not sub:
+@router.get("/admin/subscriptions/{sub_id}")
+def get_subscription(sub_id: int, db: Session = Depends(get_db), _: User = Depends(ADMIN)):
+    s = db.query(BillingSubscriptionV2).filter(BillingSubscriptionV2.id == sub_id).first()
+    if not s:
         raise HTTPException(404, "訂閱不存在")
-    sub.status = "cancelled"
-    sub.cancelled_at = datetime.utcnow()
-    log_action(db, current_user, "billing_cancel_subscription", "billing_subscription", sub_id)
-    db.commit()
-    return {"message": "已取消訂閱"}
+    today = taipei_today()
+    out = _sub_out(db, s, today)
+    bills = db.query(BillingBill).filter(BillingBill.subscription_id == s.id).order_by(
+        BillingBill.period_start.desc()).all()
+    out["bills"] = [_bill_out(b, today, s.status) for b in bills]
+    return out
 
 
-PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+@router.post("/admin/subscriptions")
+async def create_subscriptions(body: SubscriptionIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    today = taipei_today()
+    customer = db.query(User).filter(User.id == body.customer_id).first()
+    if not customer or customer.role != "reseller" or not customer.is_active:
+        raise HTTPException(422, "付款人必須是啟用中的 reseller")
+    plan = db.query(BillingPlanV2).filter(BillingPlanV2.id == body.plan_id).first()
+    if not plan or not plan.is_active:
+        raise HTTPException(422, "方案不存在或已停用")
+    if body.start_date < today - timedelta(days=MAX_BACKDATE_DAYS):
+        raise HTTPException(422, f"起始日最多回溯 {MAX_BACKDATE_DAYS} 天")
+    if len(set(body.camera_ids)) != len(body.camera_ids):
+        raise HTTPException(422, "相機重複")
 
-
-def _check_period(period: str):
-    if not PERIOD_RE.match(period):
-        raise HTTPException(422, "期別格式須為 YYYY-MM")
-
-
-def _invoice_response(inv: BillingInvoice, customer_name: str | None = None) -> InvoiceResponse:
-    return InvoiceResponse(
-        id=inv.id, customer_id=inv.customer_id, customer_name=customer_name,
-        period=inv.period, total=inv.total, status=inv.status,
-        issued_at=inv.issued_at, paid_at=inv.paid_at,
-    )
-
-
-@router.get("/admin/invoices", response_model=list[InvoiceResponse])
-def list_invoices(period: str, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    _check_period(period)
-    invs = db.query(BillingInvoice).filter(BillingInvoice.period == period).order_by(BillingInvoice.id).all()
-    customer_ids = {i.customer_id for i in invs}
-    names = {u.id: u.username for u in db.query(User).filter(User.id.in_(customer_ids)).all()}
-    return [_invoice_response(i, names.get(i.customer_id)) for i in invs]
-
-
-@router.get("/admin/invoices/{invoice_id}", response_model=InvoiceDetailResponse)
-def get_invoice(invoice_id: int, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    inv = db.query(BillingInvoice).filter(BillingInvoice.id == invoice_id).first()
-    if not inv:
-        raise HTTPException(404, "發票不存在")
-    return _build_invoice_detail(db, inv)
-
-
-def _build_invoice_detail(db: Session, inv: BillingInvoice) -> InvoiceDetailResponse:
-    lines = db.query(BillingInvoiceLine).filter(BillingInvoiceLine.invoice_id == inv.id).all()
-    u = db.query(User).filter(User.id == inv.customer_id).first()
-    return InvoiceDetailResponse(
-        id=inv.id, customer_id=inv.customer_id, customer_name=u.username if u else None,
-        period=inv.period, total=inv.total, status=inv.status,
-        issued_at=inv.issued_at, paid_at=inv.paid_at,
-        lines=[InvoiceLineResponse(id=l.id, camera_id=l.camera_id, camera_name=l.camera_name,
-                                   plan_name=l.plan_name, amount=l.amount) for l in lines],
-    )
-
-
-@router.post("/admin/invoices/generate/{period}")
-def generate_invoices(period: str, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    """為該期別產生發票。冪等：已有發票的客戶直接跳過。
-
-    冪等性靠 UNIQUE(customer_id, period)＋這裡的預先查詢兩層保障。
-    舊版沒有這層，管理者點兩次就產生兩批發票。
-    """
-    _check_period(period)
-    # 只計入非作廢的發票：作廢的發票不再佔用該期別，讓客戶＋期別可以重新開立
-    existing = {
-        i.customer_id for i in db.query(BillingInvoice).filter(
-            BillingInvoice.period == period, BillingInvoice.status != "void",
-        ).all()
-    }
-
-    period_start, _period_end = period_bounds_utc(period)
-    # design doc §5：入會當月免費，帳單從「加入後的下一期」才開始收——
-    # 訂閱必須在該期別開始「之前」就已存在(started_at < period_start)。
-    # 且訂閱狀態不能只看 active：已取消的訂閱在取消之前仍佔用過的期別，
-    # 也應該能補開歷史發票，所以連 cancelled 一起查，改用
-    # cancelled_at IS NULL OR cancelled_at > period_start 判斷「該期別當時是否仍生效」。
-    # 用嚴格大於（而非 >=）是為了與 started_at < period_start 對稱：剛好在期別起點
-    # 取消，代表這個客戶在該期別「一刻都沒有生效過」，不該被計費，等同剛好在期別
-    # 起點才加入的訂閱該期免費一樣的道理。
-    subs = db.query(BillingSubscription).filter(
-        BillingSubscription.status.in_(["active", "cancelled"]),
-        BillingSubscription.started_at < period_start,
-        (BillingSubscription.cancelled_at.is_(None)) | (BillingSubscription.cancelled_at > period_start),
-    ).all()
-    plans = {p.id: p for p in db.query(BillingPlan).all()}
-
-    by_customer: dict[int, list] = {}
-    for s in subs:
-        by_customer.setdefault(s.customer_id, []).append(s)
-
-    # 一次撈出所有相關客戶的自訂月費設定，避免在下方迴圈內逐一查 DB
-    # （同檔 list_subscriptions／list_customers 的既有慣例）。
-    customer_configs = {
-        c.user_id: c for c in db.query(BillingCustomer).filter(
-            BillingCustomer.user_id.in_(by_customer.keys())
-        ).all()
-    }
-
-    created = 0
-    skipped_existing = 0  # 冪等跳過：這期已有非作廢發票，正常重跑行為，不是錯誤
-    skipped_conflict = 0  # 真的撞到部分唯一索引：預查沒擋到、寫入當下才發現的並發衝突
-    for customer_id, customer_subs in by_customer.items():
-        if customer_id in existing:
-            skipped_existing += 1
+    results = []
+    for cid in body.camera_ids:
+        if db.query(BillingSubscriptionV2).filter(
+                BillingSubscriptionV2.camera_id == cid,
+                BillingSubscriptionV2.status.in_(OPEN_STATUSES)).first():
+            results.append({"camera_id": cid, "ok": False, "error": "這台相機已有生效中的訂閱"})
             continue
-        line_data = []
-        for s in customer_subs:
-            plan = plans.get(s.plan_id)
-            if not plan:
-                continue
-            line_data.append((s, plan))
-        if not line_data:
-            continue
-
-        # 自訂月費覆蓋方案月費：custom_monthly_fee 為 None 代表沒談成客製價，
-        # 用方案原價；0 是合法值（談成免費），effective_monthly_fee 已處理這個判斷。
-        cfg = customer_configs.get(customer_id)
-        custom_fee = cfg.custom_monthly_fee if cfg else None
-        line_fees = [(s, p, effective_monthly_fee(p.monthly_fee, custom_fee)) for s, p in line_data]
-
-        # 每個客戶各自一個 savepoint：舊版整批只 commit 一次，
-        # 若某個客戶觸發部分唯一索引，rollback 會連同其他客戶「這次呼叫已建立
-        # 但尚未提交」的發票與明細一起丟掉，卻仍回報成功。改成逐客戶 savepoint，
-        # 一個客戶失敗只影響該客戶，其餘客戶正常寫入。
+        name, serial = await _resolve_camera(cid)
+        sub = BillingSubscriptionV2(
+            camera_id=cid, camera_name=name or f"相機 #{cid}", camera_serial=serial,
+            customer_id=customer.id, plan_id=plan.id, plan_name=plan.name,
+            term=plan.term, cycle=plan.cycle,
+            price=plan.price if body.price is None else body.price,
+            start_date=body.start_date, anchor_day=body.start_date.day, term_start=body.start_date,
+            auto_renew=body.auto_renew,
+            status="scheduled" if body.start_date > today else "active",
+            note=body.note, created_by=me.id,
+        )
+        db.add(sub)
         try:
-            with db.begin_nested():
-                inv = BillingInvoice(
-                    customer_id=customer_id, period=period,
-                    total=invoice_total([fee for _, _, fee in line_fees]),
-                    status="unpaid",
-                )
-                db.add(inv); db.flush()   # 取得 inv.id 供明細使用
-                for s, p, fee in line_fees:
-                    # 快照：方案改價、相機改名、或事後調整自訂月費，
-                    # 都不得影響這張已開立發票的明細金額。
-                    db.add(BillingInvoiceLine(
-                        invoice_id=inv.id, subscription_id=s.id, camera_id=s.camera_id,
-                        camera_name=None, plan_name=p.name, amount=fee,
-                    ))
+            db.flush()
         except IntegrityError:
-            # 並發下另一個管理者同時產生了同一客戶＋期別的發票，
-            # 部分唯一索引擋下重複列；savepoint 已自動 rollback，計入 skipped_conflict
-            skipped_conflict += 1
+            db.rollback()
+            results.append({"camera_id": cid, "ok": False, "error": "這台相機已有生效中的訂閱"})
             continue
-        created += 1
+        log_action(db, me, "billing.subscription.create", "billing_subscription", sub.id,
+                   f"camera={cid} customer={customer.id} plan={plan.id} price={sub.price} start={sub.start_date}")
+        db.commit()
+        created = advance_one(db, sub, today)
+        marked = 0
+        if body.mark_past_due_paid:
+            for b in db.query(BillingBill).filter(
+                    BillingBill.subscription_id == sub.id, BillingBill.status == "unpaid",
+                    BillingBill.due_date < today).all():
+                b.status, b.paid_on, b.paid_at = "paid", b.due_date, datetime.utcnow()
+                b.paid_note = "補登訂閱時標記為已收款"
+                marked += 1
+            if marked:
+                log_action(db, me, "billing.bill.mark_paid", "billing_subscription", sub.id,
+                           f"backfill {marked} bills")
+            db.commit()
+        results.append({"camera_id": cid, "ok": True, "subscription_id": sub.id,
+                        "bills_created": created, "bills_marked_paid": marked})
+    invalidate_lock_cache()
+    return {"results": results}
 
-    skipped = skipped_existing + skipped_conflict
-    log_action(db, current_user, "billing_generate_invoices", "billing_invoice", None,
-               f"period={period} created={created} skipped_existing={skipped_existing} "
-               f"skipped_conflict={skipped_conflict}")
+
+def _load_sub_for_update(db: Session, sub_id: int) -> BillingSubscriptionV2:
+    s = db.query(BillingSubscriptionV2).filter(BillingSubscriptionV2.id == sub_id).with_for_update().first()
+    if not s:
+        raise HTTPException(404, "訂閱不存在")
+    return s
+
+
+async def _suspend(db: Session, sub_id: int, me: User) -> BillingSubscriptionV2:
+    s = _load_sub_for_update(db, sub_id)
+    if s.status != "active":
+        raise HTTPException(409, f"目前狀態為 {s.status}，無法暫停")
+    s.status = "suspended"
+    s.suspended_at = datetime.utcnow()
+    await _ensure_serial(db, s)
+    log_action(db, me, "billing.subscription.suspend", "billing_subscription", s.id, f"camera={s.camera_id}")
     db.commit()
-    msg = f"{period} 已產生 {created} 張發票"
-    if skipped_existing:
-        msg += f"，{skipped_existing} 筆該客戶本期已有發票故跳過"
-    if skipped_conflict:
-        msg += f"，另有 {skipped_conflict} 筆因併發衝突略過"
+    invalidate_lock_cache()
+    return s
+
+
+async def _end_sub(db: Session, sub_id: int, body: EndIn, me: User) -> BillingSubscriptionV2:
+    s = _load_sub_for_update(db, sub_id)
+    if s.status not in OPEN_STATUSES:
+        raise HTTPException(409, f"目前狀態為 {s.status}，無法結束")
+    unpaid = {b.id: b for b in db.query(BillingBill).filter(
+        BillingBill.subscription_id == s.id, BillingBill.status == "unpaid").all()}
+    for bid, act in body.bill_actions.items():
+        if bid not in unpaid:
+            raise HTTPException(422, f"帳單 #{bid} 不是這份訂閱的未繳帳單")
+        if act == "void" and unpaid[bid].pending_report_id:
+            raise HTTPException(409, f"帳單 #{bid} 有待確認的付款回報，請先審核再作廢")
+    for bid, act in body.bill_actions.items():
+        if act == "void":
+            b = unpaid[bid]
+            b.status, b.voided_at, b.void_reason = "void", datetime.utcnow(), "結束訂閱時作廢"
+    today = taipei_today()
+    s.status = "ended"
+    s.ended_at = taipei_date_to_utc_naive(today)
+    s.end_reason = body.reason
+    s.cancel_at = None
+    await _ensure_serial(db, s)
+    voided = [b for b, a in body.bill_actions.items() if a == "void"]
+    log_action(db, me, "billing.subscription.end", "billing_subscription", s.id,
+               f"camera={s.camera_id} reason={body.reason} voided={voided}")
+    db.commit()
+    invalidate_lock_cache()
+    return s
+
+
+@router.post("/admin/subscriptions/{sub_id}/suspend")
+async def suspend_subscription(sub_id: int, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    s = await _suspend(db, sub_id, me)
+    return _sub_out(db, s, taipei_today())
+
+
+@router.post("/admin/subscriptions/{sub_id}/resume")
+def resume_subscription(sub_id: int, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    s = _load_sub_for_update(db, sub_id)
+    if s.status != "suspended":
+        raise HTTPException(409, f"目前狀態為 {s.status}，無法恢復")
+    s.status = "active"
+    s.suspended_at = None
+    log_action(db, me, "billing.subscription.resume", "billing_subscription", s.id, f"camera={s.camera_id}")
+    db.commit()
+    advance_one(db, s)
+    return _sub_out(db, s, taipei_today())
+
+
+@router.post("/admin/subscriptions/{sub_id}/end")
+async def end_subscription(sub_id: int, body: EndIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    s = await _end_sub(db, sub_id, body, me)
+    return _sub_out(db, s, taipei_today())
+
+
+@router.post("/admin/subscriptions/{sub_id}/schedule-cancel")
+def schedule_cancel(sub_id: int, body: ScheduleCancelIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    """到期不續約：月約在下一個帳單日結束；年約在合約到期日結束。到期當天起相機鎖定（spec D9）。"""
+    s = _load_sub_for_update(db, sub_id)
+    if s.status not in ("active", "suspended"):
+        raise HTTPException(409, f"目前狀態為 {s.status}，無法設定不續約")
+    today = taipei_today()
+    if body.cancel:
+        s.cancel_at = (term_end_of(s.term_start, s.anchor_day) if s.term == "annual"
+                       else next_bill_date_after(s.start_date, s.cycle, s.anchor_day, today))
+    else:
+        s.cancel_at = None
+    log_action(db, me, "billing.subscription.schedule_cancel", "billing_subscription", s.id,
+               f"cancel_at={s.cancel_at}")
+    db.commit()
+    return _sub_out(db, s, today)
+
+
+@router.post("/admin/subscriptions/{sub_id}/release-lock")
+def release_lock(sub_id: int, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    """已結束的訂閱解除鎖定：相機回到未納管，不計費、所有人照常使用（spec §6.3）。"""
+    s = _load_sub_for_update(db, sub_id)
+    if s.status != "ended":
+        raise HTTPException(409, "只有已結束的訂閱可以解除鎖定")
+    if s.lock_released_at is None:
+        s.lock_released_at = datetime.utcnow()
+        log_action(db, me, "billing.subscription.release_lock", "billing_subscription", s.id,
+                   f"camera={s.camera_id}")
+        db.commit()
+    invalidate_lock_cache()
+    return _sub_out(db, s, taipei_today())
+
+
+# ── 帳單 ──────────────────────────────────────────────────────────────
+
+class MarkPaidIn(BaseModel):
+    bill_ids: list[int] = Field(min_length=1, max_length=200)
+    paid_on: date
+    paid_note: Optional[str] = Field(default=None, max_length=500)
+    resume_subscriptions: bool = False
+
+
+class VoidIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class AmountIn(BaseModel):
+    amount: int = Field(ge=0, le=10_000_000)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+@router.get("/admin/bills")
+def list_bills(
+    status: Optional[Literal["unpaid", "paid", "void"]] = None,
+    overdue: Optional[bool] = None,
+    customer_id: Optional[int] = None,
+    subscription_id: Optional[int] = None,
+    due_from: Optional[date] = None,
+    due_to: Optional[date] = None,
+    db: Session = Depends(get_db), _: User = Depends(ADMIN),
+):
+    today = taipei_today()
+    q = db.query(BillingBill)
+    if status:
+        q = q.filter(BillingBill.status == status)
+    if overdue is True:
+        q = q.filter(BillingBill.status == "unpaid", BillingBill.due_date < today)
+    if customer_id:
+        q = q.filter(BillingBill.customer_id == customer_id)
+    if subscription_id:
+        q = q.filter(BillingBill.subscription_id == subscription_id)
+    if due_from:
+        q = q.filter(BillingBill.due_date >= due_from)
+    if due_to:
+        q = q.filter(BillingBill.due_date <= due_to)
+    bills = q.order_by(BillingBill.due_date.desc(), BillingBill.id.desc()).limit(500).all()
+    names = _user_names(db, [b.customer_id for b in bills])
+    statuses = {s.id: s.status for s in db.query(BillingSubscriptionV2).filter(
+        BillingSubscriptionV2.id.in_({b.subscription_id for b in bills} or {0})).all()}
+    out = []
+    for b in bills:
+        row = _bill_out(b, today, statuses.get(b.subscription_id))
+        row["customer_name"] = names.get(b.customer_id)
+        out.append(row)
+    return out
+
+
+def _lock_bills(db: Session, ids) -> dict[int, BillingBill]:
+    rows = db.query(BillingBill).filter(BillingBill.id.in_(set(ids))).with_for_update().all()
+    return {b.id: b for b in rows}
+
+
+@router.post("/admin/bills/mark-paid")
+def mark_paid(body: MarkPaidIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    """直接標記收款（沒有付款回報時用）。在 pending 回報中的帳單一律 409，避免同一筆錢記兩次。"""
+    today = taipei_today()
+    if body.paid_on > today:
+        raise HTTPException(422, "付款日不可晚於今天")
+    bills = _lock_bills(db, body.bill_ids)
+    missing = set(body.bill_ids) - set(bills)
+    if missing:
+        raise HTTPException(404, f"帳單不存在：{sorted(missing)}")
+    bad = [b.id for b in bills.values() if b.status != "unpaid"]
+    if bad:
+        raise HTTPException(409, f"帳單 {bad} 不是未繳狀態")
+    pending = [b.id for b in bills.values() if b.pending_report_id]
+    if pending:
+        raise HTTPException(409, {"code": "BILL_IN_PENDING_REPORT", "bill_ids": pending,
+                                  "message": "這些帳單有待確認的付款回報，請從付款確認處理"})
+    now = datetime.utcnow()
+    for b in bills.values():
+        b.status, b.paid_on, b.paid_at, b.paid_note = "paid", body.paid_on, now, body.paid_note
+    log_action(db, me, "billing.bill.mark_paid", "billing_bill", None,
+               f"bills={sorted(bills)} paid_on={body.paid_on}")
+    resumed = _maybe_resume(db, [b.subscription_id for b in bills.values()], today, me) \
+        if body.resume_subscriptions else []
+    db.commit()
+    invalidate_lock_cache()
+    return {"paid": len(bills), "resumed": resumed}
+
+
+@router.post("/admin/bills/{bill_id}/void")
+def void_bill(bill_id: int, body: VoidIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    b = _lock_bills(db, [bill_id]).get(bill_id)
+    if not b:
+        raise HTTPException(404, "帳單不存在")
+    if b.status == "paid":
+        raise HTTPException(409, "已收款的帳單不可作廢")
+    if b.status == "void":
+        raise HTTPException(409, "帳單已作廢")
+    if b.pending_report_id:
+        raise HTTPException(409, "這張帳單有待確認的付款回報，請先確認或退回")
+    b.status, b.voided_at, b.void_reason = "void", datetime.utcnow(), body.reason
+    log_action(db, me, "billing.bill.void", "billing_bill", b.id, body.reason)
+    db.commit()
+    return _bill_out(b, taipei_today())
+
+
+@router.put("/admin/bills/{bill_id}/amount")
+def change_amount(bill_id: int, body: AmountIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    b = _lock_bills(db, [bill_id]).get(bill_id)
+    if not b:
+        raise HTTPException(404, "帳單不存在")
+    if b.status != "unpaid":
+        raise HTTPException(409, "只有未繳帳單可以改金額")
+    if b.pending_report_id:
+        raise HTTPException(409, "這張帳單有待確認的付款回報，請先確認或退回")
+    old = b.amount
+    b.amount = body.amount
+    log_action(db, me, "billing.bill.amount", "billing_bill", b.id, f"{old} -> {body.amount}：{body.reason}")
+    db.commit()
+    return _bill_out(b, taipei_today())
+
+
+# ── 逾期處置 ──────────────────────────────────────────────────────────
+
+class OverdueAction(BaseModel):
+    subscription_id: int
+    action: Literal["none", "suspend", "end"]
+    bill_actions: dict[int, Literal["keep", "void"]] = {}
+
+
+class OverdueApplyIn(BaseModel):
+    actions: list[OverdueAction] = Field(min_length=1, max_length=200)
+
+
+def _overdue_groups(db: Session, today: date) -> dict:
+    bills = db.query(BillingBill).filter(
+        BillingBill.status == "unpaid", BillingBill.due_date < today).all()
+    sub_ids = {b.subscription_id for b in bills}
+    subs = {s.id: s for s in db.query(BillingSubscriptionV2).filter(
+        BillingSubscriptionV2.id.in_(sub_ids or {0})).all()}
+    report_ids = {b.pending_report_id for b in bills if b.pending_report_id}
+    reports = {r.id: r for r in db.query(BillingPaymentReport).filter(
+        BillingPaymentReport.id.in_(report_ids or {0})).all()}
+    names = _user_names(db, [b.customer_id for b in bills])
+    customers: dict[int, dict] = {}
+    for b in sorted(bills, key=lambda x: x.due_date):
+        s = subs.get(b.subscription_id)
+        c = customers.setdefault(b.customer_id, {
+            "customer_id": b.customer_id, "customer_name": names.get(b.customer_id),
+            "total": 0, "subscriptions": {}})
+        row = c["subscriptions"].setdefault(b.subscription_id, {
+            "subscription_id": b.subscription_id, "camera_id": b.camera_id,
+            "camera_name": (s.camera_name if s else None) or b.camera_name,
+            "plan_name": s.plan_name if s else b.plan_name,
+            "term": s.term if s else None, "cycle": b.cycle,
+            "status": s.status if s else None,
+            "suspended_at": _utc_iso(s.suspended_at) if s else None,
+            "ended_at": _utc_iso(s.ended_at) if s else None,
+            "bill_count": 0, "total": 0, "max_overdue_days": 0,
+            "bills": [], "all_pending": True, "reported_at": None})
+        row["bill_count"] += 1
+        row["total"] += b.amount
+        row["max_overdue_days"] = max(row["max_overdue_days"], overdue_days(b.due_date, today))
+        rep = reports.get(b.pending_report_id) if b.pending_report_id else None
+        row["bills"].append({"id": b.id, "amount": b.amount, "due_date": _iso(b.due_date),
+                             "period_start": _iso(b.period_start), "period_end": _iso(b.period_end),
+                             "pending_report_id": b.pending_report_id})
+        if not rep:
+            row["all_pending"] = False
+        elif row["reported_at"] is None or _utc_iso(rep.created_at) < row["reported_at"]:
+            row["reported_at"] = _utc_iso(rep.created_at)
+        c["total"] += b.amount
+    out = []
+    undecided = 0
+    for c in customers.values():
+        rows = sorted(c["subscriptions"].values(), key=lambda r: -r["max_overdue_days"])
+        undecided += sum(1 for r in rows if r["status"] == "active")
+        out.append({**c, "subscriptions": rows})
+    out.sort(key=lambda c: -c["total"])
+    return {"customers": out, "undecided": undecided, "total": sum(c["total"] for c in out),
+            "camera_count": sum(len(c["subscriptions"]) for c in out)}
+
+
+@router.get("/admin/overdue")
+def overdue_list(db: Session = Depends(get_db), _: User = Depends(ADMIN)):
+    return _overdue_groups(db, taipei_today())
+
+
+@router.post("/admin/overdue/apply")
+async def overdue_apply(body: OverdueApplyIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    """逐筆執行、逐筆回結果：部分失敗不可整體顯示成功（spec §9.3）。"""
+    results = []
+    for a in body.actions:
+        if a.action == "none":
+            results.append({"subscription_id": a.subscription_id, "ok": True, "action": "none"})
+            continue
+        try:
+            if a.action == "suspend":
+                await _suspend(db, a.subscription_id, me)
+            else:
+                await _end_sub(db, a.subscription_id, EndIn(reason="non_payment", bill_actions=a.bill_actions), me)
+            results.append({"subscription_id": a.subscription_id, "ok": True, "action": a.action})
+        except HTTPException as e:
+            db.rollback()
+            detail = e.detail if isinstance(e.detail, str) else str(e.detail)
+            results.append({"subscription_id": a.subscription_id, "ok": False, "action": a.action,
+                            "error": detail})
+    return {"results": results}
+
+
+# ── 付款回報（reseller）───────────────────────────────────────────────
+
+def _sniff_receipt(data: bytes) -> Optional[str]:
+    """以檔頭判斷類型，不信任 Content-Type 與副檔名。"""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"%PDF-"):
+        return "application/pdf"
+    return None
+
+
+def _report_out(db: Session, r: BillingPaymentReport, today: date, names: Optional[dict] = None) -> dict:
+    links = db.query(BillingPaymentReportBill).filter(BillingPaymentReportBill.report_id == r.id).all()
+    bills = {b.id: b for b in db.query(BillingBill).filter(
+        BillingBill.id.in_({l.bill_id for l in links} or {0})).all()}
+    has_receipt = db.query(BillingPaymentReceipt.report_id).filter(
+        BillingPaymentReceipt.report_id == r.id).first() is not None
+    sub_status = {s.id: s.status for s in db.query(BillingSubscriptionV2).filter(
+        BillingSubscriptionV2.id.in_({b.subscription_id for b in bills.values()} or {0})).all()}
+    bill_rows = []
+    for l in links:
+        b = bills.get(l.bill_id)
+        if not b:
+            continue
+        row = _bill_out(b, today, sub_status.get(b.subscription_id))
+        row["amount_snapshot"] = l.amount_snapshot
+        row["confirmed"] = l.confirmed
+        bill_rows.append(row)
+    bill_rows.sort(key=lambda x: x["period_start"] or "")
+    bills_total = sum(l.amount_snapshot for l in links)
+    names = names if names is not None else _user_names(db, [r.customer_id, r.reviewed_by])
     return {
-        "message": msg,
-        "created": created,
-        "skipped": skipped,
-        "skipped_existing": skipped_existing,
-        "skipped_conflict": skipped_conflict,
+        "id": r.id, "customer_id": r.customer_id, "customer_name": names.get(r.customer_id),
+        "paid_on": _iso(r.paid_on), "amount": r.amount, "method": r.method,
+        "account_last5": r.account_last5, "note": r.note, "status": r.status,
+        "reviewed_by": r.reviewed_by, "reviewed_by_name": names.get(r.reviewed_by),
+        "reviewed_at": _utc_iso(r.reviewed_at), "review_note": r.review_note,
+        "created_at": _utc_iso(r.created_at),
+        "waiting_days": (today - taipei_today(r.created_at)).days if r.status == "pending" else None,
+        "bills": bill_rows, "bills_total": bills_total, "difference": r.amount - bills_total,
+        "has_receipt": has_receipt,
     }
 
 
-@router.post("/admin/invoices/{invoice_id}/mark-paid")
-def mark_invoice_paid(invoice_id: int, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    inv = db.query(BillingInvoice).filter(BillingInvoice.id == invoice_id).first()
-    if not inv:
-        raise HTTPException(404, "發票不存在")
-    if inv.status == "void":
-        raise HTTPException(409, "已作廢的發票不能標記收款")
-    if inv.status == "paid":
-        # 重複點擊不是錯誤操作，但不能覆寫已存在的收款時間，
-        # 否則帳上的收款時點會被重複點擊不斷往後推，變得不可信
-        return {"message": "此發票已標記收款，未變更收款時間"}
-    inv.status = "paid"
-    inv.paid_at = datetime.utcnow()
-    log_action(db, current_user, "billing_mark_paid", "billing_invoice", invoice_id)
+@router.post("/my/payment-reports")
+async def create_payment_report(
+    bill_ids: str = Form(...),
+    paid_on: date = Form(...),
+    amount: int = Form(...),
+    method: str = Form(...),
+    account_last5: Optional[str] = Form(None),
+    note: Optional[str] = Form(None),
+    receipt: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    if me.role != "reseller":
+        raise HTTPException(403, "只有付款人（reseller）可以回報付款")
+    today = taipei_today()
+    try:
+        ids = sorted({int(x) for x in bill_ids.split(",") if x.strip()})
+    except ValueError:
+        raise HTTPException(422, "帳單編號格式錯誤")
+    if not ids:
+        raise HTTPException(422, "請至少選一張帳單")
+    if paid_on > today:
+        raise HTTPException(422, "付款日不可晚於今天")
+    if amount <= 0 or amount > 100_000_000:
+        raise HTTPException(422, "付款金額必須是正整數")
+    if method not in ("transfer", "cash", "other"):
+        raise HTTPException(422, "付款方式不正確")
+    last5 = (account_last5 or "").strip() or None
+    if method == "transfer" and not (last5 and LAST5_RE.match(last5)):
+        raise HTTPException(422, "轉帳請填帳號末五碼（5 位數字）")
+    if last5 and not LAST5_RE.match(last5):
+        raise HTTPException(422, "帳號末五碼必須是 5 位數字")
+    note = (note or "").strip() or None
+    if note and len(note) > 500:
+        raise HTTPException(422, "備註最多 500 字")
+
+    receipt_data = receipt_type = None
+    if receipt is not None and receipt.filename:
+        receipt_data = await receipt.read(MAX_RECEIPT_BYTES + 1)
+        if len(receipt_data) > MAX_RECEIPT_BYTES:
+            raise HTTPException(422, "收據檔案不可超過 2 MB")
+        receipt_type = _sniff_receipt(receipt_data)
+        if not receipt_type:
+            raise HTTPException(422, "收據只接受 jpg、png、pdf")
+
+    pending_count = db.query(BillingPaymentReport).filter(
+        BillingPaymentReport.customer_id == me.id, BillingPaymentReport.status == "pending").count()
+    if pending_count >= MAX_PENDING_REPORTS:
+        raise HTTPException(409, f"待確認的付款回報已達 {MAX_PENDING_REPORTS} 份，請等候確認")
+
+    bills = _lock_bills(db, ids)
+    if set(ids) - {b.id for b in bills.values() if b.customer_id == me.id}:
+        raise HTTPException(404, "帳單不存在")
+    paid = [b.id for b in bills.values() if b.status != "unpaid"]
+    if paid:
+        raise HTTPException(409, {"code": "BILL_NOT_UNPAID", "bill_ids": paid,
+                                  "message": "部分帳單已收款或已作廢"})
+    busy = [b.id for b in bills.values() if b.pending_report_id]
+    if busy:
+        raise HTTPException(409, {"code": "BILL_IN_PENDING_REPORT", "bill_ids": busy,
+                                  "message": "部分帳單已在另一份待確認的回報中"})
+
+    r = BillingPaymentReport(customer_id=me.id, paid_on=paid_on, amount=amount, method=method,
+                             account_last5=last5, note=note, status="pending")
+    db.add(r)
+    db.flush()
+    for b in bills.values():
+        db.add(BillingPaymentReportBill(report_id=r.id, bill_id=b.id, amount_snapshot=b.amount))
+        b.pending_report_id = r.id
+    if receipt_data:
+        db.add(BillingPaymentReceipt(report_id=r.id, content_type=receipt_type, data=receipt_data,
+                                     sha256=hashlib.sha256(receipt_data).hexdigest()))
+    log_action(db, me, "billing.report.create", "billing_report", r.id,
+               f"bills={ids} amount={amount} method={method} receipt={bool(receipt_data)}")
     db.commit()
-    return {"message": "已標記收款"}
+    return _report_out(db, r, today)
 
 
-@router.post("/admin/invoices/{invoice_id}/void")
-def void_invoice(invoice_id: int, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    inv = db.query(BillingInvoice).filter(BillingInvoice.id == invoice_id).first()
-    if not inv:
-        raise HTTPException(404, "發票不存在")
-    if inv.status == "paid":
-        raise HTTPException(409, "已收款的發票須先辦理退款/沖銷才能作廢")
-    inv.status = "void"
-    log_action(db, current_user, "billing_void_invoice", "billing_invoice", invoice_id)
+@router.get("/my/payment-reports")
+def my_payment_reports(db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+    rows = db.query(BillingPaymentReport).filter(BillingPaymentReport.customer_id == me.id).order_by(
+        BillingPaymentReport.id.desc()).limit(100).all()
+    today = taipei_today()
+    names = _user_names(db, [me.id] + [r.reviewed_by for r in rows])
+    return [_report_out(db, r, today, names) for r in rows]
+
+
+def _clear_pending(db: Session, report_id: int) -> None:
+    for b in db.query(BillingBill).filter(BillingBill.pending_report_id == report_id).with_for_update().all():
+        b.pending_report_id = None
+
+
+@router.post("/my/payment-reports/{report_id}/withdraw")
+def withdraw_report(report_id: int, db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+    r = db.query(BillingPaymentReport).filter(
+        BillingPaymentReport.id == report_id, BillingPaymentReport.customer_id == me.id).with_for_update().first()
+    if not r:
+        raise HTTPException(404, "回報不存在")
+    if r.status != "pending":
+        raise HTTPException(409, "只有待確認的回報可以撤回")
+    r.status = "withdrawn"
+    _clear_pending(db, r.id)
+    log_action(db, me, "billing.report.withdraw", "billing_report", r.id, None)
     db.commit()
-    return {"message": "已作廢"}
+    return _report_out(db, r, taipei_today())
 
+
+def _receipt_response(row: Optional[BillingPaymentReceipt]) -> Response:
+    if not row:
+        raise HTTPException(404, "沒有收據")
+    headers = {"X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-store"}
+    if row.content_type == "application/pdf":
+        headers["Content-Disposition"] = f'attachment; filename="receipt-{row.report_id}.pdf"'
+    return Response(content=row.data, media_type=row.content_type, headers=headers)
+
+
+@router.get("/my/payment-reports/{report_id}/receipt")
+def my_receipt(report_id: int, db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+    r = db.query(BillingPaymentReport).filter(
+        BillingPaymentReport.id == report_id, BillingPaymentReport.customer_id == me.id).first()
+    if not r:
+        raise HTTPException(404, "回報不存在")
+    return _receipt_response(db.query(BillingPaymentReceipt).filter(
+        BillingPaymentReceipt.report_id == r.id).first())
+
+
+# ── 付款確認（admin）──────────────────────────────────────────────────
+
+class ConfirmIn(BaseModel):
+    bill_ids: list[int] = Field(min_length=1, max_length=200)
+    paid_note: Optional[str] = Field(default=None, max_length=500)
+    resume_subscriptions: bool = False
+
+
+class RejectIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("退回原因必填")
+        return v.strip()
+
+
+@router.get("/admin/payment-reports")
+def list_reports(
+    status: Optional[Literal["pending", "confirmed", "rejected", "withdrawn"]] = None,
+    customer_id: Optional[int] = None,
+    db: Session = Depends(get_db), _: User = Depends(ADMIN),
+):
+    q = db.query(BillingPaymentReport)
+    if status:
+        q = q.filter(BillingPaymentReport.status == status)
+    if customer_id:
+        q = q.filter(BillingPaymentReport.customer_id == customer_id)
+    # 待確認：等最久的排前面；其餘：最新的在前
+    q = q.order_by(BillingPaymentReport.created_at.asc() if status == "pending"
+                   else BillingPaymentReport.id.desc())
+    rows = q.limit(200).all()
+    today = taipei_today()
+    names = _user_names(db, [r.customer_id for r in rows] + [r.reviewed_by for r in rows])
+    return [_report_out(db, r, today, names) for r in rows]
+
+
+@router.get("/admin/payment-reports/{report_id}")
+def get_report(report_id: int, db: Session = Depends(get_db), _: User = Depends(ADMIN)):
+    r = db.query(BillingPaymentReport).filter(BillingPaymentReport.id == report_id).first()
+    if not r:
+        raise HTTPException(404, "回報不存在")
+    out = _report_out(db, r, taipei_today())
+    # 確認後哪些暫停中的訂閱會變成「已無逾期」→ 前端決定要不要顯示「同時恢復服務」
+    out["resumable_subscription_ids"] = _resumable_after(db, r, [b["id"] for b in out["bills"]])
+    return out
+
+
+def _resumable_after(db: Session, r: BillingPaymentReport, bill_ids: list[int]) -> list[int]:
+    today = taipei_today()
+    sub_ids = {b.subscription_id for b in db.query(BillingBill).filter(BillingBill.id.in_(set(bill_ids) or {0})).all()}
+    out = []
+    for s in db.query(BillingSubscriptionV2).filter(
+            BillingSubscriptionV2.id.in_(sub_ids or {0}), BillingSubscriptionV2.status == "suspended").all():
+        remaining = db.query(BillingBill).filter(
+            BillingBill.subscription_id == s.id, BillingBill.status == "unpaid",
+            BillingBill.due_date < today, ~BillingBill.id.in_(set(bill_ids) or {0})).count()
+        if remaining == 0:
+            out.append(s.id)
+    return out
+
+
+@router.get("/admin/payment-reports/{report_id}/receipt")
+def admin_receipt(report_id: int, db: Session = Depends(get_db), _: User = Depends(ADMIN)):
+    return _receipt_response(db.query(BillingPaymentReceipt).filter(
+        BillingPaymentReceipt.report_id == report_id).first())
+
+
+@router.post("/admin/payment-reports/{report_id}/confirm")
+def confirm_report(report_id: int, body: ConfirmIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    r = db.query(BillingPaymentReport).filter(BillingPaymentReport.id == report_id).with_for_update().first()
+    if not r:
+        raise HTTPException(404, "回報不存在")
+    if r.status != "pending":
+        raise HTTPException(409, "這份回報已處理過")
+    links = {l.bill_id: l for l in db.query(BillingPaymentReportBill).filter(
+        BillingPaymentReportBill.report_id == r.id).all()}
+    chosen = set(body.bill_ids)
+    if chosen - set(links):
+        raise HTTPException(422, "只能確認這份回報裡的帳單")
+    bills = _lock_bills(db, links.keys())
+    bad = [bid for bid in chosen if bills[bid].status != "unpaid" or bills[bid].pending_report_id != r.id]
+    if bad:
+        raise HTTPException(409, f"帳單 {bad} 狀態已改變，請重新整理")
+    today = taipei_today()
+    now = datetime.utcnow()
+    auto = f"付款回報 #{r.id}：" + {"transfer": f"轉帳 末五碼 {r.account_last5}", "cash": "現金",
+                                     "other": "其他"}[r.method]
+    for bid, l in links.items():
+        b = bills[bid]
+        if b.pending_report_id == r.id:
+            b.pending_report_id = None
+        if bid in chosen:
+            b.status, b.paid_on, b.paid_at = "paid", r.paid_on, now
+            b.paid_via_report_id = r.id
+            b.paid_note = auto + (f"；{body.paid_note}" if body.paid_note else "")
+            l.confirmed = True
+        else:
+            l.confirmed = False
+    r.status, r.reviewed_by, r.reviewed_at = "confirmed", me.id, now
+    r.review_note = body.paid_note
+    log_action(db, me, "billing.report.confirm", "billing_report", r.id,
+               f"confirmed={sorted(chosen)} skipped={sorted(set(links) - chosen)}")
+    resumed = _maybe_resume(db, [bills[b].subscription_id for b in chosen], today, me) \
+        if body.resume_subscriptions else []
+    db.commit()
+    invalidate_lock_cache()
+    out = _report_out(db, r, today)
+    out["resumed"] = resumed
+    return out
+
+
+@router.post("/admin/payment-reports/{report_id}/reject")
+def reject_report(report_id: int, body: RejectIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    r = db.query(BillingPaymentReport).filter(BillingPaymentReport.id == report_id).with_for_update().first()
+    if not r:
+        raise HTTPException(404, "回報不存在")
+    if r.status != "pending":
+        raise HTTPException(409, "這份回報已處理過")
+    _clear_pending(db, r.id)
+    r.status, r.reviewed_by, r.reviewed_at, r.review_note = "rejected", me.id, datetime.utcnow(), body.reason
+    log_action(db, me, "billing.report.reject", "billing_report", r.id, body.reason)
+    db.commit()
+    return _report_out(db, r, taipei_today())
+
+
+# ── reseller 自助 ─────────────────────────────────────────────────────
+
+@router.get("/my/subscriptions")
+def my_subscriptions(db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+    subs = db.query(BillingSubscriptionV2).filter(BillingSubscriptionV2.customer_id == me.id).order_by(
+        BillingSubscriptionV2.id.desc()).all()
+    today = taipei_today()
+    names = {me.id: me.username}
+    lock_map = get_lock_map(db)
+    out = [_sub_out(db, s, today, names, lock_map) for s in subs]
+    for row in out:
+        row.pop("note", None)   # 內部備註不給付款人看
+    return out
+
+
+@router.get("/my/bills")
+def my_bills(status: Optional[Literal["unpaid", "paid", "void"]] = None,
+             db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+    q = db.query(BillingBill).filter(BillingBill.customer_id == me.id)
+    if status:
+        q = q.filter(BillingBill.status == status)
+    bills = q.order_by(BillingBill.due_date.desc(), BillingBill.id.desc()).limit(500).all()
+    today = taipei_today()
+    statuses = {s.id: s.status for s in db.query(BillingSubscriptionV2).filter(
+        BillingSubscriptionV2.id.in_({b.subscription_id for b in bills} or {0})).all()}
+    return [_bill_out(b, today, statuses.get(b.subscription_id)) for b in bills]
+
+
+@router.get("/notices/my")
+def my_notices(db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+    """登入提示資料（spec §9.2）。非 reseller 一律空，前端就不會跳出對話框。"""
+    empty = {"overdue": [], "pending": [], "rejected": [], "overdue_total": 0, "overdue_count": 0,
+             "payment_instructions": None}
+    if me.role != "reseller":
+        return empty
+    today = taipei_today()
+    unpaid = db.query(BillingBill).filter(BillingBill.customer_id == me.id,
+                                          BillingBill.status == "unpaid").all()
+    statuses = {s.id: s.status for s in db.query(BillingSubscriptionV2).filter(
+        BillingSubscriptionV2.id.in_({b.subscription_id for b in unpaid} or {0})).all()}
+    overdue = [_bill_out(b, today, statuses.get(b.subscription_id)) for b in unpaid
+               if today > b.due_date and not b.pending_report_id]
+    pending = [_bill_out(b, today, statuses.get(b.subscription_id)) for b in unpaid if b.pending_report_id]
+    overdue.sort(key=lambda x: -x["overdue_days"])
+    since = datetime.utcnow() - timedelta(days=14)
+    rejected = [{"id": r.id, "paid_on": _iso(r.paid_on), "amount": r.amount, "reason": r.review_note,
+                 "reviewed_at": _utc_iso(r.reviewed_at)}
+                for r in db.query(BillingPaymentReport).filter(
+                    BillingPaymentReport.customer_id == me.id, BillingPaymentReport.status == "rejected",
+                    BillingPaymentReport.reviewed_at >= since).order_by(BillingPaymentReport.id.desc()).all()]
+    return {"overdue": overdue, "pending": pending, "rejected": rejected,
+            "overdue_total": sum(b["amount"] for b in overdue), "overdue_count": len(overdue),
+            "payment_instructions": _get_setting(db, "payment_instructions")}
+
+
+# ── 總覽與設定 ────────────────────────────────────────────────────────
 
 @router.get("/admin/dashboard")
-def billing_dashboard(period: str, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    _check_period(period)
-    invs = db.query(BillingInvoice).filter(BillingInvoice.period == period).all()
-    frozen = db.query(BillingCustomer).filter(BillingCustomer.frozen == True).count()  # noqa: E712
+def dashboard(db: Session = Depends(get_db), _: User = Depends(ADMIN)):
+    today = taipei_today()
+    unpaid = db.query(BillingBill).filter(BillingBill.status == "unpaid").all()
+    overdue = [b for b in unpaid if today > b.due_date]
+    month_start = today.replace(day=1)
+    next_month = (month_start + timedelta(days=32)).replace(day=1)
+    due_this_month = [b for b in unpaid if month_start <= b.due_date < next_month]
+    pending = db.query(BillingPaymentReport).filter(BillingPaymentReport.status == "pending").all()
+    stale = [r for r in pending if (today - taipei_today(r.created_at)).days > PENDING_ALERT_DAYS]
+    subs = db.query(BillingSubscriptionV2).all()
+    lock_map = get_lock_map(db)
+    groups = _overdue_groups(db, today)
     return {
-        "period": period,
-        # 排除 void：作廢後重開屬正常流程，張數統計不應把作廢的舊發票也算進去
-        "invoice_count": len([i for i in invs if i.status != "void"]),
-        "total_billed": sum(i.total for i in invs if i.status != "void"),
-        "total_unpaid": sum(i.total for i in invs if i.status == "unpaid"),
-        "total_paid": sum(i.total for i in invs if i.status == "paid"),
-        "frozen_count": frozen,
+        "unpaid_total": sum(b.amount for b in unpaid), "unpaid_count": len(unpaid),
+        "overdue_total": sum(b.amount for b in overdue), "overdue_count": len(overdue),
+        "overdue_undecided": groups["undecided"],
+        "due_this_month_total": sum(b.amount for b in due_this_month),
+        "due_this_month_count": len(due_this_month),
+        "pending_reports": len(pending), "pending_reports_stale": len(stale),
+        "active_subscriptions": sum(1 for s in subs if s.status == "active"),
+        "scheduled_subscriptions": sum(1 for s in subs if s.status == "scheduled"),
+        "suspended_cameras": sum(1 for v in lock_map.values() if v["state"] == "suspended"),
+        "ended_locked_cameras": sum(1 for v in lock_map.values() if v["state"] == "ended"),
     }
 
 
-@router.get("/admin/commissions", response_model=list[CommissionRowResponse])
-def list_commissions(period: str, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    """分潤應付報表。
-
-    分潤不進發票（設計決定）：發票照定價開給客戶，這張報表算的是
-    「我這期要付給各經銷商多少」。基數是該期別**非作廢**發票的總額。
-    只列有設分潤條件的客戶——沒設的列出來只是雜訊。
-    """
-    _check_period(period)
-
-    # 一次撈出該期別所有非 void 發票，依 customer_id 加總成 dict，避免逐客戶查詢。
-    invs = db.query(BillingInvoice).filter(
-        BillingInvoice.period == period, BillingInvoice.status != "void",
-    ).all()
-    totals: dict[int, int] = {}
-    for i in invs:
-        totals[i.customer_id] = totals.get(i.customer_id, 0) + i.total
-
-    # 一次撈出所有設有分潤條件的客戶（commission_type 非 NULL）。
-    customers = db.query(BillingCustomer).filter(BillingCustomer.commission_type.isnot(None)).all()
-
-    # 使用者名稱一次查完，不逐筆查 DB。
-    names = {u.id: u.username for u in db.query(User).filter(
-        User.id.in_([c.user_id for c in customers])
-    ).all()}
-
-    out = []
-    for c in customers:
-        base = totals.get(c.user_id, 0)
-        amount = commission_amount(base, c.commission_type, c.commission_percent_bps, c.commission_fixed_amount)
-        out.append(CommissionRowResponse(
-            customer_id=c.user_id, customer_name=names.get(c.user_id),
-            period=period, invoice_total=base,
-            commission_type=c.commission_type,
-            commission_percent_bps=c.commission_percent_bps,
-            commission_fixed_amount=c.commission_fixed_amount,
-            commission_amount=amount,
-            commission_display=commission_display(
-                c.commission_type, c.commission_percent_bps, c.commission_fixed_amount
-            ),
-        ))
-    return out
+class SettingsIn(BaseModel):
+    payment_instructions: Optional[str] = Field(default=None, max_length=2000)
 
 
-# ── 經銷商自助端點（spec §6：/billing/*/my 只回 current_user 自己的資料） ──
-
-@router.get("/subscriptions/my", response_model=list[MySubscriptionResponse])
-def my_subscriptions(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    subs = db.query(BillingSubscription).filter(
-        BillingSubscription.customer_id == current_user.id,
-        BillingSubscription.status == "active",
-    ).order_by(BillingSubscription.id).all()
-    plans = {p.id: p for p in db.query(BillingPlan).all()}
-    # 自訂月費要覆蓋方案原價（同 _sub_response／generate_invoices 慣例），
-    # 只有 current_user 自己一筆，不需要批次查（也沒有 N+1 的問題）。
-    customer = db.query(BillingCustomer).filter(BillingCustomer.user_id == current_user.id).first()
-    custom_fee = customer.custom_monthly_fee if customer else None
-    return [
-        MySubscriptionResponse(
-            id=s.id, camera_id=s.camera_id,
-            plan_name=plans[s.plan_id].name if s.plan_id in plans else None,
-            monthly_fee=effective_monthly_fee(plans[s.plan_id].monthly_fee, custom_fee) if s.plan_id in plans else 0,
-            status=s.status,
-        ) for s in subs
-    ]
+@router.get("/admin/settings")
+def get_settings(db: Session = Depends(get_db), _: User = Depends(ADMIN)):
+    return {k: _get_setting(db, k) for k in SETTING_KEYS}
 
 
-@router.get("/invoices/my", response_model=list[InvoiceResponse])
-def my_invoices(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    invs = db.query(BillingInvoice).filter(
-        BillingInvoice.customer_id == current_user.id,
-    ).order_by(BillingInvoice.period.desc()).all()
-    return [_invoice_response(i, current_user.username) for i in invs]
-
-
-@router.get("/quotas/my", response_model=list[MyQuotaResponse])
-def my_quotas(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """本期各相機用量 vs 配額。用量表在階段三才有資料，在此之前一律為 0。"""
-    period = period_of(datetime.utcnow())
-    subs = db.query(BillingSubscription).filter(
-        BillingSubscription.customer_id == current_user.id,
-        BillingSubscription.status == "active",
-    ).all()
-    plans = {p.id: p for p in db.query(BillingPlan).all()}
-
-    out = []
-    for s in subs:
-        plan = plans.get(s.plan_id)
-        tl_used = int(db.query(
-            func.coalesce(func.sum(BillingUsageDaily.timelapse_secs), 0),
-        ).filter(
-            BillingUsageDaily.camera_id == s.camera_id,
-            BillingUsageDaily.date.like(f"{period}-%"),
-        ).scalar())
-        # storage_gb 是時間點快照，不可跨天加總——取期間內最新一列的值，
-        # 沒有資料就是 0（同 collect_storage_gb / models.py 欄位註解）。
-        last_row = db.query(BillingUsageDaily).filter(
-            BillingUsageDaily.camera_id == s.camera_id,
-            BillingUsageDaily.date.like(f"{period}-%"),
-        ).order_by(BillingUsageDaily.date.desc()).first()
-        if last_row is None:
-            # 排程在台北 03:00 採「前一天」，所以每月 1 號白天到 2 號 03:00 之前，
-            # 本期完全沒有列——這不代表沒有用量，只是快照還沒落地。
-            # storage_gb 是「目前佔用」的快照，跨月沿用上一筆舊值比直接回 0
-            # 更接近事實：0 會讓實際佔用 90GB 的相機在帳單上顯示 0GB。
-            # 退而取「本期最後一天以前」全域最新一列；仍查無才真的是 0。
-            period_end = f"{next_period(period)}-01"
-            last_row = db.query(BillingUsageDaily).filter(
-                BillingUsageDaily.camera_id == s.camera_id,
-                BillingUsageDaily.date < period_end,
-            ).order_by(BillingUsageDaily.date.desc()).first()
-        st_used = float(last_row.storage_gb) if last_row else 0.0
-        tl_total = plan.timelapse_quota_secs if plan else 0
-        st_total = plan.storage_quota_gb if plan else 0
-        # 兩種配額取較嚴重的狀態
-        states = [quota_state(tl_used, tl_total), quota_state(st_used, st_total)]
-        state = "suspended" if "suspended" in states else ("warned" if "warned" in states else "ok")
-        out.append(MyQuotaResponse(
-            camera_id=s.camera_id, period=period,
-            timelapse_used_secs=tl_used, timelapse_total_secs=tl_total,
-            storage_used_gb=st_used, storage_total_gb=st_total, state=state,
-        ))
-    return out
-
-
-# 注意：這條必須放在 /invoices/my 之後定義，否則 "my" 會被當成 invoice_id 而回 422
-@router.get("/invoices/{invoice_id}", response_model=InvoiceDetailResponse)
-def my_invoice_detail(invoice_id: int, db: Session = Depends(get_db),
-                      current_user: User = Depends(get_current_user)):
-    inv = db.query(BillingInvoice).filter(BillingInvoice.id == invoice_id).first()
-    # 非自己的發票一律回 404（不是 403）：不洩漏「這張發票存在」這個資訊
-    if not inv or (inv.customer_id != current_user.id and current_user.role != "symotus_admin"):
-        raise HTTPException(404, "發票不存在")
-    return _build_invoice_detail(db, inv)
-
-
-@router.post("/admin/usage/collect")
-async def collect_usage(date: str, db: Session = Depends(get_db), current_user: User = Depends(ADMIN)):
-    """手動補跑某日的用量採集。每日排程失敗時的補救管道。"""
-    if not DATE_RE.match(date):
-        raise HTTPException(422, "日期格式須為 YYYY-MM-DD")
-    try:
-        parsed_date = datetime.strptime(date, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(422, "日期無效（非合法的西曆日期）")
-    # 今天的資料視為尚未完整（快照可能還在變動），只接受「昨天以前（含昨天）」；
-    # 未來日期若被接受，之後的 storage 快照會落到那天，my_quotas 取本期最大 date
-    # 時會被這個未來列永久遮蔽掉真正的每日快照。
-    yesterday = yesterday_taipei(datetime.utcnow())
-    if date > yesterday:
-        raise HTTPException(422, f"只接受 {yesterday}（昨天）以前（含昨天）的日期")
-    result = await run_collection(db, date)
-    log_action(db, current_user, "billing_collect_usage", "billing_usage", None,
-               f"date={date} ok={result['cameras']} failed={result['failed']} unresolved={result['unresolved']}")
+@router.put("/admin/settings")
+def put_settings(body: SettingsIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
+    for k, v in body.model_dump(exclude_unset=True).items():
+        row = db.query(BillingSetting).filter(BillingSetting.key == k).first()
+        if row:
+            row.value = v
+        else:
+            db.add(BillingSetting(key=k, value=v))
+    log_action(db, me, "billing.settings.update", "billing_settings", None, None)
     db.commit()
-    return result
-
-
-@router.post("/admin/usage/backfill-jobs")
-async def backfill_jobs(
-    # 加下限：limit<=0 在 sqlite 與 Postgres 行為不一致（前者視為不限制，
-    # 後者對負數直接報錯 500）。
-    limit: int = Query(500, ge=1, le=5000),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(ADMIN),
-):
-    """一次性維運操作：把既有 completed 縮時任務缺的 completed_at／
-    video_duration_secs 向 Spark 補齊（計費上線前的舊資料，這兩欄位是後加的）。
-
-    冪等：已有值的欄位不會被覆寫，重複執行只會處理仍然缺值的那些。
-    部署後手動觸發一次即可，見 docs 的部署後一次性操作清單。
-    """
-    result = await backfill_all_missing_job_fields(db, limit=limit)
-    log_action(
-        db, current_user, "billing_backfill_jobs", "timelapse_job", None,
-        f"scanned={result['scanned']} filled_completed_at={result['filled_completed_at']} "
-        f"filled_duration={result['filled_duration']} failed={result['failed']}",
-    )
-    db.commit()
-    return result
+    return {k: _get_setting(db, k) for k in SETTING_KEYS}

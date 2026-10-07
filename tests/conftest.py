@@ -22,8 +22,8 @@ from fastapi.testclient import TestClient
 from database import SessionLocal, engine
 from models import (
     User, RefreshToken, AuditLog, CameraAccess,
-    BillingPlan, BillingCustomer, BillingSubscription,
-    BillingInvoice, BillingInvoiceLine, BillingUsageDaily,
+    BillingPlanV2, BillingSubscriptionV2, BillingBill, BillingPaymentReport,
+    BillingPaymentReportBill, BillingPaymentReceipt, BillingSetting,
     TimelapsJob, UserLineAccount, LineBindCode, LineBindSession,
 )
 from auth import hash_password, create_access_token
@@ -32,10 +32,20 @@ from routers.line_bind import router as line_bind_router
 
 _TABLES = [
     User.__table__, RefreshToken.__table__, AuditLog.__table__, CameraAccess.__table__,
-    BillingPlan.__table__, BillingCustomer.__table__, BillingSubscription.__table__,
-    BillingInvoice.__table__, BillingInvoiceLine.__table__, BillingUsageDaily.__table__,
+    BillingPlanV2.__table__, BillingSubscriptionV2.__table__, BillingBill.__table__,
+    BillingPaymentReport.__table__, BillingPaymentReportBill.__table__, BillingPaymentReceipt.__table__,
+    BillingSetting.__table__,
     TimelapsJob.__table__, UserLineAccount.__table__, LineBindCode.__table__, LineBindSession.__table__,
 ]
+
+
+@pytest.fixture(autouse=True)
+def _reset_billing_lock_cache():
+    """鎖定狀態有 10 秒程序內快取；每個測試的 DB 都是新的，不清會讀到上一個測試的結果。"""
+    from services.billing_v2 import invalidate_lock_cache
+    invalidate_lock_cache()
+    yield
+    invalidate_lock_cache()
 
 
 @pytest.fixture()

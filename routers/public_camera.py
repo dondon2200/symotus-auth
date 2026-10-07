@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import User, CameraInvitation
 from routers.cameras import get_camera_backend_token, _get_admin_camera_token, CAMERA_BACKEND_URL
+from services.billing_v2 import locked_camera_ids
 
 import hmac as _hmac, hashlib as _hashlib, time as _time
 from config import settings
@@ -99,6 +100,9 @@ async def _get_public_cam(token: str, db: Session):
         raise HTTPException(404, "連結無效")
     if inv.expires_at and inv.expires_at < datetime.utcnow():
         raise HTTPException(410, "連結已過期")
+    # 計費 v2：公開連結的訪客等同 end_user，鎖定相機一律擋（spec §8.2）
+    if inv.camera_id in locked_camera_ids(db):
+        raise HTTPException(403, detail={"code": "CAMERA_LOCKED", "message": "此相機服務已停用"})
 
     granter = db.query(User).filter(User.id == inv.inviter_id).first()
     if not granter:
@@ -326,6 +330,9 @@ async def live_camera_frame(camera_id: int, exp: int = 0, sig: str = "", db: Ses
     from fastapi.responses import Response
     if not sig or exp < int(_time.time()) or not _hmac.compare_digest(sig, _live_frame_sig(camera_id, exp)):
         raise HTTPException(403, "連結無效或已過期")
+    # 計費 v2：簽章網址不帶身分，鎖定期間一律擋（含鎖定前已簽發、30 分鐘內未過期的網址）
+    if camera_id in locked_camera_ids(db):
+        raise HTTPException(403, detail={"code": "CAMERA_LOCKED", "message": "此相機服務已停用"})
     # 查 camera ip 推導 stream name
     import httpx as _httpx
     from models import User

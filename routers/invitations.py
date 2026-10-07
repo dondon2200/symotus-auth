@@ -13,6 +13,7 @@ from typing import Optional
 
 from database import get_db
 from models import User, CameraInvitation, CameraAccess, RefreshToken
+from services.billing_v2 import assert_camera_unlocked
 from auth import (get_current_user, require_role, hash_password,
                   create_access_token, create_refresh_token)
 from audit import log_action
@@ -100,6 +101,9 @@ def create_invitation(
     # 結果對方永遠建不了帳，連結形同永久卡死無法使用。
     if invitee_email and _is_reserved_identity_email(invitee_email):
         raise HTTPException(400, "此 Email 為平台保留身分，不可作為分享對象")
+
+    # 計費 v2：鎖定相機不可建立分享（admin 例外）
+    assert_camera_unlocked(db, current_user, body.camera_id)
 
     # D4：全功能被分享者可再分享。reseller/symotus_admin 照舊放行；
     # 其他角色須持有此相機的「真分享」授權（granted_by 非本人）且等級允許 camera.share。
@@ -244,6 +248,8 @@ def accept_invitation(
     # 否則「指定 email」只擋得住建帳、擋不住已有帳號的人拿連結接受。
     if inv.invitee_email and (current_user.email or "").strip().casefold() != inv.invitee_email:
         raise HTTPException(403, "此邀請連結限定特定 Email 使用")
+    # 計費 v2：鎖定相機的邀請不可接受
+    assert_camera_unlocked(db, current_user, inv.camera_id)
 
     # 若已有此相機的 camera_access：定案②以最新接受為準（可升可降），同步更新來源連結與分享者
     existing = db.query(CameraAccess).filter(

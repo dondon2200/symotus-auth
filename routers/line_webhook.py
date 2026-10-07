@@ -657,7 +657,7 @@ async def line_webhook(request: Request, db: Session = Depends(get_db)):
 
 # ── 截圖公開端點（LINE 用）────────────────────────────────────────────────────
 @router.get("/snapshot/{camera_id}")
-async def line_snapshot(camera_id: int, t: int, sig: str):
+async def line_snapshot(camera_id: int, t: int, sig: str, db: Session = Depends(get_db)):
     """LINE 用的臨時公開圖片端點（5 分鐘有效）"""
     import time
     if abs(time.time() - t) > 300:
@@ -665,6 +665,10 @@ async def line_snapshot(camera_id: int, t: int, sig: str):
     expected = hashlib.md5(f"{camera_id}:{t}:{LINE_CHANNEL_SECRET}".encode()).hexdigest()[:12]
     if sig != expected:
         raise HTTPException(403, "Invalid signature")
+    # 計費 v2：簽章網址不帶身分，鎖定期間一律擋
+    from services.billing_v2 import locked_camera_ids
+    if camera_id in locked_camera_ids(db):
+        raise HTTPException(403, detail={"code": "CAMERA_LOCKED", "message": "此相機服務已停用"})
 
     # 取最新照片 URL
     async with httpx.AsyncClient(timeout=10) as c:

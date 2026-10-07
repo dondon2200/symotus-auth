@@ -7,7 +7,7 @@ from config import settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_USAGE_TASK = None  # 模組層級，避免 asyncio.create_task 的回傳值被 GC 回收後任務無聲消失
+_BILLING_TASK = None  # 模組層級，避免 asyncio.create_task 的回傳值被 GC 回收後任務無聲消失
 
 app = FastAPI(
     title="Symotus Auth Service",
@@ -267,117 +267,6 @@ async def startup():
                     conn.rollback()
                     logger.warning(f"timelapse_jobs 切日函式索引補建失敗（不影響正確性，只是查詢較慢）：{e}")
 
-            # 補建 billing 部分唯一索引（給既有環境用）。
-            # create_all() 只會對「尚不存在」的表建索引，不會替既有表補建索引；
-            # 這個環境目前還沒有 billing_* 表，create_all 會建好一切，這裡是保險。
-            # 若既有資料已有重複列（例如手動塞資料造成同客戶同期別兩張非作廢發票），
-            # 建索引會失敗；失敗只記 log、rollback，不讓服務啟動失敗，需要人工清理重複資料。
-            with engine.connect() as conn:
-                for stmt in [
-                    """CREATE UNIQUE INDEX IF NOT EXISTS uq_billing_invoice_customer_period_active
-                        ON billing_invoices (customer_id, period)
-                        WHERE (status != 'void')""",
-                    """CREATE UNIQUE INDEX IF NOT EXISTS uq_billing_subscription_camera_active
-                        ON billing_subscriptions (camera_id)
-                        WHERE (status = 'active')""",
-                ]:
-                    try:
-                        conn.execute(text(stmt))
-                        conn.commit()
-                    except Exception as e:
-                        conn.rollback()
-                        logger.warning(f"billing 部分唯一索引補建失敗，需人工清理重複資料：{e}")
-
-            # 補上 billing_customers 的客戶條件欄位（既有表 create_all 不會補）
-            # payment_method / statement_day 在 models.py 是 nullable=False，
-            # 原本只用 ADD COLUMN ... DEFAULT 補欄位、沒有補 NOT NULL 約束，
-            # 造成既有 DB 的欄位定義與 models.py 不一致。分三步各自補齊，
-            # 每一步各自 try/except/rollback，任一步在既有環境失敗（例如
-            # 欄位已存在但仍有 NULL 值）只記警告，不擋啟動。
-            NOT_NULL_COLS = [
-                ("payment_method", "TEXT", "'monthly_transfer'"),
-                ("statement_day", "INTEGER", "1"),
-            ]
-            for col, typ, default in NOT_NULL_COLS:
-                with engine.connect() as conn:
-                    try:
-                        conn.execute(text(
-                            f"ALTER TABLE billing_customers ADD COLUMN IF NOT EXISTS {col} {typ} DEFAULT {default}"
-                        ))
-                        conn.commit()
-                    except Exception as e:
-                        conn.rollback()
-                        logger.warning(f"billing_customers 補欄位 {col}（ADD COLUMN）失敗：{e}")
-                with engine.connect() as conn:
-                    try:
-                        conn.execute(text(
-                            f"UPDATE billing_customers SET {col} = {default} WHERE {col} IS NULL"
-                        ))
-                        conn.commit()
-                    except Exception as e:
-                        conn.rollback()
-                        logger.warning(f"billing_customers 補欄位 {col}（UPDATE NULL）失敗：{e}")
-                with engine.connect() as conn:
-                    try:
-                        conn.execute(text(
-                            f"ALTER TABLE billing_customers ALTER COLUMN {col} SET NOT NULL"
-                        ))
-                        conn.commit()
-                    except Exception as e:
-                        conn.rollback()
-                        logger.warning(f"billing_customers 補欄位 {col}（SET NOT NULL）失敗：{e}")
-
-            # custom_monthly_fee / commission_type / commission_percent_bps /
-            # commission_fixed_amount 在 models.py 皆為 nullable=True，維持原本
-            # 單純 ADD COLUMN 即可。
-            with engine.connect() as conn:
-                for col, typ in [
-                    ("custom_monthly_fee", "INTEGER"),
-                    ("commission_type", "TEXT"),
-                    ("commission_percent_bps", "INTEGER"),
-                    ("commission_fixed_amount", "INTEGER"),
-                ]:
-                    try:
-                        conn.execute(text(f"ALTER TABLE billing_customers ADD COLUMN IF NOT EXISTS {col} {typ}"))
-                        conn.commit()
-                    except Exception as e:
-                        conn.rollback()
-                        logger.warning(f"billing_customers 補欄位 {col} 失敗：{e}")
-
-            # billing_subscriptions.camera_serial：NAS 用量採集快取欄位。
-            # 這張表已在正式庫存在，create_all 不會補欄位，需比照上面手動 ALTER。
-            with engine.connect() as conn:
-                try:
-                    conn.execute(text("ALTER TABLE billing_subscriptions ADD COLUMN IF NOT EXISTS camera_serial TEXT"))
-                    conn.commit()
-                except Exception as e:
-                    conn.rollback()
-                    logger.warning(f"billing_subscriptions 補欄位 camera_serial 失敗：{e}")
-
-            # 自我檢查：確認上面的欄位真的都補上了。計費模組非核心功能
-            # （auth service 同時代理所有相機 CRUD），欄位缺失不該擋住服務啟動，
-            # 但要在 log 大聲示警，讓維運人員能人工介入，而不是靜默讓計費 API 500。
-            with engine.connect() as conn:
-                try:
-                    conn.execute(text(
-                        "SELECT payment_method, statement_day, custom_monthly_fee, "
-                        "commission_type, commission_percent_bps, commission_fixed_amount "
-                        "FROM billing_customers LIMIT 1"
-                    ))
-                except Exception as e:
-                    logger.error(
-                        "billing_customers 缺少欄位，計費 API 將失效，請人工檢查 migration：" + str(e)
-                    )
-
-            with engine.connect() as conn:
-                try:
-                    conn.execute(text("SELECT camera_serial FROM billing_subscriptions LIMIT 1"))
-                except Exception as e:
-                    logger.error(
-                        "billing_subscriptions 缺少 camera_serial 欄位，NAS 儲存用量採集將失效，"
-                        "請人工檢查 migration：" + str(e)
-                    )
-
             # timelapse_jobs.completed_at：這張表在正式庫已存在且有資料，
             # create_all 不會補欄位。若 ALTER 失敗，SQLAlchemy 之後對 TimelapsJob
             # 的每次查詢都會 SELECT 一個不存在的欄位 → /jobs 相關功能全部 500，
@@ -402,33 +291,6 @@ async def startup():
                     seed_policies(_s)
             except Exception as e:
                 logger.warning(f"seed_policies: {e}")
-            # billing 種子方案：全新環境建一個預設方案，避免後台空白無從下手。
-            # 已有任何方案就不動——不覆寫營運中的資料。
-            try:
-                from models import BillingPlan
-                from database import SessionLocal
-                s = SessionLocal()
-                try:
-                    if s.query(BillingPlan).count() == 0:
-                        s.add(BillingPlan(
-                            name="（範本）標準方案",
-                            description="佔位範本，月費 9999 為暫定值尚未定案。"
-                                        "正式定價確定後，請在後台編輯價格並啟用。"
-                                        "啟用前不可指派給任何相機，以免產生真實的 9999/月發票。",
-                            monthly_fee=9999,
-                            timelapse_quota_secs=0,
-                            storage_quota_gb=0,
-                            is_active=False,
-                        ))
-                        s.commit()
-                        logger.info("billing: 已建立預設方案")
-                except Exception as e:
-                    s.rollback()
-                    logger.warning(f"billing 種子方案建立失敗（不影響啟動）：{e}")
-                finally:
-                    s.close()
-            except Exception as e:
-                logger.warning(f"billing 種子方案初始化失敗（不影響啟動）：{e}")
             # 回收上一個進程留下的 GDrive 下載孤兒（部署／SIGKILL 會讓它們永遠停在
             # downloading）。必須在開放流量前做，否則使用者會看到永遠不動的進度條。
             try:
@@ -439,10 +301,11 @@ async def startup():
             # 啟動相機開機 LINE 推播背景工作
             from services.camera_notifier import start_camera_notifier
             asyncio.create_task(start_camera_notifier())
-            # 啟動計費用量每日採集背景工作
-            from services.billing_usage import start_usage_collector
-            global _USAGE_TASK
-            _USAGE_TASK = asyncio.create_task(start_usage_collector())
+            # 啟動計費 v2 帳單排程（啟動時補跑一次，之後每天台北 00:10）。
+            # 2026-08-20 版的用量採集（billing_usage）已隨計費 v2 下架，舊表留在 DB 不再寫入。
+            from services.billing_v2 import start_billing_scheduler
+            global _BILLING_TASK
+            _BILLING_TASK = asyncio.create_task(start_billing_scheduler())
             break
         except Exception as e:
             logger.warning(f"DB not ready: {e}")
@@ -474,9 +337,7 @@ app.include_router(users.users_router)
 app.include_router(support.router)
 app.include_router(admin.router)
 app.include_router(jobs.router)
-app.include_router(billing.router)  # 前綴 /billing 與 cameras 的 /cameras 不相交，順序對兩者無影響；
-                                     # 真正要留意的是 billing router 內部 /invoices/my 需先於
-                                     # /invoices/{invoice_id}，見 tests/test_billing_route_order.py
+app.include_router(billing.router)  # 前綴 /billing 與 cameras 的 /cameras 不相交，順序對兩者無影響
 app.include_router(public_camera.router)  # 必須在 cameras 前（避免 /{camera_id}/{path} catch-all 攔截）
 app.include_router(cameras.router)
 app.include_router(line_webhook.router)
