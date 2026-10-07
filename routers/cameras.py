@@ -537,6 +537,8 @@ async def get_camera(
     else:
         data["my_permission"] = "stream_only"
 
+    # 計費 v2：管理員進入鎖定相機時，前端靠這個欄位顯示「僅管理員可存取」橫幅
+    data["billing"] = billing_field(db, current_user, camera_id)
     return data
 
 
