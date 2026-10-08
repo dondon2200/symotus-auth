@@ -42,7 +42,8 @@ _LEVEL_MIGRATIONS = [
 
 # 通用 proxy 寫入路徑 → feature_key（首段比對）
 _CONTROL_PREFIXES = ("ptz", "reboot", "restart", "autofocus", "focus")
-_TIMELAPSE_PREFIXES = ("timelapse-jobs", "prepare-timelapse")
+# timelapse-precheck（送出前分析）只讀不寫，與產縮時同等級：能產縮時就能先看一眼
+_TIMELAPSE_PREFIXES = ("timelapse-jobs", "prepare-timelapse", "timelapse-precheck")
 _DEVICE_PREFIXES = ("replace-device", "release-device")
 
 

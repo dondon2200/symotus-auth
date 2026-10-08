@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 import asyncio
 import logging
+import re
 import time as _time
 import httpx
 
@@ -1518,3 +1519,47 @@ async def prepare_timelapse_folder(
         "estimated_secs": len(sampled) // fps,
         "temp_created": True,
     }
+
+
+# ── 送出前分析（precheck）輪詢代理 ──────────────────────────────────────────────
+#
+# 送出走通用 proxy（POST /cameras/{id}/timelapse-precheck，F-5 歸 timelapse.create），
+# 但 Camera Backend 的輪詢端點是 GET /api/timelapse-prechecks/{precheck_id}，不在
+# /cameras/{id}/ 底下，通用 proxy 接不到；瀏覽器又沒有 Camera Backend token，所以要
+# 另開這條。precheck_id 是不可猜的 UUID，結果只有逐日張數統計，沒有 job id、影片或
+# 照片連結，所以只要求登入，不再比對相機歸屬（送出時已經檢查過）。
+#
+# token 取法比照通用 proxy：先用自己的，沒有或被拒（相機屬於別的 CB 帳號、或當初
+# 送出時就是用 admin token 送的）就退 admin token 再試一次。
+
+precheck_router = APIRouter(tags=["cameras"])
+
+
+@precheck_router.get("/timelapse-prechecks/{precheck_id}")
+async def get_timelapse_precheck(
+    precheck_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", precheck_id):
+        raise HTTPException(422, "precheck_id 格式不正確")
+    url = f"{CAMERA_BACKEND_URL}/api/timelapse-prechecks/{precheck_id}"
+
+    async def _fetch(tok: str) -> httpx.Response:
+        async with httpx.AsyncClient(timeout=15) as client:
+            return await client.get(url, headers={"Authorization": f"Bearer {tok}"})
+
+    resp: Optional[httpx.Response] = None
+    try:
+        tok = await get_camera_backend_token(current_user)
+        if tok:
+            resp = await _fetch(tok)
+        if resp is None or resp.status_code in (401, 403, 404):
+            admin_tok = await _get_admin_camera_token()
+            if admin_tok:
+                resp = await _fetch(admin_tok)
+    except httpx.HTTPError as e:
+        logger.warning("timelapse-precheck poll failed id=%s: %s", precheck_id, e)
+        raise HTTPException(502, "連不到相機服務，請稍後再試")
+    if resp is None:
+        raise HTTPException(502, "無法取得相機服務授權")
+    return JSONResponse(status_code=resp.status_code, content=resp.json() if resp.content else {})

@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+### Added
+- **縮時送出前分析（precheck）輪詢代理**（2026-10-08，`routers/cameras.py`）
+  - 新增 `GET /timelapse-prechecks/{precheck_id}` 轉發 Camera Backend 同名端點；先用使用者自己的 token，被拒再退 admin token（送出若是用 admin token 送的，CB 用使用者 token 查會 404）
+  - `policies.py`：`timelapse-precheck` 歸入 `timelapse.create`（原本會落到 camera.settings，被分享者 403）
+
 ---
 
 ## [2026-06-02 ~ 2026-06-03]

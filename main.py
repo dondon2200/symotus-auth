@@ -340,6 +340,7 @@ app.include_router(jobs.router)
 app.include_router(billing.router)  # 前綴 /billing 與 cameras 的 /cameras 不相交，順序對兩者無影響
 app.include_router(public_camera.router)  # 必須在 cameras 前（避免 /{camera_id}/{path} catch-all 攔截）
 app.include_router(cameras.router)
+app.include_router(cameras.precheck_router)  # GET /timelapse-prechecks/{id}：不在 /cameras 前綴下，通用 proxy 接不到
 app.include_router(line_webhook.router)
 app.include_router(invitations.router)
 app.include_router(line_bind.router)
