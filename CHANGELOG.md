@@ -6,6 +6,13 @@
 
 ## [Unreleased]
 
+### Changed
+- **縮時任務對所有 symotus_admin 可見**（2026-10-14，`routers/jobs.py`）
+  - 新增 `_scope_to_user()`：symotus_admin 不套 `user_id` 過濾，其他角色維持只看自己的
+  - 套用於 `GET/PUT/DELETE /jobs`、`GET /jobs/gdrive`、`GET/POST(resume)/DELETE /jobs/gdrive/{id}`；影片下載 ticket 原本就綁任務擁有者，不用改
+  - 原因：jimmy_admin 登入後看不到 Super Admin 建的 Google Drive 縮時任務；管理員本就能操作全部相機，任務比照辦理
+  - 測試：`tests/test_jobs_admin_visibility.py`
+
 ### Added
 - **縮時送出前分析（precheck）輪詢代理**（2026-10-08，`routers/cameras.py`）
   - 新增 `GET /timelapse-prechecks/{precheck_id}` 轉發 Camera Backend 同名端點；先用使用者自己的 token，被拒再退 admin token（送出若是用 admin token 送的，CB 用使用者 token 查會 404）

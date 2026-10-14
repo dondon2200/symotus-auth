@@ -17,6 +17,19 @@ from schemas import UtcDatetime, utc_iso
 router = APIRouter(prefix="/jobs", tags=["timelapse_jobs"])
 
 
+def _scope_to_user(query, model, current_user: User):
+    """任務可見範圍：symotus_admin 看得到所有人的任務，其他角色只看自己的。
+
+    2026-10-14 前每支端點都寫死 `model.user_id == current_user.id`，管理員彼此看
+    不到對方建立的縮時任務（jimmy_admin 看不到 Super Admin 的 52 筆 Google Drive
+    任務）。管理員本來就能操作全部相機（routers/cameras.py 的 symotus_admin 分支），
+    任務也比照辦理；讀、改、刪都走這個 helper，不要再各自手寫過濾條件。
+    """
+    if current_user.role == "symotus_admin":
+        return query
+    return query.filter(model.user_id == current_user.id)
+
+
 class JobCreate(BaseModel):
     job_id: str
     camera_id: Optional[int] = None
@@ -93,9 +106,8 @@ async def list_jobs(
     後端提交的，callback_url 不指向本服務），所以在此比照 GET /jobs/gdrive/{id}
     的做法，於查詢時主動同步。Spark 查不到或逾時就沿用 DB 原值，不影響列表回應。
     """
-    jobs = db.query(TimelapsJob).filter(
-        TimelapsJob.user_id == current_user.id
-    ).order_by(TimelapsJob.created_at.desc()).all()
+    jobs = _scope_to_user(db.query(TimelapsJob), TimelapsJob, current_user).order_by(
+        TimelapsJob.created_at.desc()).all()
     await _sync_jobs_with_spark(db, jobs)
     return jobs
 
@@ -107,9 +119,9 @@ async def update_job(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    job = db.query(TimelapsJob).filter(
-        TimelapsJob.job_id == job_id,
-        TimelapsJob.user_id == current_user.id,
+    job = _scope_to_user(
+        db.query(TimelapsJob).filter(TimelapsJob.job_id == job_id),
+        TimelapsJob, current_user,
     ).first()
     if not job:
         raise HTTPException(404, "Job 不存在")
@@ -173,9 +185,9 @@ def delete_job(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    job = db.query(TimelapsJob).filter(
-        TimelapsJob.job_id == job_id,
-        TimelapsJob.user_id == current_user.id,
+    job = _scope_to_user(
+        db.query(TimelapsJob).filter(TimelapsJob.job_id == job_id),
+        TimelapsJob, current_user,
     ).first()
     if not job:
         raise HTTPException(404, "Job 不存在")
@@ -1508,9 +1520,9 @@ async def resume_gdrive_job(
     整批照片刷光導致 worker 死鎖），沒有覆寫就只能原封重送、必然再失敗一次，
     否則得重新下載數 GB。
     """
-    job = db.query(GDriveJob).filter(
-        GDriveJob.id == job_id,
-        GDriveJob.user_id == current_user.id,
+    job = _scope_to_user(
+        db.query(GDriveJob).filter(GDriveJob.id == job_id),
+        GDriveJob, current_user,
     ).first()
     if not job:
         raise HTTPException(404, "找不到此任務")
@@ -1576,10 +1588,9 @@ async def list_gdrive_jobs(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """列出目前用戶的所有 Google Drive 縮時 jobs"""
-    jobs = db.query(GDriveJob).filter(
-        GDriveJob.user_id == current_user.id
-    ).order_by(GDriveJob.created_at.desc()).all()
+    """列出 Google Drive 縮時 jobs：一般用戶看自己的，symotus_admin 看全部"""
+    jobs = _scope_to_user(db.query(GDriveJob), GDriveJob, current_user).order_by(
+        GDriveJob.created_at.desc()).all()
     return [
         {
             "job_id": job.id,
@@ -1609,9 +1620,9 @@ async def get_gdrive_job(
     送 Spark 前（pending/listing/downloading/submitted）回本地 GDriveJob 進度；
     一旦有 spark_job_id 就直接輪詢 Spark GET /jobs/{id} 取即時狀態（不再 proxy Camera Backend）。
     """
-    job = db.query(GDriveJob).filter(
-        GDriveJob.id == job_id,
-        GDriveJob.user_id == current_user.id,
+    job = _scope_to_user(
+        db.query(GDriveJob).filter(GDriveJob.id == job_id),
+        GDriveJob, current_user,
     ).first()
     if not job:
         raise HTTPException(404, "找不到此任務")
@@ -1758,9 +1769,9 @@ async def delete_gdrive_job(
     db: Session = Depends(get_db),
 ):
     """刪除 Google Drive 縮時 job"""
-    job = db.query(GDriveJob).filter(
-        GDriveJob.id == job_id,
-        GDriveJob.user_id == current_user.id,
+    job = _scope_to_user(
+        db.query(GDriveJob).filter(GDriveJob.id == job_id),
+        GDriveJob, current_user,
     ).first()
     if not job:
         raise HTTPException(404, "找不到此任務")
