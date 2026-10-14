@@ -45,6 +45,9 @@ class Settings(BaseSettings):
         return self.LINE_LOGIN_CHANNEL_SECRET or self.LINE_CHANNEL_SECRET
 
     FRONTEND_URL: str = "https://user.symotus.com"
+    # 縮時影片公開分享連結的預設／最長有效天數
+    VIDEO_SHARE_DEFAULT_DAYS: int = 7
+    VIDEO_SHARE_MAX_DAYS: int = 30
     INVITE_EXPIRE_HOURS: int = 168
 
     class Config:

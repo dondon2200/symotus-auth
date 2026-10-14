@@ -152,6 +152,36 @@ def decode_video_ticket(token: str) -> Optional[tuple[int, int]]:
     except Exception:
         return None
 
+def create_video_share_ticket(kind: str, job_key: str, days: int) -> tuple[str, datetime]:
+    """公開分享縮時影片的簽章 ticket：任何人持連結可看、可下載，到期即失效。
+
+    不落 DB、不能撤銷——用途是「把成品給客戶看」，不是長期授權；預設 7 天、
+    最長 30 天（由呼叫端限制）。ticket 綁 kind+job，不綁人，所以不要塞 user 資料。
+    回傳 (token, 到期時間 naive UTC)。
+    """
+    exp = datetime.utcnow() + timedelta(days=days)
+    payload = {
+        "purpose": "video_share",
+        "kind": kind,
+        "job": str(job_key),
+        "jti": secrets.token_urlsafe(16),
+        "exp": exp,
+    }
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM), exp
+
+
+def decode_video_share_ticket(token: str) -> Optional[tuple[str, str, datetime]]:
+    """驗證分享 ticket，回傳 (kind, job_key, 到期時間 naive UTC)；無效／過期回 None。"""
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        if payload.get("purpose") != "video_share":
+            return None
+        exp = datetime.utcfromtimestamp(int(payload["exp"]))
+        return str(payload["kind"]), str(payload["job"]), exp
+    except Exception:
+        return None
+
+
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),

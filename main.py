@@ -7,6 +7,7 @@ from config import settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_JOB_SYNC_TASK = None  # 縮時任務背景同步（services/job_notifier），同樣要持強引用
 _BILLING_TASK = None  # 模組層級，避免 asyncio.create_task 的回傳值被 GC 回收後任務無聲消失
 
 app = FastAPI(
@@ -306,6 +307,10 @@ async def startup():
             from services.billing_v2 import start_billing_scheduler
             global _BILLING_TASK
             _BILLING_TASK = asyncio.create_task(start_billing_scheduler())
+            # 縮時任務背景同步：使用者不開任務頁也會轉態並收到 LINE 完成通知
+            from services.job_notifier import start_job_sync_loop
+            global _JOB_SYNC_TASK
+            _JOB_SYNC_TASK = asyncio.create_task(start_job_sync_loop())
             break
         except Exception as e:
             logger.warning(f"DB not ready: {e}")

@@ -6,6 +6,17 @@
 
 ## [Unreleased]
 
+### Added
+- **縮時影片公開分享**（2026-10-14，`routers/jobs.py`、`auth.py`）
+  - `POST /jobs/share {kind, job_id, days?}`：對已完成任務簽到期 ticket（預設 7 天、最長 30），回 `{url: FRONTEND_URL/video/{token}, expires_at}`；擁有者或 symotus_admin 才能簽
+  - `GET /jobs/public/{token}` 回中繼資料、`GET /jobs/public/{token}/video[?download=1]` 串流自 Spark（支援 Range），皆不需登入；任務刪除或 ticket 過期即 404
+  - 影片串流抽成 `_stream_spark_video()`，GDrive 下載與公開分享共用
+- **縮時任務完成／失敗 LINE 通知與背景同步**（2026-10-14，`services/job_notifier.py`）
+  - 任務轉終態（列表同步、PUT 查證、GDrive 輪詢、Spark 回呼）時推 LINE 給建立者所有 `is_active` 綁定；同任務 10 分鐘內只推一次；完成時間早於 24 小時不推
+  - 每 `JOB_SYNC_INTERVAL`（預設 120 秒）把未結束的相機任務與已送 Spark 的 GDrive 任務向 Spark 對齊一次，使用者不開任務頁也會轉態並收到通知
+  - 前端舊的「完成時通知我」按鈕打的 `/cameras/notify-job-complete` 從未存在，隨此一併移除
+- **任務列表帶建立者**：`GET /jobs`、`GET /jobs/gdrive` 每筆多 `owner_id`、`owner_name`（full_name 優先，否則 username）
+
 ### Changed
 - **縮時任務對所有 symotus_admin 可見**（2026-10-14，`routers/jobs.py`）
   - 新增 `_scope_to_user()`：symotus_admin 不套 `user_id` 過濾，其他角色維持只看自己的

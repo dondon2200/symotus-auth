@@ -11,8 +11,10 @@ from pydantic import BaseModel
 from database import get_db
 from models import User, TimelapsJob
 from auth import (get_current_user, create_gdrive_oauth_ticket, decode_gdrive_oauth_ticket,
-                  create_video_ticket, decode_video_ticket)
+                  create_video_ticket, decode_video_ticket,
+                  create_video_share_ticket, decode_video_share_ticket)
 from schemas import UtcDatetime, utc_iso
+from services.job_notifier import schedule_job_notification
 
 router = APIRouter(prefix="/jobs", tags=["timelapse_jobs"])
 
@@ -60,9 +62,28 @@ class JobResponse(BaseModel):
     resolution: Optional[str]
     created_at: UtcDatetime
     updated_at: UtcDatetime
+    # 建立者（2026-10-14 起 symotus_admin 看得到所有人的任務，列表要能分辨是誰建的）。
+    # 不是資料表欄位，由 _attach_owner_names() 在回應前掛上去。
+    owner_id: Optional[int] = None
+    owner_name: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+
+def _owner_names(db: Session, user_ids: set[int]) -> dict[int, str]:
+    """user_id → 顯示名稱（full_name 優先，否則 username）。一次查完，不逐列打 DB。"""
+    if not user_ids:
+        return {}
+    rows = db.query(User.id, User.username, User.full_name).filter(User.id.in_(user_ids)).all()
+    return {r.id: (r.full_name or r.username or "") for r in rows}
+
+
+def _attach_owner_names(db: Session, jobs: list) -> None:
+    names = _owner_names(db, {j.user_id for j in jobs})
+    for j in jobs:
+        j.owner_id = j.user_id
+        j.owner_name = names.get(j.user_id)
 
 
 @router.post("", response_model=JobResponse)
@@ -109,6 +130,7 @@ async def list_jobs(
     jobs = _scope_to_user(db.query(TimelapsJob), TimelapsJob, current_user).order_by(
         TimelapsJob.created_at.desc()).all()
     await _sync_jobs_with_spark(db, jobs)
+    _attach_owner_names(db, jobs)
     return jobs
 
 
@@ -125,6 +147,7 @@ async def update_job(
     ).first()
     if not job:
         raise HTTPException(404, "Job 不存在")
+    notify_after_commit = False
     if body.status is not None:
         # 呼叫端可能送 "Completed"；spark_status 已被 _spark_status_to_local 正規化成
         # 小寫，兩邊要在同一個大小寫基準上比較，否則真實請求會被誤判成偽報。
@@ -156,10 +179,13 @@ async def update_job(
                 # completed_at／video_duration_secs。
                 # 只在「從非 completed 轉為 completed」時寫入 completed_at，
                 # 避免重複同步到同一結果時把完成日往後改，導致用量從舊日搬到新日。
+                transitioned = (job.status or "").lower() != spark_status
                 if spark_status == "completed" and (job.status or "").lower() != "completed":
                     job.completed_at = parse_spark_completed_at(
                         data.get("completed_at"), datetime.utcnow())
                 job.status = spark_status
+                if transitioned:
+                    notify_after_commit = True
                 # video_duration_secs 只在目前為 None 時才寫，讓後到的真值仍能
                 # 補上先到的 None；一旦有值就不再被（Spark 的）新值覆蓋。
                 spark_duration = data.get("video_duration_secs")
@@ -176,7 +202,21 @@ async def update_job(
     job.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(job)
+    if notify_after_commit:
+        _notify_camera_job(db, job)
     return job
+
+
+def _notify_camera_job(db: Session, job: TimelapsJob) -> None:
+    """任務轉終態後推 LINE 給建立者。推播只是附帶效果，任何錯誤都不能讓主流程失敗。"""
+    try:
+        schedule_job_notification(
+            db, "camera", job.job_id, job.user_id,
+            job.camera_name or job.serial_id or job.job_id,
+            (job.status or "").lower(), job.completed_at,
+        )
+    except Exception:
+        logger.warning("job_id=%s: 完成通知排程失敗", job.job_id, exc_info=True)
 
 
 @router.delete("/{job_id}")
@@ -388,6 +428,7 @@ async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
     results = await asyncio.gather(*[fetch(j) for j in active])
 
     changed_any = False
+    finished: list = []
     for job, data in results:
         if not data:
             continue
@@ -413,6 +454,8 @@ async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
                     )
             job.status = status
             changed = True
+            if status in ("completed", "failed"):
+                finished.append(job)
         # video_duration_secs 不綁在上面的轉態守衛：這條同步路徑不是唯一會先跑到的
         # 路徑（前端 PUT /jobs/{id} 常常更早送達、且不帶這個欄位，把值定成 None）。
         # 用「目前為 None 且 Spark 這次有值」判斷，讓真值有機會補上先到的 None；
@@ -439,6 +482,9 @@ async def _sync_jobs_with_spark(db: Session, jobs: list) -> None:
 
     if changed_any:
         db.commit()
+    # 推播放在 commit 之後：DB 已是終態，就算推播失敗也不會讓列表回應出錯
+    for job in finished:
+        _notify_camera_job(db, job)
 
 
 # ── OAuth：用消費者授權碼換 token、refresh token 續期 ──────────────────────────
@@ -1275,8 +1321,16 @@ async def download_gdrive_video(job_id: int, t: str, request: Request, db: Sessi
     ).first()
     if not job or not job.spark_job_id:
         raise HTTPException(404, "找不到此任務的影片")
+    return await _stream_spark_video(job.spark_job_id, request, f"timelapse_{job_id}.mp4")
 
-    upstream = f"{SPARK_API_URL}/jobs/{job.spark_job_id}/download"
+
+async def _stream_spark_video(spark_job_id: str, request: Request, filename: str,
+                              inline: bool = False) -> Response:
+    """把 Spark 的影片檔串流轉給瀏覽器（支援 Range）。GDrive 下載與公開分享共用。
+
+    inline=True 時用 Content-Disposition: inline，讓 <video> 直接播；否則 attachment 觸發下載。
+    """
+    upstream = f"{SPARK_API_URL}/jobs/{spark_job_id}/download"
     upstream_headers = {"x-api-key": SPARK_API_KEY}
     for name in _VIDEO_FORWARD_REQUEST_HEADERS:
         if request.headers.get(name):
@@ -1308,7 +1362,8 @@ async def download_gdrive_video(job_id: int, t: str, request: Request, db: Sessi
             await resp.aclose()
             await client.aclose()
 
-    headers = {"Content-Disposition": f'attachment; filename="timelapse_{job_id}.mp4"'}
+    disposition = "inline" if inline else "attachment"
+    headers = {"Content-Disposition": f'{disposition}; filename="{filename}"'}
     for name in _VIDEO_RELAY_RESPONSE_HEADERS:
         if resp.headers.get(name):
             headers[name.title()] = resp.headers[name]
@@ -1316,6 +1371,104 @@ async def download_gdrive_video(job_id: int, t: str, request: Request, db: Sessi
                              status_code=resp.status_code,
                              media_type=resp.headers.get("content-type", "video/mp4"),
                              headers=headers)
+
+
+# ── 公開分享縮時影片 ──────────────────────────────────────────────────────────
+# 任務頁的「分享影片」：登入者對自己（或 admin 對任何人）的已完成任務簽一張到期 ticket，
+# 連結指向前端 /video/{token}；該頁再用同一 token 向這裡拿中繼資料與影片串流，全程不需登入。
+
+class VideoShareRequest(BaseModel):
+    kind: str                      # "camera" | "gdrive"
+    job_id: str                    # 相機任務＝Spark job_id；GDrive＝本地 id
+    days: Optional[int] = None     # 有效天數，預設 settings.VIDEO_SHARE_DEFAULT_DAYS
+
+
+def _resolve_shareable_job(db: Session, kind: str, job_key: str):
+    """回傳 (spark_job_id, 標題, 任務物件)；任務不存在或沒影片回 None。不做授權，呼叫端負責。"""
+    if kind == "camera":
+        job = db.query(TimelapsJob).filter(TimelapsJob.job_id == job_key).first()
+        if not job or (job.status or "").lower() != "completed":
+            return None
+        return job.job_id, (job.camera_name or job.serial_id or job.job_id), job
+    if kind == "gdrive":
+        try:
+            pk = int(job_key)
+        except (TypeError, ValueError):
+            return None
+        job = db.query(GDriveJob).filter(GDriveJob.id == pk).first()
+        if not job or (job.status or "").lower() != "completed" or not job.spark_job_id:
+            return None
+        return job.spark_job_id, (job.folder_name or f"Google Drive 匯入 #{job.id}"), job
+    return None
+
+
+@router.post("/share")
+def create_video_share(
+    body: VideoShareRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if body.kind not in ("camera", "gdrive"):
+        raise HTTPException(422, "kind 必須是 camera 或 gdrive")
+    days = body.days or settings.VIDEO_SHARE_DEFAULT_DAYS
+    if not (1 <= days <= settings.VIDEO_SHARE_MAX_DAYS):
+        raise HTTPException(422, f"有效天數需在 1～{settings.VIDEO_SHARE_MAX_DAYS} 天之間")
+    found = _resolve_shareable_job(db, body.kind, body.job_id)
+    if not found:
+        raise HTTPException(404, "找不到可分享的影片（任務不存在或尚未完成）")
+    _, title, job = found
+    if current_user.role != "symotus_admin" and job.user_id != current_user.id:
+        raise HTTPException(404, "找不到可分享的影片（任務不存在或尚未完成）")
+    token, exp = create_video_share_ticket(body.kind, body.job_id, days)
+    return {
+        "url": f"{settings.FRONTEND_URL}/video/{token}",
+        "title": title,
+        "expires_at": utc_iso(exp),
+        "days": days,
+    }
+
+
+def _load_shared(db: Session, token: str):
+    claims = decode_video_share_ticket(token)
+    if not claims:
+        raise HTTPException(404, "分享連結無效或已過期")
+    kind, job_key, exp = claims
+    found = _resolve_shareable_job(db, kind, job_key)
+    if not found:
+        raise HTTPException(404, "這部影片已不存在")
+    spark_job_id, title, job = found
+    return kind, spark_job_id, title, job, exp
+
+
+@router.get("/public/{token}")
+def get_shared_video_meta(token: str, db: Session = Depends(get_db)):
+    kind, _, title, job, exp = _load_shared(db, token)
+    base = f"{settings.PUBLIC_BASE_URL}/jobs/public/{token}/video"
+    completed_at = getattr(job, "completed_at", None)
+    return {
+        "kind": kind,
+        "title": title,
+        "created_at": utc_iso(job.created_at),
+        "completed_at": utc_iso(completed_at) if completed_at else None,
+        "fps": job.fps,
+        "resolution": job.resolution,
+        "video_duration_secs": getattr(job, "video_duration_secs", None),
+        "image_count": getattr(job, "image_count", None) or getattr(job, "total_images", None),
+        "start_date": getattr(job, "start_date", None),
+        "end_date": getattr(job, "end_date", None),
+        "expires_at": utc_iso(exp),
+        "video_url": base,
+        "download_url": f"{base}?download=1",
+    }
+
+
+@router.get("/public/{token}/video")
+async def stream_shared_video(token: str, request: Request, download: int = 0,
+                              db: Session = Depends(get_db)):
+    kind, spark_job_id, title, job, _ = _load_shared(db, token)
+    key = job.job_id if kind == "camera" else job.id
+    return await _stream_spark_video(spark_job_id, request, f"timelapse_{key}.mp4",
+                                     inline=not download)
 
 
 def _get_drive_credential(db: Session, user_id: int) -> Optional[GoogleDriveCredential]:
@@ -1583,6 +1736,57 @@ async def resume_gdrive_job(
 
 
 
+def _gdrive_status_from_spark(spark: dict, job: GDriveJob) -> str:
+    sp = (spark.get("status") or job.status or "").lower()
+    if sp in ("completed", "done", "success"):
+        return "completed"
+    if sp in ("failed", "error"):
+        return "failed"
+    return "processing"
+
+
+def _notify_gdrive_job(db: Session, job: GDriveJob) -> None:
+    """同 _notify_camera_job：推播失敗只記 log。"""
+    try:
+        schedule_job_notification(
+            db, "gdrive", job.id, job.user_id,
+            job.folder_name or f"Google Drive 匯入 #{job.id}",
+            (job.status or "").lower(), None,
+        )
+    except Exception:
+        logger.warning("gdrive job=%s: 完成通知排程失敗", job.id, exc_info=True)
+
+
+async def sync_gdrive_job_with_spark(db: Session, job: GDriveJob) -> tuple[dict, str]:
+    """向 Spark 查一次已送出的 GDrive 任務，終態寫回 DB 並推播。回傳 (Spark 原始回應, 本地狀態)。
+
+    Spark 查不到／逾時就回空 dict，狀態沿用 DB 原值（不會把進行中的任務誤判成失敗）。
+    任務頁輪詢與 services/job_notifier 的背景同步都走這裡。
+    """
+    spark: dict = {}
+    if job.spark_job_id:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                sr = await client.get(
+                    f"{SPARK_API_URL}/jobs/{job.spark_job_id}",
+                    headers={"x-api-key": SPARK_API_KEY},
+                )
+            if sr.status_code == 200:
+                spark = sr.json()
+        except Exception:
+            pass
+    status = _gdrive_status_from_spark(spark, job)
+    if status in ("completed", "failed") and job.status != status:
+        job.status = status
+        error = spark.get("error")
+        if error:
+            job.error_message = error
+        job.updated_at = datetime.utcnow()
+        db.commit()
+        _notify_gdrive_job(db, job)
+    return spark, status
+
+
 @router.get("/gdrive")
 async def list_gdrive_jobs(
     current_user: User = Depends(get_current_user),
@@ -1591,9 +1795,12 @@ async def list_gdrive_jobs(
     """列出 Google Drive 縮時 jobs：一般用戶看自己的，symotus_admin 看全部"""
     jobs = _scope_to_user(db.query(GDriveJob), GDriveJob, current_user).order_by(
         GDriveJob.created_at.desc()).all()
+    names = _owner_names(db, {j.user_id for j in jobs})
     return [
         {
             "job_id": job.id,
+            "owner_id": job.user_id,
+            "owner_name": names.get(job.user_id),
             "status": job.status,
             "folder_url": job.folder_url,
             "folder_name": job.folder_name,
@@ -1658,26 +1865,8 @@ async def get_gdrive_job(
             "resumable": job.status in ("interrupted", "failed") and bool(job.job_params),
         }
 
-    # 階段二：已送 Spark → 直接問 Spark
-    spark = {}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            sr = await client.get(
-                f"{SPARK_API_URL}/jobs/{job.spark_job_id}",
-                headers={"x-api-key": SPARK_API_KEY},
-            )
-        if sr.status_code == 200:
-            spark = sr.json()
-    except Exception:
-        pass
-
-    sp = (spark.get("status") or job.status or "").lower()
-    if sp in ("completed", "done", "success"):
-        status = "completed"
-    elif sp in ("failed", "error"):
-        status = "failed"
-    else:
-        status = "processing"
+    # 階段二：已送 Spark → 直接問 Spark（同步終態與推播也在 helper 裡，背景同步共用）
+    spark, status = await sync_gdrive_job_with_spark(db, job)
 
     percent = spark.get("percent_complete")
     if percent is None:
@@ -1686,13 +1875,6 @@ async def get_gdrive_job(
     error = spark.get("error") or job.error_message
 
     video_url = _video_download_url(job) if status == "completed" else None
-
-    # 同步 DB 終態
-    if status in ("completed", "failed") and job.status != status:
-        job.status = status
-        if error:
-            job.error_message = error
-        db.commit()
 
     # current_stage 是要顯示給使用者的中文標籤，所以用我們自己的——Spark 的
     # current_stage 是它的內部英文狀態（實測就是 "processing"），採用它會讓中文
@@ -1748,7 +1930,9 @@ async def gdrive_spark_callback(
     if not job:
         return {"message": "job not found, ignored"}
 
+    transitioned = False
     if body.status:
+        transitioned = (job.status or "").lower() != body.status.lower()
         job.status = body.status
     err = body.error or body.error_message
     if err:
@@ -1759,6 +1943,8 @@ async def gdrive_spark_callback(
         elif body.video_url:
             job.video_url = body.video_url
     db.commit()
+    if transitioned:
+        _notify_gdrive_job(db, job)
     return {"message": "ok"}
 
 
