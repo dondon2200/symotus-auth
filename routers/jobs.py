@@ -876,7 +876,7 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
                                    body_fps: int, body_resolution, rain_fog: bool, darkness: bool,
                                    max_images=None, initial_access_token: Optional[str] = None,
                                    initial_expires_in: int = 0, duration_seconds: Optional[int] = None,
-                                   image_recovery: bool = False):
+                                   image_recovery: bool = False, stabilization: bool = False):
     """背景任務：用消費者自己的 Drive 授權並發下載 → NAS → Spark /jobs/nas。
 
     下載清單 = 個別選取的照片（picked_files）+ 各選取資料夾遞迴展開的照片（drive.readonly，含
@@ -1011,7 +1011,8 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
                 headers={"x-api-key": SPARK_API_KEY},
                 json={"nas_path": nas_folder, "callback_url": callback_url,
                       "fps": body_fps, "resolution": body_resolution,
-                      "rain_fog_detection": rain_fog, "darkness_detection": darkness})
+                      "rain_fog_detection": rain_fog, "darkness_detection": darkness,
+                      "image_recovery": image_recovery, "stabilization": stabilization})
         if sr.status_code not in (200, 202):
             # 照片一律留在 NAS：重下載可能是數十 GB／數小時，不能因為送件失敗就丟掉。
             # 但狀態要分流——4xx 是請求本身不合法（例如 422 張數超上限），原封重送
@@ -1620,6 +1621,7 @@ async def create_gdrive_job(
         "rain_fog_detection": body.rain_fog_detection,
         "darkness_detection": body.darkness_detection,
         "image_recovery": body.image_recovery,
+        "stabilization": body.stabilization,
         "max_images": body.max_images,
         "duration_seconds": body.duration_seconds,
     }
@@ -1640,6 +1642,7 @@ async def create_gdrive_job(
         max_images=body.max_images,
         initial_access_token=access_token, initial_expires_in=expires_in,
         duration_seconds=body.duration_seconds, image_recovery=body.image_recovery,
+        stabilization=body.stabilization,
     )
     return {"job_id": job.id, "status": "pending", "message": "已開始：用你的 Google 權限下載照片 → Spark 生成"}
 
@@ -1654,6 +1657,7 @@ class GDriveResumeRequest(BaseModel):
     rain_fog_detection: Optional[bool] = None
     darkness_detection: Optional[bool] = None
     image_recovery: Optional[bool] = None
+    stabilization: Optional[bool] = None
     duration_seconds: Optional[int] = None
 
 
@@ -1728,6 +1732,7 @@ async def resume_gdrive_job(
         initial_expires_in=td.get("expires_in", 0),
         duration_seconds=params.get("duration_seconds"),
         image_recovery=bool(params.get("image_recovery")),
+        stabilization=bool(params.get("stabilization")),
     )
     msg = "已續傳：跳過已下載的照片，只補齊缺的部分"
     if overrides:

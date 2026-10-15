@@ -578,3 +578,99 @@ def test_resume_cannot_override_resolution(gdrive_client, gdrive_db, make_user,
                        json={"resolution": "3840x2160"})
 
     assert started["kwargs"]["body_resolution"] == "1920x1080"   # 未被改動
+
+
+# ── 四個 AI 選項都要送到 Spark ──────────────────────────────────────────────
+
+def test_spark_submission_carries_all_ai_options(gdrive_db, make_user, monkeypatch):
+    """job 73：使用者勾了影像修復＋防抖，Spark 卻只收到雨霧／過暗兩項——送件的 JSON
+    漏寫了 image_recovery 與 stabilization，Spark 端完全看不到。"""
+    import types
+    import database
+
+    user = make_user("ai1", "ai1@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "pending", PARAMS)
+    job_id = job.id
+
+    monkeypatch.setattr(database, "SessionLocal", lambda: gdrive_db)
+    monkeypatch.setattr(gdrive_db, "close", lambda: None)
+
+    async def fake_list(token_mgr, folder_id, max_images):
+        return [{"id": f"{folder_id}-{i}", "name": f"{i}.jpg"} for i in range(20)]
+
+    async def fake_fetch(*a, **kw):
+        return None
+
+    monkeypatch.setattr(jobs_module, "_list_drive_images", fake_list)
+    monkeypatch.setattr(jobs_module, "_existing_sizes", lambda p: {})
+    monkeypatch.setattr(jobs_module, "_fetch_and_store", fake_fetch)
+    monkeypatch.setattr(jobs_module, "os", types.SimpleNamespace(
+        path=jobs_module.os.path, makedirs=lambda *a, **kw: None,
+        listdir=lambda p: [f"{i}.jpg" for i in range(20)]))
+
+    posted = {}
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+        async def post(self, url, headers=None, json=None):
+            posted["url"], posted["json"] = url, json
+
+            class R:
+                status_code = 202
+                @staticmethod
+                def json(): return {"job_id": "spark-1"}
+            return R()
+
+    monkeypatch.setattr(jobs_module.httpx, "AsyncClient", FakeClient)
+
+    asyncio.run(jobs_module._run_gdrive_nas_pipeline(
+        job_id, folder_ids=["folder-1"], picked_files=[], refresh_token="rt",
+        body_fps=30, body_resolution="1920x1080", rain_fog=True, darkness=True,
+        initial_access_token="at", initial_expires_in=3600,
+        image_recovery=True, stabilization=True,
+    ))
+
+    assert posted["url"].endswith("/jobs/nas")
+    body = posted["json"]
+    assert body["rain_fog_detection"] is True
+    assert body["darkness_detection"] is True
+    assert body["image_recovery"] is True
+    assert body["stabilization"] is True
+    assert gdrive_db.get(GDriveJob, job_id).status == "processing"
+
+
+def test_create_job_persists_and_forwards_stabilization(
+        gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch, _google_ok):
+    """stabilization 也要寫進 job_params，否則續傳時會被悄悄關掉。"""
+    user = make_user("ai2", "ai2@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-ai2"))
+    gdrive_db.commit()
+    started = _capture_launch(monkeypatch)
+
+    r = gdrive_client.post("/jobs/gdrive", headers=auth_headers(user), json=_job_body(
+        rain_fog_detection=True, darkness_detection=True,
+        image_recovery=True, stabilization=True))
+    assert r.status_code == 200, r.text
+
+    kw = started["kwargs"]
+    assert kw["image_recovery"] is True and kw["stabilization"] is True
+    params = json.loads(gdrive_db.get(GDriveJob, r.json()["job_id"]).job_params)
+    assert params["image_recovery"] is True and params["stabilization"] is True
+
+
+def test_resume_keeps_and_overrides_stabilization(gdrive_client, gdrive_db, make_user,
+                                                  auth_headers, monkeypatch, _google_ok):
+    user = make_user("ai3", "ai3@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "failed", {**PARAMS, "stabilization": True})
+    started = _capture_launch(monkeypatch)
+
+    gdrive_client.post(f"/jobs/gdrive/{job.id}/resume", headers=auth_headers(user))
+    assert started["kwargs"]["stabilization"] is True
+
+    job2 = _mk_job(gdrive_db, user, "failed", {**PARAMS, "stabilization": True})
+    gdrive_client.post(f"/jobs/gdrive/{job2.id}/resume", headers=auth_headers(user),
+                       json={"stabilization": False})
+    assert started["kwargs"]["stabilization"] is False
