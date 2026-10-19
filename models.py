@@ -233,6 +233,9 @@ class GDriveJob(Base):
     error_message = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # 處理歷程各階段的完成時間（naive UTC）。updated_at 任何寫入都會變，不能拿來當階段時間。
+    downloaded_at = Column(DateTime, nullable=True)   # 照片下載完、送出 Spark 的時間
+    completed_at = Column(DateTime, nullable=True)    # Spark 完成或失敗的時間
 
 
 class GoogleDriveCredential(Base):

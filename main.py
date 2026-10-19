@@ -198,6 +198,11 @@ async def startup():
                     "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS folder_name VARCHAR",
                     "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS google_refresh_token VARCHAR",
                     "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS job_params TEXT",
+                    "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS downloaded_at TIMESTAMP",
+                    "ALTER TABLE gdrive_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP",
+                    # 舊任務沒記完成時間：終態那次寫入的 updated_at 是最接近的估計
+                    "UPDATE gdrive_jobs SET completed_at = updated_at "
+                    "WHERE completed_at IS NULL AND status IN ('completed', 'failed')",
                     "ALTER TABLE gdrive_jobs ALTER COLUMN folder_url DROP NOT NULL",
                     """CREATE TABLE IF NOT EXISTS google_drive_credentials (
                         id SERIAL PRIMARY KEY,

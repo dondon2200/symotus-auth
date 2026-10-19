@@ -639,7 +639,9 @@ def test_spark_submission_carries_all_ai_options(gdrive_db, make_user, monkeypat
     assert body["darkness_detection"] is True
     assert body["image_recovery"] is True
     assert body["stabilization"] is True
-    assert gdrive_db.get(GDriveJob, job_id).status == "processing"
+    done = gdrive_db.get(GDriveJob, job_id)
+    assert done.status == "processing"
+    assert done.downloaded_at is not None          # 處理歷程「下載照片」的完成時間
 
 
 def test_create_job_persists_and_forwards_stabilization(
@@ -674,3 +676,39 @@ def test_resume_keeps_and_overrides_stabilization(gdrive_client, gdrive_db, make
     gdrive_client.post(f"/jobs/gdrive/{job2.id}/resume", headers=auth_headers(user),
                        json={"stabilization": False})
     assert started["kwargs"]["stabilization"] is False
+
+
+# ── 處理歷程各階段的完成時間 ─────────────────────────────────────────────────
+
+def test_spark_completed_at_is_parsed_to_naive_utc():
+    from datetime import datetime
+    got = jobs_module._spark_completed_at({"completed_at": "2026-10-15T05:56:19.368211Z"})
+    assert got == datetime(2026, 10, 15, 5, 56, 19, 368211)
+    assert got.tzinfo is None
+
+
+def test_spark_completed_at_falls_back_to_now():
+    from datetime import datetime, timedelta
+    for spark in ({}, {"completed_at": None}, {"completed_at": "garbage"}):
+        assert datetime.utcnow() - jobs_module._spark_completed_at(spark) < timedelta(seconds=5)
+
+
+def test_sync_records_completed_at_and_api_returns_stage_times(
+        gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch):
+    """Spark 終態寫回時記下完成時間（用 Spark 自己的時間，背景同步可能晚幾分鐘才看到）；
+    清單與單筆都把下載完成／合成完成時間交給前端畫處理歷程。"""
+    from datetime import datetime
+    user = make_user("stamp1", "stamp1@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "processing", PARAMS, spark_job_id="spark-t",
+                  downloaded_at=datetime(2026, 10, 19, 2, 0, 0))
+    monkeypatch.setattr(jobs_module.httpx, "AsyncClient", _FakeSparkClient)
+    monkeypatch.setattr(_FakeSparkClient, "payload", {
+        "status": "completed", "percent_complete": 100, "completed_at": "2026-10-19T03:30:00Z"})
+
+    detail = gdrive_client.get(f"/jobs/gdrive/{job.id}", headers=auth_headers(user)).json()
+    row = next(r for r in gdrive_client.get("/jobs/gdrive", headers=auth_headers(user)).json()
+               if r["job_id"] == job.id)
+
+    for d in (detail, row):
+        assert d["downloaded_at"].startswith("2026-10-19T02:00:00")
+        assert d["completed_at"].startswith("2026-10-19T03:30:00")

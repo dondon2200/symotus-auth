@@ -1004,7 +1004,7 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
             job.downloaded_count = saved; db.commit()
 
         # 3. Spark 從 NAS 讀（無大小限制）
-        job.status = "submitted"; db.commit()
+        job.status = "submitted"; job.downloaded_at = datetime.utcnow(); db.commit()
         callback_url = f"{settings.PUBLIC_BASE_URL}/jobs/gdrive/callback/{job_id}"
         async with httpx.AsyncClient(timeout=30) as client:
             sr = await client.post(f"{SPARK_API_URL}/jobs/nas",
@@ -1741,6 +1741,23 @@ async def resume_gdrive_job(
 
 
 
+def _spark_completed_at(spark: dict) -> datetime:
+    """Spark 回報的完成時間（ISO，帶 Z）轉 naive UTC；沒有或格式不對就用現在。
+
+    背景同步可能晚幾分鐘才看到終態，用 Spark 自己的時間才準。
+    """
+    raw = spark.get("completed_at")
+    if isinstance(raw, str) and raw:
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
+        except ValueError:
+            pass
+    return datetime.utcnow()
+
+
 def _gdrive_status_from_spark(spark: dict, job: GDriveJob) -> str:
     sp = (spark.get("status") or job.status or "").lower()
     if sp in ("completed", "done", "success"):
@@ -1786,6 +1803,7 @@ async def sync_gdrive_job_with_spark(db: Session, job: GDriveJob) -> tuple[dict,
         error = spark.get("error")
         if error:
             job.error_message = error
+        job.completed_at = _spark_completed_at(spark)
         job.updated_at = datetime.utcnow()
         db.commit()
         _notify_gdrive_job(db, job)
@@ -1817,6 +1835,8 @@ async def list_gdrive_jobs(
             "error_message": job.error_message,
             "resumable": job.status in ("interrupted", "failed") and bool(job.job_params),
             "created_at": utc_iso(job.created_at),
+            "downloaded_at": utc_iso(job.downloaded_at),
+            "completed_at": utc_iso(job.completed_at),
         }
         for job in jobs
     ]
@@ -1868,6 +1888,8 @@ async def get_gdrive_job(
             "error_message": job.error_message,
             # 前端據此顯示「繼續下載」；舊任務沒有 job_params 無法續傳
             "resumable": job.status in ("interrupted", "failed") and bool(job.job_params),
+            "downloaded_at": utc_iso(job.downloaded_at),
+            "completed_at": utc_iso(job.completed_at),
         }
 
     # 階段二：已送 Spark → 直接問 Spark（同步終態與推播也在 helper 裡，背景同步共用）
@@ -1905,6 +1927,8 @@ async def get_gdrive_job(
         "quality_report": spark.get("quality_report") or None,
         "video_download_url": video_url,
         "error_message": error,
+        "downloaded_at": utc_iso(job.downloaded_at),
+        "completed_at": utc_iso(job.completed_at),
     }
 
 
@@ -1942,6 +1966,8 @@ async def gdrive_spark_callback(
     err = body.error or body.error_message
     if err:
         job.error_message = err
+    if transitioned and (body.status or "").lower() in ("completed", "failed"):
+        job.completed_at = datetime.utcnow()
     if body.status == "completed":
         if job.spark_job_id:
             job.video_url = None      # 連結改為查詢時即時產生（見 _video_download_url）
