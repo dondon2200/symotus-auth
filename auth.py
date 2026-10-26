@@ -56,6 +56,8 @@ def create_access_token(user: User, db: Session) -> str:
         "tech_support_until": tech_support_until,
         # 前端用這個 claim 決定要不要顯示工程測試區塊（純畫面，不是權限）
         "engineering_mode": bool(user.engineering_mode),
+        # 可讀取全部縮時影片（帳號旗標；後端 /jobs 讀路徑也認這個欄位，不是純畫面）
+        "jobs_view_all": bool(user.jobs_view_all),
         "exp": datetime.utcnow() + timedelta(minutes=settings.JWT_EXPIRE_MINUTES),
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)

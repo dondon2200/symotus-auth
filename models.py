@@ -20,6 +20,10 @@ class User(Base):
     # 工程模式：前端顯示工程測試用的隱藏設定（例：拍照星期 DAY0–DAY6、OSD 字幕）。
     # 只影響畫面；由 symotus_admin 在帳號管理切換，寫進 JWT 與 /auth/me。
     engineering_mode = Column(Boolean, nullable=False, default=False, server_default="false")
+    # 可讀取全部縮時影片：任務頁看得到所有人的任務並可播放／下載／分享，但不能改、刪、
+    # 續傳別人的任務（routers/jobs.py 的 _scope_for_read）。admin 在帳號管理切換，
+    # 寫進 JWT 與 /auth/me。設計：symotus-frontend docs/superpowers/specs/2026-10-26-jobs-view-all-flag-design.md
+    jobs_view_all = Column(Boolean, nullable=False, default=False, server_default="false")
     reseller_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # end_user -> reseller
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 

@@ -7,6 +7,12 @@
 ## [Unreleased]
 
 ### Added
+- **帳號旗標 `jobs_view_all`：可讀取全部縮時影片**（2026-10-26，`models.py`、`auth.py`、`routers/{admin,auth,jobs}.py`）
+  - 開著的帳號在 `GET /jobs`、`GET /jobs/gdrive`、`GET /jobs/gdrive/{id}`、`POST /jobs/share` 看得到／可分享所有人的任務；`PUT/DELETE /jobs/{id}`、`POST(resume)/DELETE /jobs/gdrive/{id}` 不放寬，仍只有擁有者或 symotus_admin
+  - `routers/jobs.py` 把讀路徑抽成 `_scope_for_read()`（admin 或旗標看全部），`_scope_to_user()` 只管寫入
+  - 比照 `engineering_mode`：JWT claim、`/auth/me`、`GET/PUT /admin/users` 皆帶 `jobs_view_all`；startup 自動補欄位（`migrations/2026-10-26_users_jobs_view_all.sql`）
+  - 原因：同事只需要看公司所有縮時影片，升 symotus_admin 權限太大
+  - 設計：symotus-frontend `docs/superpowers/specs/2026-10-26-jobs-view-all-flag-design.md`；測試：`tests/test_jobs_view_all_flag.py`
 - **縮時影片公開分享**（2026-10-14，`routers/jobs.py`、`auth.py`）
   - `POST /jobs/share {kind, job_id, days?}`：對已完成任務簽到期 ticket（預設 7 天、最長 30），回 `{url: FRONTEND_URL/video/{token}, expires_at}`；擁有者或 symotus_admin 才能簽
   - `GET /jobs/public/{token}` 回中繼資料、`GET /jobs/public/{token}/video[?download=1]` 串流自 Spark（支援 Range），皆不需登入；任務刪除或 ticket 過期即 404

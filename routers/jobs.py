@@ -19,8 +19,23 @@ from services.job_notifier import schedule_job_notification
 router = APIRouter(prefix="/jobs", tags=["timelapse_jobs"])
 
 
+def _can_view_all(current_user: User) -> bool:
+    """能讀全部任務的人：symotus_admin，或帳號旗標 jobs_view_all 開著的人（2026-10-26，
+    給只需要看影片的同事；設計見 symotus-frontend docs/superpowers/specs/2026-10-26-jobs-view-all-flag-design.md）。"""
+    return current_user.role == "symotus_admin" or bool(getattr(current_user, "jobs_view_all", False))
+
+
+def _scope_for_read(query, model, current_user: User):
+    """讀路徑（列表／單筆／分享）的可見範圍：admin 或 jobs_view_all 看全部，其他只看自己的。
+    改、刪、續傳不走這裡——用 _scope_to_user，旗標不放寬寫入。"""
+    if _can_view_all(current_user):
+        return query
+    return query.filter(model.user_id == current_user.id)
+
+
 def _scope_to_user(query, model, current_user: User):
-    """任務可見範圍：symotus_admin 看得到所有人的任務，其他角色只看自己的。
+    """任務「寫入」範圍：symotus_admin 可動所有人的任務，其他角色只能動自己的。
+    讀路徑請用 _scope_for_read（多認 jobs_view_all 旗標）。
 
     2026-10-14 前每支端點都寫死 `model.user_id == current_user.id`，管理員彼此看
     不到對方建立的縮時任務（jimmy_admin 看不到 Super Admin 的 52 筆 Google Drive
@@ -127,7 +142,7 @@ async def list_jobs(
     後端提交的，callback_url 不指向本服務），所以在此比照 GET /jobs/gdrive/{id}
     的做法，於查詢時主動同步。Spark 查不到或逾時就沿用 DB 原值，不影響列表回應。
     """
-    jobs = _scope_to_user(db.query(TimelapsJob), TimelapsJob, current_user).order_by(
+    jobs = _scope_for_read(db.query(TimelapsJob), TimelapsJob, current_user).order_by(
         TimelapsJob.created_at.desc()).all()
     await _sync_jobs_with_spark(db, jobs)
     _attach_owner_names(db, jobs)
@@ -1418,7 +1433,7 @@ def create_video_share(
     if not found:
         raise HTTPException(404, "找不到可分享的影片（任務不存在或尚未完成）")
     _, title, job = found
-    if current_user.role != "symotus_admin" and job.user_id != current_user.id:
+    if not _can_view_all(current_user) and job.user_id != current_user.id:
         raise HTTPException(404, "找不到可分享的影片（任務不存在或尚未完成）")
     token, exp = create_video_share_ticket(body.kind, body.job_id, days)
     return {
@@ -1815,8 +1830,8 @@ async def list_gdrive_jobs(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """列出 Google Drive 縮時 jobs：一般用戶看自己的，symotus_admin 看全部"""
-    jobs = _scope_to_user(db.query(GDriveJob), GDriveJob, current_user).order_by(
+    """列出 Google Drive 縮時 jobs：一般用戶看自己的，symotus_admin／jobs_view_all 看全部"""
+    jobs = _scope_for_read(db.query(GDriveJob), GDriveJob, current_user).order_by(
         GDriveJob.created_at.desc()).all()
     names = _owner_names(db, {j.user_id for j in jobs})
     return [
@@ -1852,7 +1867,7 @@ async def get_gdrive_job(
     送 Spark 前（pending/listing/downloading/submitted）回本地 GDriveJob 進度；
     一旦有 spark_job_id 就直接輪詢 Spark GET /jobs/{id} 取即時狀態（不再 proxy Camera Backend）。
     """
-    job = _scope_to_user(
+    job = _scope_for_read(
         db.query(GDriveJob).filter(GDriveJob.id == job_id),
         GDriveJob, current_user,
     ).first()

@@ -166,6 +166,7 @@ def _me_payload(user: User) -> dict:
             "role": user.role, "reseller_id": user.reseller_id,
             "is_active": user.is_active,
             "engineering_mode": bool(user.engineering_mode),
+            "jobs_view_all": bool(user.jobs_view_all),
             "has_password": user.hashed_password is not None,
             "line_accounts": line_accounts,
             "line_linked": len(line_accounts) > 0,

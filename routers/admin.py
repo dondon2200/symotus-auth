@@ -243,6 +243,7 @@ def list_all_users(
              "role": u.role,
              "is_active": u.is_active,
              "engineering_mode": bool(u.engineering_mode),
+             "jobs_view_all": bool(u.jobs_view_all),
              "full_name": u.full_name, "reseller_id": u.reseller_id,
              "has_password": bool(u.hashed_password),
              "created_at": u.created_at.isoformat() if u.created_at else None} for u in users]
@@ -273,15 +274,17 @@ def update_user_admin(
     authorization: str = Header(None),
     db: Session = Depends(get_db),
 ):
-    """更新用戶屬性：role、is_active、reseller_id、engineering_mode（service key 或 symotus_admin JWT 保護）。
+    """更新用戶屬性：role、is_active、reseller_id、engineering_mode、jobs_view_all
+    （service key 或 symotus_admin JWT 保護）。
     camera_email/camera_user_id 已移除可寫欄位（Task 5：非 admin 不再綁 Camera Backend）。
-    engineering_mode 只影響前端畫面（顯示工程測試用設定），不是權限。"""
+    engineering_mode 只影響前端畫面（顯示工程測試用設定），不是權限。
+    jobs_view_all 是權限：/jobs 讀路徑放寬到全部任務（寫路徑不放寬）。"""
     if not _is_admin(x_service_key, authorization):
         raise HTTPException(status_code=403, detail="Invalid service key")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    changes = {k: body[k] for k in ("role", "is_active", "reseller_id", "engineering_mode") if k in body}
+    changes = {k: body[k] for k in ("role", "is_active", "reseller_id", "engineering_mode", "jobs_view_all") if k in body}
     if "role" in body:
         if body["role"] not in ("symotus_admin", "reseller", "end_user"):
             raise HTTPException(status_code=400, detail="role 僅能是 symotus_admin/reseller/end_user")
@@ -294,13 +297,18 @@ def update_user_admin(
         if not isinstance(body["engineering_mode"], bool):
             raise HTTPException(status_code=400, detail="engineering_mode 必須是布林值")
         user.engineering_mode = body["engineering_mode"]
+    if "jobs_view_all" in body:
+        if not isinstance(body["jobs_view_all"], bool):
+            raise HTTPException(status_code=400, detail="jobs_view_all 必須是布林值")
+        user.jobs_view_all = body["jobs_view_all"]
     log_action(db, _actor_user(authorization, db), "update_user", "user", user.id,
                f"{user.username} -> {changes}")
     db.commit()
     return {"id": user.id, "username": user.username, "email": user.email,
             "role": user.role, "is_active": user.is_active,
             "reseller_id": user.reseller_id,
-            "engineering_mode": bool(user.engineering_mode)}
+            "engineering_mode": bool(user.engineering_mode),
+            "jobs_view_all": bool(user.jobs_view_all)}
 
 
 @router.post("/camera-access")
