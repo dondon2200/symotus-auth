@@ -678,6 +678,145 @@ def test_resume_keeps_and_overrides_stabilization(gdrive_client, gdrive_db, make
     assert started["kwargs"]["stabilization"] is False
 
 
+# ── 影片風格參數（固定時段抽樣、去閃爍、疊化）─────────────────────────────────
+
+STYLE = {
+    "daily_pick_times": ["12:00"], "daily_pick_every_days": 7, "daily_pick_window_min": 90,
+    "deflicker_window": 9, "dissolve_hold_sec": 0.5, "dissolve_fade_sec": 0.5,
+}
+
+
+def _run_pipeline_capture(gdrive_db, make_user, monkeypatch, uname, style):
+    """跑一次 pipeline，回傳送到 Spark /jobs/nas 的 JSON（下載與 NAS 都換成假的）。"""
+    import types
+    import database
+
+    user = make_user(uname, f"{uname}@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "pending", PARAMS)
+    monkeypatch.setattr(database, "SessionLocal", lambda: gdrive_db)
+    monkeypatch.setattr(gdrive_db, "close", lambda: None)
+
+    async def fake_list(token_mgr, folder_id, max_images):
+        return [{"id": f"{folder_id}-{i}", "name": f"{i}.jpg"} for i in range(20)]
+
+    async def fake_fetch(*a, **kw):
+        return None
+
+    monkeypatch.setattr(jobs_module, "_list_drive_images", fake_list)
+    monkeypatch.setattr(jobs_module, "_existing_sizes", lambda p: {})
+    monkeypatch.setattr(jobs_module, "_fetch_and_store", fake_fetch)
+    monkeypatch.setattr(jobs_module, "os", types.SimpleNamespace(
+        path=jobs_module.os.path, makedirs=lambda *a, **kw: None,
+        listdir=lambda p: [f"{i}.jpg" for i in range(20)]))
+    posted = {}
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+        async def post(self, url, headers=None, json=None):
+            posted["json"] = json
+
+            class R:
+                status_code = 202
+                @staticmethod
+                def json(): return {"job_id": "spark-1"}
+            return R()
+
+    monkeypatch.setattr(jobs_module.httpx, "AsyncClient", FakeClient)
+    asyncio.run(jobs_module._run_gdrive_nas_pipeline(
+        job.id, folder_ids=["folder-1"], picked_files=[], refresh_token="rt",
+        body_fps=30, body_resolution="1920x1080", rain_fog=True, darkness=True,
+        initial_access_token="at", initial_expires_in=3600, style=style,
+    ))
+    return posted["json"]
+
+
+def test_spark_submission_forwards_style_fields(gdrive_db, make_user, monkeypatch):
+    body = _run_pipeline_capture(gdrive_db, make_user, monkeypatch, "st1", STYLE)
+    for k, v in STYLE.items():
+        assert body[k] == v
+
+
+def test_spark_submission_omits_unset_style_fields(gdrive_db, make_user, monkeypatch):
+    """沒設定的欄位一個都不能送：送了 null 不保證 Spark 當成「關」。"""
+    body = _run_pipeline_capture(gdrive_db, make_user, monkeypatch, "st2", None)
+    assert not any(k in body for k in jobs_module.STYLE_FIELDS)
+
+
+def test_create_job_persists_and_forwards_style(
+        gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch, _google_ok):
+    user = make_user("st3", "st3@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-st3"))
+    gdrive_db.commit()
+    started = _capture_launch(monkeypatch)
+
+    r = gdrive_client.post("/jobs/gdrive", headers=auth_headers(user), json=_job_body(**STYLE))
+    assert r.status_code == 200, r.text
+    assert started["kwargs"]["style"] == STYLE
+    params = json.loads(gdrive_db.get(GDriveJob, r.json()["job_id"]).job_params)
+    for k, v in STYLE.items():
+        assert params[k] == v
+
+
+def test_create_job_without_style_sends_nothing_extra(
+        gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch, _google_ok):
+    user = make_user("st4", "st4@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-st4"))
+    gdrive_db.commit()
+    started = _capture_launch(monkeypatch)
+
+    r = gdrive_client.post("/jobs/gdrive", headers=auth_headers(user), json=_job_body())
+    assert r.status_code == 200, r.text
+    assert started["kwargs"]["style"] == {}
+    params = json.loads(gdrive_db.get(GDriveJob, r.json()["job_id"]).job_params)
+    assert not any(k in params for k in jobs_module.STYLE_FIELDS)
+
+
+@pytest.mark.parametrize("bad", [
+    {"daily_pick_times": ["12"]},
+    {"daily_pick_times": ["24:00"]},
+    {"daily_pick_times": []},
+    {"deflicker_window": 2},
+    {"dissolve_hold_sec": 0},
+    {"daily_pick_every_days": 91},
+])
+def test_create_job_rejects_invalid_style_before_download(
+        gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch, _google_ok, bad):
+    """格式錯在送 Spark 前就要擋：GDrive 任務要先下載數 GB，等 Spark 回 422 就太晚了。"""
+    user = make_user("st5", "st5@example.com", password="pw")
+    started = _capture_launch(monkeypatch)
+    r = gdrive_client.post("/jobs/gdrive", headers=auth_headers(user), json=_job_body(**bad))
+    assert r.status_code == 422, r.text
+    assert "kwargs" not in started
+
+
+def test_create_job_rejects_dissolve_with_duration(
+        gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch, _google_ok):
+    user = make_user("st6", "st6@example.com", password="pw")
+    gdrive_db.add(GoogleDriveCredential(user_id=user.id, refresh_token="rt-st6"))
+    gdrive_db.commit()
+    started = _capture_launch(monkeypatch)
+    r = gdrive_client.post("/jobs/gdrive", headers=auth_headers(user),
+                           json=_job_body(dissolve_hold_sec=1, duration_seconds=60))
+    assert r.status_code == 422
+    assert "疊化" in r.json()["detail"]
+    assert "kwargs" not in started
+
+
+def test_resume_carries_style_and_allows_override(
+        gdrive_client, gdrive_db, make_user, auth_headers, monkeypatch, _google_ok):
+    user = make_user("st7", "st7@example.com", password="pw")
+    job = _mk_job(gdrive_db, user, "failed", {**PARAMS, "duration_seconds": None, **STYLE})
+    started = _capture_launch(monkeypatch)
+
+    r = gdrive_client.post(f"/jobs/gdrive/{job.id}/resume", headers=auth_headers(user),
+                           json={"deflicker_window": 15})
+    assert r.status_code == 200, r.text
+    assert started["kwargs"]["style"] == {**STYLE, "deflicker_window": 15}
+
+
 # ── 處理歷程各階段的完成時間 ─────────────────────────────────────────────────
 
 def test_spark_completed_at_is_parsed_to_naive_utc():

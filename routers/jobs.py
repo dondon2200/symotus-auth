@@ -6,7 +6,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from database import get_db
 from models import User, TimelapsJob
@@ -891,7 +891,8 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
                                    body_fps: int, body_resolution, rain_fog: bool, darkness: bool,
                                    max_images=None, initial_access_token: Optional[str] = None,
                                    initial_expires_in: int = 0, duration_seconds: Optional[int] = None,
-                                   image_recovery: bool = False, stabilization: bool = False):
+                                   image_recovery: bool = False, stabilization: bool = False,
+                                   style: Optional[dict] = None):
     """背景任務：用消費者自己的 Drive 授權並發下載 → NAS → Spark /jobs/nas。
 
     下載清單 = 個別選取的照片（picked_files）+ 各選取資料夾遞迴展開的照片（drive.readonly，含
@@ -1027,7 +1028,9 @@ async def _run_gdrive_nas_pipeline(job_id: int, folder_ids: list[str], picked_fi
                 json={"nas_path": nas_folder, "callback_url": callback_url,
                       "fps": body_fps, "resolution": body_resolution,
                       "rain_fog_detection": rain_fog, "darkness_detection": darkness,
-                      "image_recovery": image_recovery, "stabilization": stabilization})
+                      "image_recovery": image_recovery, "stabilization": stabilization,
+                      # 影片風格：只帶有設定的欄位，名稱照 Spark
+                      **_style_payload(style or {})})
         if sr.status_code not in (200, 202):
             # 照片一律留在 NAS：重下載可能是數十 GB／數小時，不能因為送件失敗就丟掉。
             # 但狀態要分流——4xx 是請求本身不合法（例如 422 張數超上限），原封重送
@@ -1544,7 +1547,40 @@ async def gdrive_oauth_disconnect(
     return {"revoked": True}
 
 
-class GDriveJobRequest(BaseModel):
+# ── 影片風格參數（Spark 2026-10-29：固定時段抽樣、去閃爍、疊化）────────────────
+# 欄位名與範圍照 Spark POST /jobs/nas。全部選填，沒設的不送 Spark，行為與以前相同。
+# 在這裡先驗：Google Drive 任務要先下載數 GB 才送 Spark，等 Spark 回 422 就太晚了。
+STYLE_FIELDS = (
+    "daily_pick_times", "daily_pick_every_days", "daily_pick_window_min",
+    "deflicker_window", "dissolve_hold_sec", "dissolve_fade_sec",
+)
+_HHMM = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+class VideoStyleFields(BaseModel):
+    daily_pick_times: Optional[list[str]] = Field(None, min_length=1, max_length=24)
+    daily_pick_every_days: Optional[int] = Field(None, ge=1, le=90)
+    daily_pick_window_min: Optional[int] = Field(None, ge=1, le=720)
+    deflicker_window: Optional[int] = Field(None, ge=3, le=101)
+    dissolve_hold_sec: Optional[float] = Field(None, gt=0, le=30)
+    dissolve_fade_sec: Optional[float] = Field(None, ge=0, le=30)
+
+    @field_validator("daily_pick_times")
+    @classmethod
+    def _check_times(cls, v):
+        if v is not None:
+            bad = [t for t in v if not _HHMM.match(t)]
+            if bad:
+                raise ValueError(f"daily_pick_times 需為 HH:MM：{bad}")
+        return v
+
+
+def _style_payload(src: dict) -> dict:
+    """從 job_params／請求挑出有設定的風格欄位（None 不送）。"""
+    return {k: src[k] for k in STYLE_FIELDS if src.get(k) is not None}
+
+
+class GDriveJobRequest(VideoStyleFields):
     folder_id: Optional[str] = None          # 向後相容：單一資料夾
     folder_name: Optional[str] = None
     folder_ids: Optional[list[str]] = None   # 多選：資料夾（後端列出內含照片）
@@ -1583,6 +1619,10 @@ async def create_gdrive_job(
       access token。僅為 auth-service 與前端分階段部署期間保留的相容分支，前端全面
       改用綁定憑證後可移除。
     """
+    # 疊化會把每張照片拉成「停留＋淡化」秒，跟「指定影片長度」互斥（Spark 同樣規則回 422）。
+    # 疊化影片的長度請用 daily_pick_every_days 控制。
+    if body.dissolve_hold_sec is not None and body.duration_seconds:
+        raise HTTPException(422, "疊化不能和指定影片長度一起使用，請改用「每幾天取一天」控制長度")
     folder_ids = list(body.folder_ids or [])
     if body.folder_id:
         folder_ids.append(body.folder_id)
@@ -1639,6 +1679,7 @@ async def create_gdrive_job(
         "stabilization": body.stabilization,
         "max_images": body.max_images,
         "duration_seconds": body.duration_seconds,
+        **_style_payload(body.model_dump()),
     }
     job = GDriveJob(
         user_id=current_user.id,
@@ -1657,15 +1698,15 @@ async def create_gdrive_job(
         max_images=body.max_images,
         initial_access_token=access_token, initial_expires_in=expires_in,
         duration_seconds=body.duration_seconds, image_recovery=body.image_recovery,
-        stabilization=body.stabilization,
+        stabilization=body.stabilization, style=_style_payload(body.model_dump()),
     )
     return {"job_id": job.id, "status": "pending", "message": "已開始：用你的 Google 權限下載照片 → Spark 生成"}
 
 
-class GDriveResumeRequest(BaseModel):
+class GDriveResumeRequest(VideoStyleFields):
     """續傳時可覆寫的設定（未給的沿用原本的 job_params）。
 
-    只開放不會讓「已下載的照片作廢」的欄位：AI 選項與影片時長都只影響送 Spark
+    只開放不會讓「已下載的照片作廢」的欄位：AI 選項、影片時長與影片風格都只影響送 Spark
     之後的處理。resolution / fps 刻意不開放——照片是依當初的解析度抓對應尺寸的
     縮圖，事後改成 4K 只會拿到不足尺寸的素材。
     """
@@ -1729,6 +1770,9 @@ async def resume_gdrive_job(
     overrides = body.model_dump(exclude_none=True) if body else {}
     if overrides:
         params.update(overrides)
+    if params.get("dissolve_hold_sec") is not None and params.get("duration_seconds"):
+        raise HTTPException(422, "疊化不能和指定影片長度一起使用，請改用「每幾天取一天」控制長度")
+    if overrides:
         job.job_params = json.dumps(params, ensure_ascii=False)
         logger.info("gdrive job %s 續傳並覆寫設定：%s", job_id, overrides)
 
@@ -1748,6 +1792,7 @@ async def resume_gdrive_job(
         duration_seconds=params.get("duration_seconds"),
         image_recovery=bool(params.get("image_recovery")),
         stabilization=bool(params.get("stabilization")),
+        style=_style_payload(params),
     )
     msg = "已續傳：跳過已下載的照片，只補齊缺的部分"
     if overrides:
