@@ -274,6 +274,21 @@ class FeaturePolicy(Base):
     updated_by = Column(Integer, nullable=True)
 
 
+class RolePolicy(Base):
+    """角色權限政策：reseller／end_user 能不能做某個動作（目錄在 role_policies.py）。
+    symotus_admin 不存列、程式一律放行。與 FeaturePolicy（被分享者依授權等級）是兩張表、兩種語意。
+    設計：symotus-frontend docs/superpowers/specs/2026-11-04-role-policies-design.md"""
+    __tablename__ = "role_policies"
+    __table_args__ = (UniqueConstraint("feature_key", "role", name="uq_role_policies_key_role"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    feature_key = Column(String, nullable=False, index=True)  # 例 camera.create
+    role = Column(String, nullable=False)                     # reseller | end_user
+    allowed = Column(Boolean, nullable=False, default=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(Integer, nullable=True)
+
+
 class AuditLog(Base):
     """帳號/授權管理操作稽核（誰、何時、對誰做了什麼）"""
     __tablename__ = "audit_logs"
