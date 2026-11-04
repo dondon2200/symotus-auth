@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from models import Base, User, CameraAccess
+from models import Base, User, CameraAccess, RolePolicy
 import routers.cameras as cameras_mod
 from routers.cameras import nas_images, nas_image, delete_camera
 import routers.users as users_mod
@@ -34,7 +34,7 @@ _REAL_GET_ADMIN_TOKEN = cameras_mod._get_admin_camera_token
 @pytest.fixture()
 def db():
     engine = create_engine("sqlite://")
-    Base.metadata.create_all(engine, tables=[User.__table__, CameraAccess.__table__])
+    Base.metadata.create_all(engine, tables=[User.__table__, CameraAccess.__table__, RolePolicy.__table__])
     s = sessionmaker(bind=engine)()
     yield s
     s.close()

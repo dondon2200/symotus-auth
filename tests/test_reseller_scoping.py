@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from models import Base, User, CameraAccess
+from models import Base, User, CameraAccess, RolePolicy
 from routers.cameras import (
     get_allowed_camera_ids, create_camera, unbind_camera, get_live_frame_url,
     unsubscribe_online_notification,
@@ -26,7 +26,7 @@ import routers.cameras as cameras_mod
 @pytest.fixture()
 def db():
     engine = create_engine("sqlite://")
-    Base.metadata.create_all(engine, tables=[User.__table__, CameraAccess.__table__])
+    Base.metadata.create_all(engine, tables=[User.__table__, CameraAccess.__table__, RolePolicy.__table__])
     s = sessionmaker(bind=engine)()
     yield s
     s.close()

@@ -19,6 +19,7 @@ from models import User, CameraAccess, TechSupportGrant
 from auth import get_current_user, to_backend_role
 from audit import log_action
 from policies import level_allows, feature_for_write
+from role_policies import role_allows
 from services.billing_v2 import (
     assert_camera_unlocked, billing_field, camera_billing_flags, get_lock_map, locked_camera_ids,
     locked_serial_in_path,
@@ -425,9 +426,9 @@ async def create_camera(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """新增/配對相機 — 只有 reseller 和 symotus_admin 可以新增相機"""
-    if current_user.role not in ("reseller", "symotus_admin"):
-        raise HTTPException(403, "只有 reseller 或 admin 可以新增相機")
+    """新增/配對相機 — 角色政策 camera.create（預設 reseller／admin；管理員可在角色權限分頁調整）"""
+    if not role_allows(db, "camera.create", current_user):
+        raise HTTPException(403, "此角色沒有「新增／配對相機」的權限")
     cam_token = await get_camera_backend_token(current_user)
     # 若沒有自己的 token（reseller 尚未設 camera_email），用 admin fallback
     if not cam_token:
@@ -450,7 +451,8 @@ async def create_camera(
     # get_allowed_camera_ids 現在對 reseller 也是靠 camera_access 控管範圍，
     # 所以無論有沒有自己的 camera_email（有自有 token 或走 admin fallback），
     # 配對成功都要建這筆 grant，否則自己剛配的相機在 list_cameras 等端點會直接消失。
-    if resp.status_code in (200, 201) and current_user.role == "reseller":
+    # end_user 被開放配對時同樣要建 grant，否則相機會從清單消失。
+    if resp.status_code in (200, 201) and current_user.role != "symotus_admin":
         camera_id = resp_data.get("id") or resp_data.get("basic_info", {}).get("id")
         if camera_id:
             existing = db.query(CameraAccess).filter(
@@ -865,11 +867,12 @@ async def delete_camera(
     if shared:
         if not level_allows(db, "camera.delete", access.permission_level):
             raise HTTPException(403, "此相機為他人分享，需「全功能管理」授權才能刪除")
-    elif current_user.role == "reseller":
+    elif current_user.role != "symotus_admin":
+        # 擁有者路徑：角色政策 camera.delete.own（預設 reseller）且持有自我 grant；admin 維持不受限
+        if not role_allows(db, "camera.delete.own", current_user):
+            raise HTTPException(403, "此角色沒有「刪除自己擁有的相機」的權限")
         if access is None:
             raise HTTPException(403, "無此相機的存取權限")
-    elif current_user.role != "symotus_admin":
-        raise HTTPException(403, "僅系統管理員或相機擁有者可刪除相機")
 
     # token：自己的 → 借 granter token（F-13，排除自我授權）→ admin fallback
     cam_token = await get_camera_backend_token(current_user)
@@ -894,6 +897,13 @@ async def delete_camera(
         current_user.id, current_user.role, camera_id, resp.status_code,
     )
     if resp.status_code not in (200, 204):
+        # 2026-09-29：camera 58 被 Camera Backend 打 500，日誌只有 status 沒有內文，
+        # 得靠瀏覽器 Response 分頁才看得到後端錯誤；這裡把內文（截 2000 字）一併留在日誌，
+        # 方便直接轉給 Camera Backend 開發人員。
+        logger.warning(
+            "CAMERA_DELETE_BACKEND_ERROR camera=%s status=%s body=%s",
+            camera_id, resp.status_code, (resp.text or "")[:2000],
+        )
         raise HTTPException(resp.status_code, resp.text)
 
     log_action(db, current_user, "camera.delete", "camera", camera_id,
@@ -1201,7 +1211,7 @@ async def delete_project(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if current_user.role not in ("reseller", "symotus_admin"):
+    if not role_allows(db, "project.delete", current_user):
         raise HTTPException(403, "沒有刪除專案的權限")
     if current_user.role != "symotus_admin":
         # 歸屬檢查：project 內至少一台相機在自己的 allowed_ids 才准刪，避免 admin
@@ -1386,7 +1396,7 @@ async def create_project(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if current_user.role not in ("reseller", "symotus_admin"):
+    if not role_allows(db, "project.create", current_user):
         raise HTTPException(403, "沒有建立專案的權限")
     cam_token = await get_camera_backend_token(current_user)
     # 若沒有自己的 token（reseller 尚未設 camera_email），用 admin fallback

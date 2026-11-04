@@ -18,7 +18,7 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from models import Base, User, CameraAccess
+from models import Base, User, CameraAccess, RolePolicy
 import routers.cameras as cameras_mod
 from routers.cameras import get_timer_status, list_projects, delete_project
 
@@ -28,7 +28,7 @@ from routers.cameras import get_timer_status, list_projects, delete_project
 @pytest.fixture()
 def db():
     engine = create_engine("sqlite://")
-    Base.metadata.create_all(engine, tables=[User.__table__, CameraAccess.__table__])
+    Base.metadata.create_all(engine, tables=[User.__table__, CameraAccess.__table__, RolePolicy.__table__])
     s = sessionmaker(bind=engine)()
     yield s
     s.close()
