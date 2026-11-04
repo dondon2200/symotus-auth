@@ -6,6 +6,7 @@ from models import User, CameraAccess
 from schemas import UserResponse, UserUpdate, ResellerUserCreate
 from auth import get_current_user, require_role, hash_password
 from audit import log_action
+from role_policies import require_feature, role_allows
 from services.billing_v2 import assert_camera_unlocked
 
 router = APIRouter(prefix="/reseller", tags=["reseller"])
@@ -19,9 +20,10 @@ users_router = APIRouter(tags=["users"])
 def reseller_create_user(
     body: ResellerUserCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("reseller")),
+    current_user: User = Depends(require_feature("account.create")),
 ):
-    """reseller 直接建 end_user。role/reseller_id 一律強制，schema 本身也不收
+    """直接建 end_user（角色政策 account.create，預設 reseller）。admin 走 /admin/users；
+    這裡仍強制 role=end_user 並綁到呼叫者。role/reseller_id 一律強制，schema 本身也不收
     這兩個欄位，body 夾帶什麼都不影響結果。"""
     if db.query(User).filter(User.username == body.username).first():
         raise HTTPException(status_code=409, detail="username 已存在")
@@ -165,10 +167,13 @@ def update_my_granted_access(
 async def grant_access_to_managed_user(
     body: dict,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("reseller", "symotus_admin"))
+    current_user: User = Depends(get_current_user)
 ):
     """把「我能以 camera token 存取的相機」授權給我管理的使用者。
     相機歸屬以 Camera Backend 實際回應驗證（非 admin 需 200），受眾限旗下或已授權過的人。"""
+    # 角色政策：直接授權（account.grant_access）或分享自己相機（camera.share.own）任一允許即過閘
+    if not (role_allows(db, "account.grant_access", current_user) or role_allows(db, "camera.share.own", current_user)):
+        raise HTTPException(403, "此角色沒有「直接授權相機給旗下帳號」的權限")
     camera_id = body.get("camera_id")
     user_id = body.get("user_id")
     permission_level = body.get("permission_level", "photos_stream")

@@ -15,20 +15,23 @@ from auth import (get_current_user, create_gdrive_oauth_ticket, decode_gdrive_oa
                   create_video_share_ticket, decode_video_share_ticket)
 from schemas import UtcDatetime, utc_iso
 from services.job_notifier import schedule_job_notification
+from role_policies import role_allows
 
 router = APIRouter(prefix="/jobs", tags=["timelapse_jobs"])
 
 
-def _can_view_all(current_user: User) -> bool:
-    """能讀全部任務的人：symotus_admin，或帳號旗標 jobs_view_all 開著的人（2026-10-26，
-    給只需要看影片的同事；設計見 symotus-frontend docs/superpowers/specs/2026-10-26-jobs-view-all-flag-design.md）。"""
-    return current_user.role == "symotus_admin" or bool(getattr(current_user, "jobs_view_all", False))
+def _can_view_all(current_user: User, db: Session) -> bool:
+    """能讀全部任務的人：symotus_admin、帳號旗標 jobs_view_all、或角色政策 jobs.view_all（2026-11-04）。
+    旗標設計見 symotus-frontend docs/superpowers/specs/2026-10-26-jobs-view-all-flag-design.md。"""
+    return (current_user.role == "symotus_admin"
+            or bool(getattr(current_user, "jobs_view_all", False))
+            or role_allows(db, "jobs.view_all", current_user))
 
 
 def _scope_for_read(query, model, current_user: User):
     """讀路徑（列表／單筆／分享）的可見範圍：admin 或 jobs_view_all 看全部，其他只看自己的。
     改、刪、續傳不走這裡——用 _scope_to_user，旗標不放寬寫入。"""
-    if _can_view_all(current_user):
+    if _can_view_all(current_user, query.session):
         return query
     return query.filter(model.user_id == current_user.id)
 
@@ -1436,7 +1439,7 @@ def create_video_share(
     if not found:
         raise HTTPException(404, "找不到可分享的影片（任務不存在或尚未完成）")
     _, title, job = found
-    if not _can_view_all(current_user) and job.user_id != current_user.id:
+    if not _can_view_all(current_user, db) and job.user_id != current_user.id:
         raise HTTPException(404, "找不到可分享的影片（任務不存在或尚未完成）")
     token, exp = create_video_share_ticket(body.kind, body.job_id, days)
     return {

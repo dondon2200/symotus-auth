@@ -18,11 +18,34 @@ from auth import (get_current_user, require_role, hash_password,
                   create_access_token, create_refresh_token)
 from audit import log_action
 from policies import level_allows
+from role_policies import role_allows
 from config import settings
 from schemas import utc_iso
 from routers.auth import get_camera_token, _rate_limit
 
 router = APIRouter(prefix="/invitations", tags=["invitations"])
+
+
+def _assert_can_share(db: Session, current_user: User, camera_id: int) -> None:
+    """分享閘：角色政策 camera.share.own（預設 reseller／admin）放行；
+    否則（D4）須持有此相機的「真分享」授權（granted_by 非本人）且等級允許 camera.share。
+    放行後的歸屬檢查在呼叫端維持原樣，預設下行為與 2026-11-04 前完全相同。"""
+    if role_allows(db, "camera.share.own", current_user):
+        return
+    access = db.query(CameraAccess).filter(
+        CameraAccess.user_id == current_user.id,
+        CameraAccess.camera_id == camera_id,
+    ).first()
+    if not (access and access.granted_by != current_user.id
+            and level_allows(db, "camera.share", access.permission_level)):
+        raise HTTPException(403, "需要此相機的「全功能管理」授權才能分享")
+
+
+def _scope_cancel(q, db: Session, current_user: User):
+    """撤銷範圍：角色政策 invitation.revoke_any（預設只有 admin）可撤任何人發的；否則只撤自己發的。"""
+    if role_allows(db, "invitation.revoke_any", current_user):
+        return q
+    return q.filter(CameraInvitation.inviter_id == current_user.id)
 
 logger = logging.getLogger(__name__)
 
@@ -105,16 +128,7 @@ def create_invitation(
     # 計費 v2：鎖定相機不可建立分享（admin 例外）
     assert_camera_unlocked(db, current_user, body.camera_id)
 
-    # D4：全功能被分享者可再分享。reseller/symotus_admin 照舊放行；
-    # 其他角色須持有此相機的「真分享」授權（granted_by 非本人）且等級允許 camera.share。
-    if current_user.role not in ("reseller", "symotus_admin"):
-        access = db.query(CameraAccess).filter(
-            CameraAccess.user_id == current_user.id,
-            CameraAccess.camera_id == body.camera_id,
-        ).first()
-        if not (access and access.granted_by != current_user.id
-                and level_allows(db, "camera.share", access.permission_level)):
-            raise HTTPException(403, "需要此相機的「全功能管理」授權才能分享")
+    _assert_can_share(db, current_user, body.camera_id)
 
     # 防重複：同相機同模式已有仍有效的連結（pending/accepted 皆算，連結可重複接受）→ 回傳現有連結
     existing_inv = db.query(CameraInvitation).filter(
@@ -519,9 +533,7 @@ def cancel_invitation(
         CameraInvitation.id == inv_id,
         CameraInvitation.status.in_(["pending", "accepted"]),
     )
-    # symotus_admin 可代撤任何人發的邀請；其他角色僅能撤自己發的
-    if current_user.role != "symotus_admin":
-        q = q.filter(CameraInvitation.inviter_id == current_user.id)
+    q = _scope_cancel(q, db, current_user)
     inv = q.first()
     if not inv:
         raise HTTPException(404, "邀請不存在或無法撤銷")

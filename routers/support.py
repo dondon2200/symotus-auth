@@ -6,6 +6,7 @@ from models import User, TechSupportGrant
 from schemas import TechSupportGrantCreate, TechSupportGrantResponse
 from auth import get_current_user, require_role
 from audit import log_action
+from role_policies import require_feature
 
 router = APIRouter(prefix="/support", tags=["support"])
 
@@ -13,7 +14,7 @@ router = APIRouter(prefix="/support", tags=["support"])
 def create_grant(
     body: TechSupportGrantCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("reseller"))
+    current_user: User = Depends(require_feature("support.grant"))
 ):
     grant = TechSupportGrant(
         reseller_id=current_user.id,
@@ -49,7 +50,7 @@ def list_grants(
 def revoke_grant(
     grant_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("reseller"))
+    current_user: User = Depends(require_feature("support.grant"))
 ):
     grant = db.query(TechSupportGrant).filter(
         TechSupportGrant.id == grant_id,

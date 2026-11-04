@@ -6,7 +6,8 @@ from database import get_db
 from models import User, InviteToken
 from audit import log_action
 from schemas import InviteCreate, InviteResponse, InvitePreview
-from auth import get_current_user, require_role
+from auth import get_current_user
+from role_policies import require_feature, role_allows
 from config import settings
 
 router = APIRouter(prefix="/invites", tags=["invites"])
@@ -15,13 +16,13 @@ router = APIRouter(prefix="/invites", tags=["invites"])
 def create_invite(
     body: InviteCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("reseller", "symotus_admin"))
+    current_user: User = Depends(require_feature("account.invite"))
 ):
-    # 角色把關：只有 symotus_admin 能發「reseller」邀請；其餘一律 end_user。
+    # 角色政策 account.invite_reseller（預設只有 symotus_admin）才能發「reseller」邀請；其餘一律 end_user。
     intended_role = "end_user"
     if body.intended_role == "reseller":
-        if current_user.role != "symotus_admin":
-            raise HTTPException(403, "只有平台管理員能發出 reseller 邀請")
+        if not role_allows(db, "account.invite_reseller", current_user):
+            raise HTTPException(403, "此角色沒有「發 reseller 邀請」的權限")
         intended_role = "reseller"
     elif body.intended_role not in ("end_user", None, ""):
         raise HTTPException(400, "intended_role 僅能是 end_user 或 reseller")
@@ -40,7 +41,7 @@ def create_invite(
 @router.get("", response_model=list[InviteResponse])
 def list_invites(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("reseller", "symotus_admin"))
+    current_user: User = Depends(require_feature("account.invite"))
 ):
     # 過期的自動標記
     db.query(InviteToken).filter(
@@ -56,14 +57,14 @@ def list_invites(
 def revoke_invite(
     token: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("reseller", "symotus_admin"))
+    current_user: User = Depends(require_feature("account.invite"))
 ):
     q = db.query(InviteToken).filter(
         InviteToken.token == token,
         InviteToken.status == "pending",
     )
-    # symotus_admin 可代撤任何人發的邀請；其他角色僅能撤自己發的
-    if current_user.role != "symotus_admin":
+    # 角色政策 invitation.revoke_any（預設只有 admin）可代撤任何人發的；否則只能撤自己發的
+    if not role_allows(db, "invitation.revoke_any", current_user):
         q = q.filter(InviteToken.reseller_id == current_user.id)
     invite = q.first()
     if not invite:
