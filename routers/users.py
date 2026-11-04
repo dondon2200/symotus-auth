@@ -20,7 +20,7 @@ users_router = APIRouter(tags=["users"])
 def reseller_create_user(
     body: ResellerUserCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_feature("account.create")),
+    current_user: User = Depends(require_feature("account.create", admin_allowed=False)),
 ):
     """直接建 end_user（角色政策 account.create，預設 reseller）。admin 走 /admin/users；
     這裡仍強制 role=end_user 並綁到呼叫者。role/reseller_id 一律強制，schema 本身也不收

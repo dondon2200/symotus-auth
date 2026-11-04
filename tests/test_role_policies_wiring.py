@@ -88,6 +88,29 @@ def test_routes_guarded_by_feature(fn, key):
     assert dep(current_user=U("end_user"), db=Db([Row(key, "end_user", True)])).role == "end_user"
 
 
+
+# ── admin 在 reseller 專屬端點維持 403（改版前即如此）──────────────
+@pytest.mark.parametrize("fn", [
+    users_mod.reseller_create_user,
+    support_mod.create_grant,
+    support_mod.revoke_grant,
+])
+def test_reseller_only_routes_block_admin(fn):
+    dep = _dep(fn)
+    assert dep.admin_allowed is False
+    _expect_403(dep, U("symotus_admin"))
+
+
+@pytest.mark.parametrize("fn", [
+    invites_mod.create_invite,
+    invites_mod.list_invites,
+    invites_mod.revoke_invite,
+])
+def test_invite_routes_still_allow_admin(fn):
+    dep = _dep(fn)
+    assert dep.admin_allowed is True
+    assert dep(current_user=U("symotus_admin"), db=Db()).role == "symotus_admin"
+
 # ── account.invite_reseller ────────────────────────────────────
 def test_reseller_invite_requires_flag():
     body = InviteCreate(email="x@y.com", intended_role="reseller", expires_hours=24)

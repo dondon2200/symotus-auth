@@ -81,6 +81,17 @@ def test_require_feature_403_with_description():
     assert checker(current_user=_User("reseller"), db=FakeDb()).role == "reseller"
 
 
+def test_require_feature_admin_allowed_false_blocks_admin():
+    checker = require_feature("account.create", admin_allowed=False)
+    assert checker.admin_allowed is False
+    with pytest.raises(HTTPException) as e:
+        checker(current_user=_User("symotus_admin"), db=FakeDb())
+    assert e.value.status_code == 403
+    assert "直接建立帳號" in e.value.detail
+    assert checker(current_user=_User("reseller"), db=FakeDb()).role == "reseller"
+    assert require_feature("account.create").admin_allowed is True
+
+
 def _sqlite_db():
     engine = create_engine("sqlite://")
     RolePolicy.__table__.create(engine)

@@ -17,7 +17,6 @@ from models import RolePolicy, User
 
 ADMIN_ROLE = "symotus_admin"
 ROLES = ("reseller", "end_user")
-GROUPS = ("相機與專案", "帳號與邀請", "其他")
 
 # (feature_key, group, description, {role: allowed})。順序＝管理頁顯示順序。
 ROLE_FEATURE_DEFAULTS = [
@@ -75,12 +74,17 @@ def role_allows(db: Session, feature_key: str, user: User) -> bool:
     return hit
 
 
-def require_feature(feature_key: str) -> Callable:
-    """FastAPI dependency，取代 require_role(...)。不允許 → 403，訊息帶目錄說明。"""
+def require_feature(feature_key: str, *, admin_allowed: bool = True) -> Callable:
+    """FastAPI dependency，取代 require_role(...)。不允許 → 403，訊息帶目錄說明。
+    admin_allowed=False：reseller 專屬端點（POST /users、/support/grants），symotus_admin 照改版前回 403；
+    role_allows 本身不變（admin 一律 True）。"""
     def checker(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+        if not admin_allowed and current_user.role == ADMIN_ROLE:
+            raise HTTPException(403, f"此角色沒有「{description_of(feature_key)}」的權限")
         if not role_allows(db, feature_key, current_user):
             raise HTTPException(403, f"此角色沒有「{description_of(feature_key)}」的權限")
         return current_user
+    checker.admin_allowed = admin_allowed
     return checker
 
 
