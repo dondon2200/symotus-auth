@@ -305,6 +305,14 @@ async def startup():
                     seed_policies(_s)
             except Exception as e:
                 logger.warning(f"seed_policies: {e}")
+            # 種子角色權限政策（缺列才補，不覆蓋既有調整）
+            try:
+                from database import SessionLocal
+                from role_policies import seed_role_policies
+                with SessionLocal() as _s:
+                    seed_role_policies(_s)
+            except Exception as e:
+                logger.warning(f"seed_role_policies: {e}")
             # 回收上一個進程留下的 GDrive 下載孤兒（部署／SIGKILL 會讓它們永遠停在
             # downloading）。必須在開放流量前做，否則使用者會看到永遠不動的進度條。
             try:
@@ -347,13 +355,14 @@ async def shutdown():
         logger.warning(f"shutdown_gdrive_jobs: {e}")
 
 
-from routers import auth, invites, users, support, admin, jobs, cameras, line_webhook, invitations, public_camera, billing, line_bind
+from routers import auth, invites, users, support, admin, jobs, cameras, line_webhook, invitations, public_camera, billing, line_bind, role_policy_api
 app.include_router(auth.router)
 app.include_router(invites.router)
 app.include_router(users.router)
 app.include_router(users.users_router)
 app.include_router(support.router)
 app.include_router(admin.router)
+app.include_router(role_policy_api.router)
 app.include_router(jobs.router)
 app.include_router(billing.router)  # 前綴 /billing 與 cameras 的 /cameras 不相交，順序對兩者無影響
 app.include_router(public_camera.router)  # 必須在 cameras 前（避免 /{camera_id}/{path} catch-all 攔截）
