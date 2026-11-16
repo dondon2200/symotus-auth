@@ -14,7 +14,9 @@ from typing import Optional
 
 TAIPEI = timezone(timedelta(hours=8))
 
-TERMS = ("monthly", "annual")
+TERMS = ("monthly", "semiannual", "annual")
+# 有合約期的 term 與其月數；月約沒有合約期（2026-11-16 官網方案：半年約＝最短訂閱期 6 個月）。
+TERM_MONTHS = {"semiannual": 6, "annual": 12}
 CYCLES = ("monthly", "yearly")
 
 
@@ -47,8 +49,13 @@ def cycle_months(cycle: str) -> int:
 
 
 def valid_combo(term: str, cycle: str) -> bool:
-    """月約年繳不允許（spec D2）：月約可隨時不續約，預繳一年中途不續約就得退款。"""
-    return term in TERMS and cycle in CYCLES and not (term == "monthly" and cycle == "yearly")
+    """月約、半年約都不能年繳（spec D2）：預繳一年會超過可以不續約的時點，中途不續約就得退款。"""
+    return term in TERMS and cycle in CYCLES and not (term in ("monthly", "semiannual") and cycle == "yearly")
+
+
+def has_term(term: str) -> bool:
+    """有合約期（半年約、年約）：合約期內不能提前不續約，到期日才結束。"""
+    return term in TERM_MONTHS
 
 
 def bill_date(start: date, k: int, cycle: str, anchor: int) -> date:
@@ -60,9 +67,9 @@ def due_date_of(bill_day: date, anchor: int) -> date:
     return add_months(bill_day, 1, anchor)
 
 
-def term_end_of(term_start: date, anchor: int) -> date:
-    """年約合約到期日（= 下一個合約期的起點）。"""
-    return add_months(term_start, 12, anchor)
+def term_end_of(term_start: date, anchor: int, term: str = "annual") -> date:
+    """合約到期日（= 下一個合約期的起點）。半年約 6 個月、年約 12 個月。"""
+    return add_months(term_start, TERM_MONTHS[term], anchor)
 
 
 def is_overdue(status: str, due: date, today: date) -> bool:

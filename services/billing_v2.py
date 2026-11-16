@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from models import BillingBill, BillingSubscriptionV2, User
 from services.billing_dates import (
-    TAIPEI, bill_date, due_date_of, taipei_date_to_utc_naive, taipei_today, term_end_of,
+    TAIPEI, bill_date, due_date_of, has_term, taipei_date_to_utc_naive, taipei_today, term_end_of,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,9 +46,10 @@ def advance_subscription(db: Session, sub: BillingSubscriptionV2, today: date) -
     if sub.status not in ("active", "suspended"):
         return 0
 
+    # 只看週期帳單：一次性帳單（相機採購款）和第一期同一天，不能讓它佔掉第一期的位置
     existing = {
         r[0] for r in db.query(BillingBill.period_start)
-        .filter(BillingBill.subscription_id == sub.id).all()
+        .filter(BillingBill.subscription_id == sub.id, BillingBill.kind == "period").all()
     }
     anchor = sub.anchor_day
     created = 0
@@ -60,10 +61,13 @@ def advance_subscription(db: Session, sub: BillingSubscriptionV2, today: date) -
         if sub.cancel_at and bd >= sub.cancel_at:
             _end(sub, sub.cancel_at, "not_renewed")
             break
-        if sub.term == "annual":
-            tend = term_end_of(sub.term_start, anchor)
+        if has_term(sub.term):
+            tend = term_end_of(sub.term_start, anchor, sub.term)
             if bd >= tend:
                 if sub.auto_renew:
+                    # 年約再續一個合約期；半年約期滿轉月約（2026-11-16 P5），之後可隨時不續約
+                    if sub.term == "semiannual":
+                        sub.term = "monthly"
                     sub.term_start = tend
                 else:
                     _end(sub, tend, "not_renewed")

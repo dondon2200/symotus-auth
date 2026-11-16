@@ -340,9 +340,14 @@ class BillingPlanV2(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     description = Column(Text, nullable=True)
-    term = Column(String, nullable=False)    # monthly | annual
+    term = Column(String, nullable=False)    # monthly | semiannual | annual
     cycle = Column(String, nullable=False)   # monthly | yearly
     price = Column(Integer, nullable=False)  # 每期金額 TWD，0 合法（免費）
+    # 一次性費用（例：採購訂閱的相機採購款）：建立訂閱時另開一張帳單。NULL/0 = 沒有。
+    one_time_fee = Column(Integer, nullable=True)
+    one_time_label = Column(String(50), nullable=True)
+    # 方案內容，一行一項；只給客戶看，不快照到訂閱（2026-11-16 官網方案 spec §5）
+    features = Column(Text, nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -374,9 +379,11 @@ class BillingSubscriptionV2(Base):
     term = Column(String, nullable=False)
     cycle = Column(String, nullable=False)
     price = Column(Integer, nullable=False)
+    one_time_fee = Column(Integer, nullable=True)   # 建立時快照（可議價覆寫）；帳單在建立時開好
+    one_time_label = Column(String(50), nullable=True)
     start_date = Column(Date, nullable=False)       # 第一期帳單日（台北）
     anchor_day = Column(Integer, nullable=False)    # = start_date.day，1–31
-    term_start = Column(Date, nullable=False)       # 目前合約期起點；年約續約時往後推 12 個月
+    term_start = Column(Date, nullable=False)       # 目前合約期起點；年約續約時往後推 12 個月；半年約期滿轉月約時 = 到期日
     auto_renew = Column(Boolean, nullable=False, default=True)
     cancel_at = Column(Date, nullable=True)         # 「到期不續約」的生效日（台北）；NULL = 未設
     status = Column(String, nullable=False, default="active")  # scheduled | active | suspended | ended
@@ -392,11 +399,12 @@ class BillingSubscriptionV2(Base):
 class BillingBill(Base):
     """一份訂閱的一期應繳款。
 
-    UNIQUE(subscription_id, period_start) 不排除作廢：帳單由排程自動補開，
-    若作廢後可重開，排程隔天就會把它補回來（spec §6.4）。"""
+    UNIQUE(subscription_id, kind, period_start) 不排除作廢：帳單由排程自動補開，
+    若作廢後可重開，排程隔天就會把它補回來（spec §6.4）。
+    kind：period＝週期帳單（排程開）；one_time＝一次性費用（建立訂閱時開，排程不碰）。"""
     __tablename__ = "billing_bills"
     __table_args__ = (
-        UniqueConstraint("subscription_id", "period_start", name="uq_billing_bill_sub_period"),
+        UniqueConstraint("subscription_id", "kind", "period_start", name="uq_billing_bill_sub_kind_period"),
         Index("ix_billing_bill_customer_status", "customer_id", "status"),
         Index("ix_billing_bill_status_due", "status", "due_date"),
     )
@@ -408,6 +416,8 @@ class BillingBill(Base):
     camera_name = Column(String, nullable=True)
     plan_name = Column(String, nullable=True)
     cycle = Column(String, nullable=False)
+    kind = Column(String, nullable=False, default="period", server_default="period")  # period | one_time
+    label = Column(String(50), nullable=True)       # one_time 的名稱（例「相機採購款」）
     period_start = Column(Date, nullable=False)     # = 帳單日
     period_end = Column(Date, nullable=False)       # 下一期帳單日（半開區間）
     due_date = Column(Date, nullable=False)

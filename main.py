@@ -265,6 +265,34 @@ async def startup():
                         conn.rollback()
                         logger.warning(f"user_line_accounts 多對多 migration 失敗（略過）：{e}")
 
+            # 官網方案上架（2026-11-16，修改清單 #11）：半年約、一次性費用、方案內容。
+            # 見 frontend docs/superpowers/specs/2026-11-16-official-plans-design.md §8 與
+            # migrations/2026-11-16_official_plans.sql（同內容，留紀錄）。唯一鍵改成含 kind，
+            # 不然一次性帳單會和第一期月費撞 (subscription_id, period_start)。失敗只記警告不擋啟動。
+            with engine.connect() as conn:
+                for stmt in [
+                    "ALTER TABLE billing_plans_v2 ADD COLUMN IF NOT EXISTS one_time_fee INTEGER",
+                    "ALTER TABLE billing_plans_v2 ADD COLUMN IF NOT EXISTS one_time_label VARCHAR(50)",
+                    "ALTER TABLE billing_plans_v2 ADD COLUMN IF NOT EXISTS features TEXT",
+                    "ALTER TABLE billing_subscriptions_v2 ADD COLUMN IF NOT EXISTS one_time_fee INTEGER",
+                    "ALTER TABLE billing_subscriptions_v2 ADD COLUMN IF NOT EXISTS one_time_label VARCHAR(50)",
+                    "ALTER TABLE billing_bills ADD COLUMN IF NOT EXISTS kind VARCHAR NOT NULL DEFAULT 'period'",
+                    "ALTER TABLE billing_bills ADD COLUMN IF NOT EXISTS label VARCHAR(50)",
+                    "ALTER TABLE billing_bills DROP CONSTRAINT IF EXISTS uq_billing_bill_sub_period",
+                    """DO $$ BEGIN
+                        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_billing_bill_sub_kind_period') THEN
+                            ALTER TABLE billing_bills ADD CONSTRAINT uq_billing_bill_sub_kind_period
+                                UNIQUE (subscription_id, kind, period_start);
+                        END IF;
+                    END $$""",
+                ]:
+                    try:
+                        conn.execute(text(stmt))
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning(f"官網方案 migration 失敗（略過）：{e}")
+
             # timelapse_jobs 的切日函式索引（給既有環境用）。models.py 的
             # __table_args__ 只對「create_all 新建的表」有效，正式庫這張表已存在、
             # 已有資料，create_all 不會替既有表補索引，所以這裡另外補一次。

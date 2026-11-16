@@ -17,7 +17,7 @@ from typing import Literal, Optional
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -29,7 +29,7 @@ from models import (
     BillingPlanV2, BillingSetting, BillingSubscriptionV2, CameraAccess, User,
 )
 from services.billing_dates import (
-    next_bill_date_after, overdue_days, taipei_date_to_utc_naive, taipei_today, term_end_of, valid_combo,
+    due_date_of, has_term, next_bill_date_after, overdue_days, taipei_date_to_utc_naive, taipei_today, term_end_of, valid_combo,
 )
 from services.billing_v2 import (
     OPEN_STATUSES, advance_one, get_lock_map, invalidate_lock_cache,
@@ -85,6 +85,8 @@ def _bill_out(b: BillingBill, today: date, sub_status: Optional[str] = None) -> 
         "camera_name": b.camera_name,
         "plan_name": b.plan_name,
         "cycle": b.cycle,
+        "kind": b.kind or "period",
+        "label": b.label,
         "period_start": _iso(b.period_start),
         "period_end": _iso(b.period_end),
         "due_date": _iso(b.due_date),
@@ -104,9 +106,15 @@ def _bill_out(b: BillingBill, today: date, sub_status: Optional[str] = None) -> 
     }
 
 
+def _features(text_: Optional[str]) -> list[str]:
+    return [ln.strip() for ln in (text_ or "").splitlines() if ln.strip()]
+
+
 def _plan_out(p: BillingPlanV2) -> dict:
     return {"id": p.id, "name": p.name, "description": p.description, "term": p.term,
-            "cycle": p.cycle, "price": p.price, "is_active": p.is_active}
+            "cycle": p.cycle, "price": p.price,
+            "one_time_fee": p.one_time_fee, "one_time_label": p.one_time_label,
+            "features": _features(p.features), "is_active": p.is_active}
 
 
 def _sub_out(db: Session, s: BillingSubscriptionV2, today: date, names: Optional[dict] = None,
@@ -137,10 +145,14 @@ def _sub_out(db: Session, s: BillingSubscriptionV2, today: date, names: Optional
         "term": s.term,
         "cycle": s.cycle,
         "price": s.price,
+        "one_time_fee": s.one_time_fee,
+        "one_time_label": s.one_time_label,
         "start_date": _iso(s.start_date),
         "anchor_day": s.anchor_day,
         "term_start": _iso(s.term_start),
-        "term_end": _iso(term_end_of(s.term_start, s.anchor_day)) if s.term == "annual" else None,
+        "term_end": _iso(term_end_of(s.term_start, s.anchor_day, s.term)) if has_term(s.term) else None,
+        # 半年約期滿已轉月約：月約的 term_start 永遠等於 start_date，只有轉過才會不同
+        "term_converted": s.term == "monthly" and s.term_start != s.start_date,
         "auto_renew": s.auto_renew,
         "cancel_at": _iso(s.cancel_at),
         "status": s.status,
@@ -230,20 +242,62 @@ async def _ensure_serial(db: Session, sub: BillingSubscriptionV2) -> None:
 
 # ── 方案 ──────────────────────────────────────────────────────────────
 
+MAX_FEATURES = 12
+MAX_FEATURE_LEN = 60
+
+
+def _check_features(v: Optional[str]) -> Optional[str]:
+    """方案內容：一行一項，最多 12 項、每項 60 字；空白行略過，全空存 NULL。"""
+    if v is None:
+        return None
+    lines = _features(v)
+    if len(lines) > MAX_FEATURES:
+        raise ValueError(f"方案內容最多 {MAX_FEATURES} 項")
+    if any(len(ln) > MAX_FEATURE_LEN for ln in lines):
+        raise ValueError(f"方案內容每項最多 {MAX_FEATURE_LEN} 字")
+    return "\n".join(lines) or None
+
+
+def _check_one_time(fee: Optional[int], label: Optional[str]) -> None:
+    if fee and not (label or "").strip():
+        raise ValueError("有一次性費用時請填名稱（例：相機採購款）")
+
+
 class PlanIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     description: Optional[str] = Field(default=None, max_length=1000)
-    term: Literal["monthly", "annual"]
+    term: Literal["monthly", "semiannual", "annual"]
     cycle: Literal["monthly", "yearly"]
     price: int = Field(ge=0, le=10_000_000)
+    one_time_fee: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    one_time_label: Optional[str] = Field(default=None, max_length=50)
+    features: Optional[str] = Field(default=None, max_length=2000)
     is_active: bool = True
+
+    @field_validator("features")
+    @classmethod
+    def _v_features(cls, v):
+        return _check_features(v)
+
+    @model_validator(mode="after")
+    def _v_one_time(self):
+        _check_one_time(self.one_time_fee, self.one_time_label)
+        return self
 
 
 class PlanPatch(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=100)
     description: Optional[str] = Field(default=None, max_length=1000)
     price: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    one_time_fee: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    one_time_label: Optional[str] = Field(default=None, max_length=50)
+    features: Optional[str] = Field(default=None, max_length=2000)
     is_active: Optional[bool] = None
+
+    @field_validator("features")
+    @classmethod
+    def _v_features(cls, v):
+        return _check_features(v)
 
 
 @router.get("/admin/plans")
@@ -257,7 +311,7 @@ def list_plans(include_inactive: bool = False, db: Session = Depends(get_db), _:
 @router.post("/admin/plans")
 def create_plan(body: PlanIn, db: Session = Depends(get_db), me: User = Depends(ADMIN)):
     if not valid_combo(body.term, body.cycle):
-        raise HTTPException(422, "月約不可年繳（請改用年約年繳）")
+        raise HTTPException(422, "月約、半年約不可年繳（請改用月繳，或年約年繳）")
     p = BillingPlanV2(**body.model_dump())
     db.add(p)
     db.flush()
@@ -273,6 +327,12 @@ def update_plan(plan_id: int, body: PlanPatch, db: Session = Depends(get_db), me
     if not p:
         raise HTTPException(404, "方案不存在")
     changes = body.model_dump(exclude_unset=True)
+    fee = changes.get("one_time_fee", p.one_time_fee)
+    label = changes.get("one_time_label", p.one_time_label)
+    try:
+        _check_one_time(fee, label)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
     for k, v in changes.items():
         setattr(p, k, v)
     log_action(db, me, "billing.plan.update", "billing_plan", p.id, str(changes))
@@ -299,6 +359,8 @@ class SubscriptionIn(BaseModel):
     plan_id: int
     start_date: date
     price: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    # 一次性費用議價（不帶＝用方案的）；方案沒有一次性費用時忽略
+    one_time_fee: Optional[int] = Field(default=None, ge=0, le=10_000_000)
     auto_renew: bool = True
     note: Optional[str] = Field(default=None, max_length=1000)
     mark_past_due_paid: bool = False   # 補登歷史訂閱時，把已過截止日的帳單標成已收款（spec §13 S7）
@@ -404,6 +466,9 @@ async def create_subscriptions(body: SubscriptionIn, db: Session = Depends(get_d
             customer_id=customer.id, plan_id=plan.id, plan_name=plan.name,
             term=plan.term, cycle=plan.cycle,
             price=plan.price if body.price is None else body.price,
+            one_time_fee=(plan.one_time_fee if body.one_time_fee is None else body.one_time_fee)
+            if plan.one_time_fee else None,
+            one_time_label=plan.one_time_label if plan.one_time_fee else None,
             start_date=body.start_date, anchor_day=body.start_date.day, term_start=body.start_date,
             auto_renew=body.auto_renew,
             status="scheduled" if body.start_date > today else "active",
@@ -418,12 +483,24 @@ async def create_subscriptions(body: SubscriptionIn, db: Session = Depends(get_d
             continue
         log_action(db, me, "billing.subscription.create", "billing_subscription", sub.id,
                    f"camera={cid} customer={customer.id} plan={plan.id} price={sub.price} start={sub.start_date}")
+        if sub.one_time_fee:
+            # 一次性費用（相機採購款）：建立時就開，截止日同第一期（spec 2026-11-16 §4.2）
+            db.add(BillingBill(
+                subscription_id=sub.id, camera_id=cid, customer_id=customer.id,
+                camera_name=sub.camera_name, plan_name=sub.plan_name, cycle=sub.cycle,
+                kind="one_time", label=sub.one_time_label,
+                period_start=sub.start_date, period_end=sub.start_date,
+                due_date=due_date_of(sub.start_date, sub.anchor_day),
+                amount=sub.one_time_fee, status="unpaid",
+            ))
         db.commit()
         created = advance_one(db, sub, today)
         marked = 0
         if body.mark_past_due_paid:
+            # 只標週期帳單；相機採購款要另外確認收款（P6）
             for b in db.query(BillingBill).filter(
                     BillingBill.subscription_id == sub.id, BillingBill.status == "unpaid",
+                    BillingBill.kind == "period",
                     BillingBill.due_date < today).all():
                 b.status, b.paid_on, b.paid_at = "paid", b.due_date, datetime.utcnow()
                 b.paid_note = "補登訂閱時標記為已收款"
@@ -520,7 +597,7 @@ def schedule_cancel(sub_id: int, body: ScheduleCancelIn, db: Session = Depends(g
         raise HTTPException(409, f"目前狀態為 {s.status}，無法設定不續約")
     today = taipei_today()
     if body.cancel:
-        s.cancel_at = (term_end_of(s.term_start, s.anchor_day) if s.term == "annual"
+        s.cancel_at = (term_end_of(s.term_start, s.anchor_day, s.term) if has_term(s.term)
                        else next_bill_date_after(s.start_date, s.cycle, s.anchor_day, today))
     else:
         s.cancel_at = None
@@ -1064,8 +1141,12 @@ def my_subscriptions(db: Session = Depends(get_db), me: User = Depends(get_curre
     names = {me.id: me.username}
     lock_map = get_lock_map(db)
     out = [_sub_out(db, s, today, names, lock_map) for s in subs]
-    for row in out:
+    plans = {p.id: p for p in db.query(BillingPlanV2).filter(
+        BillingPlanV2.id.in_({s.plan_id for s in subs} or {0})).all()}
+    for s, row in zip(subs, out):
         row.pop("note", None)   # 內部備註不給付款人看
+        # 方案內容不快照：方案調整說明時客戶看到最新的（停用的方案照樣回）
+        row["plan_features"] = _features(plans[s.plan_id].features) if s.plan_id in plans else []
     return out
 
 

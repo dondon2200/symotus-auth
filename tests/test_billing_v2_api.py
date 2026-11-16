@@ -291,3 +291,59 @@ def test_my端點只看自己(client, h, alice, plan_id, make_user, auth_headers
 def test_notices_非reseller一律空(client, h, alice, plan_id, auth_headers, admin):
     _create(client, h, alice, plan_id, TODAY - timedelta(days=40))
     assert client.get("/billing/notices/my", headers=h).json()["overdue"] == []
+
+
+# ── 官網方案（2026-11-16）：半年約、一次性費用、方案內容 ──
+
+@pytest.fixture()
+def buy_plan_id(client, h):
+    r = client.post("/billing/admin/plans", headers=h, json={
+        "name": "採購訂閱", "term": "semiannual", "cycle": "monthly", "price": 8950,
+        "one_time_fee": 29800, "one_time_label": "相機採購款",
+        "features": "雲端平台使用權\n\n 90 秒 AI 縮時生成額度／每月 \n100G 雲端儲存容量"})
+    assert r.status_code == 200, r.text
+    p = r.json()
+    assert p["features"] == ["雲端平台使用權", "90 秒 AI 縮時生成額度／每月", "100G 雲端儲存容量"]
+    assert (p["one_time_fee"], p["one_time_label"]) == (29800, "相機採購款")
+    return p["id"]
+
+
+def test_半年約年繳被拒_一次性費用要有名稱_內容最多12項(client, h):
+    base = {"name": "x", "term": "semiannual", "cycle": "monthly", "price": 1}
+    assert client.post("/billing/admin/plans", headers=h, json={**base, "cycle": "yearly"}).status_code == 422
+    assert client.post("/billing/admin/plans", headers=h, json={**base, "one_time_fee": 100}).status_code == 422
+    assert client.post("/billing/admin/plans", headers=h,
+                       json={**base, "features": "\n".join(str(i) for i in range(13))}).status_code == 422
+    assert client.post("/billing/admin/plans", headers=h, json={**base, "features": "x" * 61}).status_code == 422
+
+
+def test_建立採購訂閱_另開一次性帳單_可議價(client, h, alice, buy_plan_id):
+    res = _create(client, h, alice, buy_plan_id, TODAY, cams=(44, 45), one_time_fee=25000)
+    sub = client.get(f"/billing/admin/subscriptions/{res[0]['subscription_id']}", headers=h).json()
+    assert sub["term"] == "semiannual" and sub["term_end"] is not None
+    assert (sub["one_time_fee"], sub["one_time_label"]) == (25000, "相機採購款")
+    kinds = sorted((b["kind"], b["amount"], b["label"]) for b in sub["bills"])
+    assert kinds == [("one_time", 25000, "相機採購款"), ("period", 8950, None)]
+
+
+def test_回溯標已繳不含一次性帳單(client, h, alice, buy_plan_id):
+    res = _create(client, h, alice, buy_plan_id, TODAY - timedelta(days=70), mark_past_due_paid=True)
+    sub = client.get(f"/billing/admin/subscriptions/{res[0]['subscription_id']}", headers=h).json()
+    one = [b for b in sub["bills"] if b["kind"] == "one_time"][0]
+    assert one["status"] == "unpaid" and one["overdue"] is True
+    assert all(b["status"] == "paid" for b in sub["bills"] if b["kind"] == "period" and b["overdue_days"] == 0
+               and b["due_date"] < TODAY.isoformat())
+
+
+def test_my訂閱帶方案內容_不帶備註(client, h, alice, buy_plan_id, auth_headers):
+    _create(client, h, alice, buy_plan_id, TODAY, note="內部")
+    row = client.get("/billing/my/subscriptions", headers=auth_headers(alice)).json()[0]
+    assert row["plan_features"][0] == "雲端平台使用權"
+    assert "note" not in row
+    assert client.get("/billing/my/bills", headers=auth_headers(alice)).json()[0]["kind"] in ("period", "one_time")
+
+
+def test_一般方案沒有一次性帳單(client, h, alice, plan_id):
+    res = _create(client, h, alice, plan_id, TODAY)
+    sub = client.get(f"/billing/admin/subscriptions/{res[0]['subscription_id']}", headers=h).json()
+    assert [b["kind"] for b in sub["bills"]] == ["period"] and sub["one_time_fee"] is None

@@ -82,3 +82,11 @@ def test_下次帳單日():
     assert next_bill_date_after(D(2026, 10, 7), "monthly", 7, D(2026, 10, 7)) == D(2026, 11, 7)
     assert next_bill_date_after(D(2026, 10, 7), "monthly", 7, D(2026, 11, 6)) == D(2026, 11, 7)
     assert next_bill_date_after(D(2026, 10, 7), "yearly", 7, D(2026, 11, 6)) == D(2027, 10, 7)
+
+
+def test_半年約到期日與組合():
+    # 2026-11-16 官網方案：最短訂閱期 6 個月
+    assert term_end_of(D(2026, 11, 16), 16, "semiannual") == D(2027, 5, 16)
+    assert term_end_of(D(2026, 8, 31), 31, "semiannual") == D(2027, 2, 28)
+    assert valid_combo("semiannual", "monthly")
+    assert not valid_combo("semiannual", "yearly")

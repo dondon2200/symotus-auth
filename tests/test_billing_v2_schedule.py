@@ -179,3 +179,34 @@ def test_逾期旗標不給end_user(db, reseller, plan, make_user):
     assert camera_billing_flags(db, end_user, today) == {}
     assert camera_billing_flags(db, other, today) == {}
     assert camera_billing_flags(db, reseller, D(2026, 11, 7)) == {}  # 截止日當天不算
+
+
+# ── 半年約、一次性帳單（2026-11-16 官網方案）──
+
+def test_半年約期滿轉月約_帳單不中斷(db, reseller, plan):
+    s = _sub(db, reseller, plan, D(2026, 11, 16), term="semiannual", auto_renew=True)
+    advance_subscription(db, s, D(2027, 6, 16))
+    assert s.status == "active"
+    assert s.term == "monthly" and s.term_start == D(2027, 5, 16)
+    assert [b.period_start for b in _bills(db, s)][-2:] == [D(2027, 5, 16), D(2027, 6, 16)]
+    assert len(_bills(db, s)) == 8
+
+
+def test_半年約不續約_第6期後結束(db, reseller, plan):
+    s = _sub(db, reseller, plan, D(2026, 11, 16), term="semiannual", auto_renew=False)
+    advance_subscription(db, s, D(2027, 5, 16))
+    assert s.status == "ended" and s.end_reason == "not_renewed"
+    assert len(_bills(db, s)) == 6
+
+
+def test_一次性帳單不佔第一期_排程也不重開(db, reseller, plan):
+    s = _sub(db, reseller, plan, D(2026, 11, 16), one_time_fee=29800, one_time_label="相機採購款")
+    db.add(BillingBill(subscription_id=s.id, camera_id=44, customer_id=reseller.id, cycle="monthly",
+                       kind="one_time", label="相機採購款", period_start=D(2026, 11, 16),
+                       period_end=D(2026, 11, 16), due_date=D(2026, 12, 16), amount=29800))
+    db.commit()
+    assert advance_subscription(db, s, D(2026, 12, 16)) == 2
+    db.commit()
+    rows = [(b.kind, b.period_start, b.amount) for b in _bills(db, s)]
+    assert sorted(rows) == sorted([("one_time", D(2026, 11, 16), 29800),
+                                   ("period", D(2026, 11, 16), 1500), ("period", D(2026, 12, 16), 1500)])
