@@ -787,6 +787,7 @@ def _overdue_groups(db: Session, today: date) -> dict:
         rep = reports.get(b.pending_report_id) if b.pending_report_id else None
         row["bills"].append({"id": b.id, "amount": b.amount, "due_date": _iso(b.due_date),
                              "period_start": _iso(b.period_start), "period_end": _iso(b.period_end),
+                             "kind": b.kind or "period", "label": b.label,
                              "pending_report_id": b.pending_report_id})
         if not rep:
             row["all_pending"] = False
