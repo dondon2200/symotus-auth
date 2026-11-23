@@ -327,6 +327,28 @@ class CameraInvitation(Base):
     signup_count = Column(Integer, default=0, nullable=False, server_default="0")   # 已自助建帳人數
 
 
+class CameraAccessRequest(Base):
+    """相機存取權限請求（2026-11-23）。
+
+    新增相機時掃到「系統裡已經有、但自己沒權限」的相機，使用者送出一筆請求；
+    該相機的全功能管理者（camera_access.permission_level=full）或 symotus_admin 核准時
+    選定權限等級並建立 camera_access，拒絕則只改狀態。
+    同一 (相機, 請求者) 同時只會有一筆 pending（程式層檢查，重複送出回傳既有那筆）。
+    時間戳為 naive UTC。"""
+    __tablename__ = "camera_access_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(Integer, nullable=False, index=True)             # Camera Backend 的 camera ID
+    camera_name = Column(String, nullable=True)                          # 送出當下的相機名稱，方便顯示
+    requester_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    note = Column(String, nullable=True)                                 # 請求者留言
+    status = Column(String, default="pending", nullable=False, index=True)  # pending / approved / rejected
+    permission_level = Column(String, nullable=True)                     # 核准時授予的等級
+    decided_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    decided_at = Column(DateTime, nullable=True)
+
+
 # ── Billing 計費模組 v2：按相機訂閱 ─────────────────────────────────
 # 設計見 symotus-frontend/docs/superpowers/specs/2026-10-07-camera-subscription-billing-design.md
 # 金額一律整數 TWD；日期（帳單日、截止日、付款日）一律存台北日期（Date），時間戳存 naive UTC。

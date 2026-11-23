@@ -383,7 +383,7 @@ async def shutdown():
         logger.warning(f"shutdown_gdrive_jobs: {e}")
 
 
-from routers import auth, invites, users, support, admin, jobs, cameras, line_webhook, invitations, public_camera, billing, line_bind, role_policy_api
+from routers import auth, invites, users, support, admin, jobs, cameras, line_webhook, invitations, public_camera, billing, line_bind, role_policy_api, access_requests
 app.include_router(auth.router)
 app.include_router(invites.router)
 app.include_router(users.router)
@@ -399,6 +399,7 @@ app.include_router(cameras.precheck_router)  # GET /timelapse-prechecks/{id}：�
 app.include_router(line_webhook.router)
 app.include_router(invitations.router)
 app.include_router(line_bind.router)
+app.include_router(access_requests.router)  # 前綴 /access-requests，不與 /cameras 的 catch-all 相交
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
