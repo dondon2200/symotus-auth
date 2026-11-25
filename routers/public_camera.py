@@ -323,6 +323,114 @@ async def serve_temp_image(token: str):
     return Response(content=data, media_type=content_type)
 
 
+# ── 照片打包下載（R-015）──────────────────────────────────────────
+# 網址由 POST /cameras/{id}/photo-archive 簽發。簽章綁定相機、使用者、日期與期限；
+# 下載時重新用該使用者的身分走一次權限與鎖機檢查，簽發後被停用或撤銷授權的人下載不了。
+PHOTO_ARCHIVE_MAX_CONCURRENT = 2
+_photo_archive_active = 0
+
+
+def photo_archive_sig(camera_id: int, user_id: int, start: str, end: str, exp: int) -> str:
+    msg = f"photo-archive:{camera_id}:{user_id}:{start}:{end}:{exp}".encode()
+    return _hmac.new(settings.JWT_SECRET.encode(), msg, _hashlib.sha256).hexdigest()
+
+
+@router.get("/photo-archive/zip")  # 兩段路徑：單段會被上面的 /{token} 先接走
+async def download_photo_archive(
+    camera_id: int, start: str, end: str, uid: int, exp: int = 0, sig: str = "",
+    db: Session = Depends(get_db),
+):
+    """串流回傳照片壓縮檔（不壓縮、邊抓邊送）。"""
+    global _photo_archive_active
+    from routers.cameras import (
+        camera_serial_for_archive, get_allowed_camera_ids, resolve_nas_token,
+    )
+    from services.billing_v2 import assert_camera_unlocked
+    from services.photo_archive import ArchiveRangeError, parse_range, stream_zip
+
+    if (not sig or exp < int(_time.time())
+            or not _hmac.compare_digest(sig, photo_archive_sig(camera_id, uid, start, end, exp))):
+        raise HTTPException(403, detail={"code": "ARCHIVE_LINK_EXPIRED", "message": "下載連結無效或已過期，請回到頁面重新下載"})
+    try:
+        days = parse_range(start, end)
+    except ArchiveRangeError as e:
+        raise HTTPException(400, detail={"code": e.code, "message": e.message})
+
+    user = db.query(User).filter(User.id == uid).first()
+    if not user or not user.is_active:
+        raise HTTPException(403, detail={"code": "ARCHIVE_LINK_EXPIRED", "message": "下載連結無效或已過期，請回到頁面重新下載"})
+    allowed_ids = get_allowed_camera_ids(user, db)
+    if allowed_ids is not None and camera_id not in allowed_ids:
+        raise HTTPException(403, detail={"code": "CAMERA_FORBIDDEN", "message": "無此相機的存取權限"})
+    assert_camera_unlocked(db, user, camera_id)
+
+    cam_token = await resolve_nas_token(db, user, camera_id, "photos.download")
+    serial = await camera_serial_for_archive(cam_token, camera_id)
+    if not serial:
+        raise HTTPException(404, detail={"code": "ARCHIVE_NO_SERIAL", "message": "找不到這台相機的照片資料夾"})
+
+    if _photo_archive_active >= PHOTO_ARCHIVE_MAX_CONCURRENT:
+        raise HTTPException(429, detail={"code": "ARCHIVE_BUSY", "message": "目前有其他人在打包下載，請稍後再試"})
+
+    base_path = f"/homes/firmness/{serial}"
+    headers = {"Authorization": f"Bearer {cam_token}"}
+    client = httpx.AsyncClient(timeout=30)
+
+    async def list_day(day: str) -> list[dict]:
+        # Camera Backend 一次最多回 30 筆，超過回空，要分頁
+        out: list[dict] = []
+        offset = 0
+        while True:
+            try:
+                r = await client.get(
+                    f"{CAMERA_BACKEND_URL}/api/camera/nas/images", headers=headers,
+                    params={"camera_id": camera_id, "folder_path": f"{base_path}/{day}", "limit": 30, "offset": offset},
+                )
+            except httpx.HTTPError:
+                break
+            if r.status_code != 200:
+                break
+            files = (r.json().get("data") or {}).get("files") or []
+            # 只收這台相機自己資料夾底下的路徑：後端回來的 path 不直接信任
+            out.extend(f for f in files if str(f.get("path", "")).startswith(f"{base_path}/"))
+            offset += len(files)
+            if len(files) < 30:
+                break
+        return out
+
+    async def fetch_photo(path: str):
+        for _ in range(2):
+            try:
+                r = await client.get(
+                    f"{CAMERA_BACKEND_URL}/api/camera/nas/image", headers=headers, params={"path": path},
+                )
+                if r.status_code == 200 and r.content:
+                    return r.content
+            except httpx.HTTPError:
+                pass
+        return None
+
+    async def body():
+        global _photo_archive_active
+        _photo_archive_active += 1
+        try:
+            async for chunk in stream_zip(days, list_day, fetch_photo):
+                yield chunk
+        finally:
+            _photo_archive_active -= 1
+            await client.aclose()
+
+    filename = f"photos_{serial}_{days[0]}_{days[-1]}.zip" if days[0] != days[-1] else f"photos_{serial}_{days[0]}.zip"
+    return StreamingResponse(
+        body(), media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",   # nginx 不要先緩衝整包
+        },
+    )
+
+
 @router.get("/live-frame/{camera_id}")
 async def live_camera_frame(camera_id: int, exp: int = 0, sig: str = "", db: Session = Depends(get_db)):
     """直接從 go2rtc 取即時截圖，供 LINE 使用（公開但需簽章）。

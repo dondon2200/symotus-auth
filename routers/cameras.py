@@ -916,25 +916,9 @@ async def delete_camera(
     return {"success": True, "camera_id": camera_id}
 
 
-# ── NAS Images proxy ───────────────────────────────────────────────────────────
-
-@router.get("/nas/images")
-async def nas_images(
-    request: Request,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """NAS 照片列表 proxy
-    照片按日期存在子資料夾 /homes/firmness/{serial}/YYYY-MM-DD/
-    用 asyncio.gather 並行查詢所有日期資料夾，速度快
-    """
-    from datetime import datetime, timedelta, date as date_type
-
-    params = dict(request.query_params)
-    camera_id = params.get("camera_id")
-    if camera_id:
-        assert_camera_unlocked(db, current_user, int(camera_id))
-
+async def resolve_nas_token(db: Session, current_user: User, camera_id, feature: str = "photos.view") -> str:
+    """NAS 照片用的 Camera Backend token：自己 → 授權者 → admin（F-3／F-13），並檢查被分享者的功能層級。
+    camera_id 可為 None（沒指定相機的清單查詢）。照片清單、打包下載共用。"""
     cam_token = await get_camera_backend_token(current_user)
 
     # F-3：此相機的 grant（決定是否允許 granter/admin fallback）
@@ -946,11 +930,11 @@ async def nas_images(
         ).first()
     allow_fallback = (access is not None) or current_user.role == "symotus_admin"
 
-    # photos.view 政策：被分享者（非自我配對）等級不足 → 後端直接擋（不再只靠 UI 藏按鈕）
+    # 功能政策（photos.view／photos.download）：被分享者（非自我配對）等級不足 → 後端直接擋（不再只靠 UI 藏按鈕）
     if (access and access.granted_by != current_user.id
             and current_user.role != "symotus_admin"
-            and not level_allows(db, "photos.view", access.permission_level)):
-        raise HTTPException(403, "此操作需要更高的授權等級（photos.view）")
+            and not level_allows(db, feature, access.permission_level)):
+        raise HTTPException(403, f"此操作需要更高的授權等級（{feature}）")
 
     # 沒有自己的 token（分享用戶）→ 用 granter 的 token
     if not cam_token and access and access.granted_by:
@@ -983,6 +967,30 @@ async def nas_images(
                 adm_tok = await _get_admin_camera_token()
                 if adm_tok:
                     cam_token = adm_tok
+
+    return cam_token
+
+
+# ── NAS Images proxy ───────────────────────────────────────────────────────────
+
+@router.get("/nas/images")
+async def nas_images(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """NAS 照片列表 proxy
+    照片按日期存在子資料夾 /homes/firmness/{serial}/YYYY-MM-DD/
+    用 asyncio.gather 並行查詢所有日期資料夾，速度快
+    """
+    from datetime import datetime, timedelta, date as date_type
+
+    params = dict(request.query_params)
+    camera_id = params.get("camera_id")
+    if camera_id:
+        assert_camera_unlocked(db, current_user, int(camera_id))
+
+    cam_token = await resolve_nas_token(db, current_user, camera_id, "photos.view")
 
     return await list_nas_images_backend(cam_token, camera_id, params)
 
@@ -1203,6 +1211,68 @@ async def nas_image(
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type", "image/jpeg"),
         )
+
+
+# ── 照片打包下載（R-015）──────────────────────────────────────────
+# 兩段式：登入的人先 POST 取得一條 5 分鐘內有效的簽章網址，瀏覽器再用一般連結下載。
+# 不直接用帶 Authorization 的 fetch：那樣整包（可能數 GB）會先進瀏覽器記憶體。
+PHOTO_ARCHIVE_URL_TTL = 300
+
+
+async def camera_serial_for_archive(cam_token: str, camera_id: int) -> str:
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"{CAMERA_BACKEND_URL}/api/cameras/{camera_id}",
+            headers={"Authorization": f"Bearer {cam_token}"},
+        )
+    if r.status_code != 200:
+        return ""
+    data = r.json()
+    basic = data.get("basic_info", data)
+    return str(basic.get("device_serial_id") or basic.get("serial_id") or basic.get("serial") or "")
+
+
+@router.post("/{camera_id:int}/photo-archive")
+async def create_photo_archive_link(
+    camera_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """回傳這台相機某段日期的照片壓縮檔下載網址（簽章、5 分鐘內要開始下載）。
+    body：{"start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}，最多 31 天。"""
+    from routers.public_camera import photo_archive_sig
+    from services.photo_archive import ArchiveRangeError, parse_range
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        days = parse_range(str(body.get("start_date") or ""), str(body.get("end_date") or ""))
+    except ArchiveRangeError as e:
+        raise HTTPException(400, detail={"code": e.code, "message": e.message})
+
+    allowed_ids = get_allowed_camera_ids(current_user, db)
+    if allowed_ids is not None and camera_id not in allowed_ids:
+        raise HTTPException(403, detail={"code": "CAMERA_FORBIDDEN", "message": "無此相機的存取權限"})
+    assert_camera_unlocked(db, current_user, camera_id)
+
+    cam_token = await resolve_nas_token(db, current_user, camera_id, "photos.download")
+    if not await camera_serial_for_archive(cam_token, camera_id):
+        raise HTTPException(404, detail={"code": "ARCHIVE_NO_SERIAL", "message": "找不到這台相機的照片資料夾"})
+
+    start, end = days[0], days[-1]
+    exp = int(_time.time()) + PHOTO_ARCHIVE_URL_TTL
+    sig = photo_archive_sig(camera_id, current_user.id, start, end, exp)
+    return {
+        "url": f"/cameras/public/photo-archive/zip?camera_id={camera_id}&start={start}&end={end}"
+               f"&uid={current_user.id}&exp={exp}&sig={sig}",
+        "expires_in": PHOTO_ARCHIVE_URL_TTL,
+        "days": len(days),
+    }
 
 
 @router.delete("/projects/{project_id}")
