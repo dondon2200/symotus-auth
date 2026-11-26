@@ -330,6 +330,11 @@ PHOTO_ARCHIVE_MAX_CONCURRENT = 2
 _photo_archive_active = 0
 
 
+def photo_archive_busy() -> bool:
+    """同時打包數已滿。取連結時先看一次，讓前端能直接提示；真正的上限仍在下載端點把關。"""
+    return _photo_archive_active >= PHOTO_ARCHIVE_MAX_CONCURRENT
+
+
 def photo_archive_sig(camera_id: int, user_id: int, start: str, end: str, exp: int) -> str:
     msg = f"photo-archive:{camera_id}:{user_id}:{start}:{end}:{exp}".encode()
     return _hmac.new(settings.JWT_SECRET.encode(), msg, _hashlib.sha256).hexdigest()

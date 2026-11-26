@@ -235,3 +235,11 @@ def test_超過_31_天回_400(no_network):
         _create(AccessDb("full"), {"start_date": "2026-10-01", "end_date": "2026-11-30"})
     assert e.value.status_code == 400
     assert e.value.detail["code"] == "ARCHIVE_RANGE_TOO_LONG"
+
+
+def test_同時打包數已滿時取連結就回_429(no_network, monkeypatch):
+    monkeypatch.setattr(public_mod, "_photo_archive_active", public_mod.PHOTO_ARCHIVE_MAX_CONCURRENT)
+    with pytest.raises(HTTPException) as e:
+        _create(AccessDb("full"), {"start_date": "2026-11-24", "end_date": "2026-11-24"})
+    assert e.value.status_code == 429
+    assert e.value.detail["code"] == "ARCHIVE_BUSY"

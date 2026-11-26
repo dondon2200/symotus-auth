@@ -1241,7 +1241,7 @@ async def create_photo_archive_link(
 ):
     """回傳這台相機某段日期的照片壓縮檔下載網址（簽章、5 分鐘內要開始下載）。
     body：{"start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}，最多 31 天。"""
-    from routers.public_camera import photo_archive_sig
+    from routers.public_camera import photo_archive_busy, photo_archive_sig
     from services.photo_archive import ArchiveRangeError, parse_range
 
     try:
@@ -1263,6 +1263,9 @@ async def create_photo_archive_link(
     cam_token = await resolve_nas_token(db, current_user, camera_id, "photos.download")
     if not await camera_serial_for_archive(cam_token, camera_id):
         raise HTTPException(404, detail={"code": "ARCHIVE_NO_SERIAL", "message": "找不到這台相機的照片資料夾"})
+    # 下載是瀏覽器直接開網址，那一步的 429 前端接不到；在這裡先擋，畫面才有提示
+    if photo_archive_busy():
+        raise HTTPException(429, detail={"code": "ARCHIVE_BUSY", "message": "目前有其他人在打包下載，請稍後再試"})
 
     start, end = days[0], days[-1]
     exp = int(_time.time()) + PHOTO_ARCHIVE_URL_TTL
